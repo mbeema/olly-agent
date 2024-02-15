@@ -1,0 +1,8 @@
+# Logs signal configuration
+logs:
+  enabled: true
+  sources:
+    - type: file
+      paths:
+        - /var/log/demo-app/*.log
+      format: json

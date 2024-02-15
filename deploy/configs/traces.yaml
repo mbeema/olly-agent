@@ -1,0 +1,23 @@
+# Traces signal configuration
+tracing:
+  enabled: true
+  protocols:
+    http:
+      enabled: true
+    grpc:
+      enabled: true
+    postgres:
+      enabled: true
+    mysql:
+      enabled: false
+    redis:
+      enabled: false
+    mongodb:
+      enabled: false
+    dns:
+      enabled: true
+
+correlation:
+  enabled: true
+  strategy: pid_tid_timestamp
+  window: 100ms

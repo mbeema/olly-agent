@@ -1,0 +1,103 @@
+# Olly Agent Configuration
+# Zero-instrumentation observability agent
+
+service_name: auto
+log_level: info
+
+# Library hooking configuration
+hook:
+  enabled: true
+  socket_path: /var/run/olly/hook.sock
+  # library_path: /usr/lib/libolly.so
+  http_ports: [80, 443, 8080, 8443, 3000, 5000, 8000]
+  debug: false
+
+# Protocol tracing
+tracing:
+  enabled: true
+  protocols:
+    http:
+      enabled: true
+    grpc:
+      enabled: true
+    postgres:
+      enabled: true
+    mysql:
+      enabled: true
+    redis:
+      enabled: true
+    mongodb:
+      enabled: true
+    dns:
+      enabled: true
+
+# Log collection
+logs:
+  enabled: true
+  sources:
+    - type: file
+      paths:
+        - /var/log/*.log
+        - /var/log/syslog
+      excludes:
+        - /var/log/lastlog
+      format: auto
+
+# Log-trace correlation
+correlation:
+  enabled: true
+  strategy: pid_tid_timestamp
+  window: 100ms
+
+# Metrics collection
+metrics:
+  enabled: true
+  host:
+    enabled: true
+  process:
+    enabled: true
+  request:
+    enabled: true
+    buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+  interval: 15s
+
+# Telemetry exporters
+exporters:
+  otlp:
+    enabled: true
+    endpoint: localhost:4317
+    protocol: grpc
+    insecure: true
+    # headers:
+    #   Authorization: "Bearer <token>"
+  stdout:
+    enabled: false
+    format: text
+
+# Service discovery
+discovery:
+  enabled: true
+  env_vars:
+    - OTEL_SERVICE_NAME
+    - SERVICE_NAME
+    - DD_SERVICE
+    - APP_NAME
+  port_mappings:
+    3306: mysql
+    5432: postgresql
+    6379: redis
+    27017: mongodb
+    9092: kafka
+    5672: rabbitmq
+
+# CPU profiling (Linux only)
+profiling:
+  enabled: false
+  sample_rate: 99
+  interval: 10s
+
+# Packet capture fallback
+capture:
+  enabled: false
+  # interfaces: [eth0]
+  # bpf_filter: "tcp port 80"
