@@ -77,6 +77,8 @@ func TestMsgTypeName(t *testing.T) {
 		{MsgClose, "CLOSE"},
 		{MsgSSLOut, "SSL_OUT"},
 		{MsgSSLIn, "SSL_IN"},
+		{MsgAccept, "ACCEPT"},
+		{MsgLogWrite, "LOG_WRITE"},
 		{99, "UNKNOWN(99)"},
 	}
 
@@ -85,6 +87,53 @@ func TestMsgTypeName(t *testing.T) {
 		if got != tt.name {
 			t.Errorf("MsgTypeName(%d) = %q, want %q", tt.t, got, tt.name)
 		}
+	}
+}
+
+func TestMsgLogWriteConstant(t *testing.T) {
+	if MsgLogWrite != 8 {
+		t.Errorf("MsgLogWrite = %d, want 8", MsgLogWrite)
+	}
+}
+
+func TestParseLogWriteMessage(t *testing.T) {
+	payload := []byte("INFO: user logged in\n")
+	buf := make([]byte, HeaderSize+len(payload))
+
+	buf[0] = MsgLogWrite
+	binary.LittleEndian.PutUint32(buf[4:8], 5555)              // pid
+	binary.LittleEndian.PutUint32(buf[8:12], 6666)             // tid
+	binary.LittleEndian.PutUint32(buf[12:16], 7)               // fd (log file)
+	binary.LittleEndian.PutUint32(buf[16:20], uint32(len(payload)))
+	binary.LittleEndian.PutUint64(buf[24:32], 9999999)
+	copy(buf[HeaderSize:], payload)
+
+	msg, err := ParseMessage(buf)
+	if err != nil {
+		t.Fatalf("ParseMessage error: %v", err)
+	}
+
+	if msg.Header.MsgType != MsgLogWrite {
+		t.Errorf("MsgType = %d, want %d", msg.Header.MsgType, MsgLogWrite)
+	}
+	if msg.Header.PID != 5555 {
+		t.Errorf("PID = %d, want 5555", msg.Header.PID)
+	}
+	if msg.Header.TID != 6666 {
+		t.Errorf("TID = %d, want 6666", msg.Header.TID)
+	}
+	if string(msg.Payload) != string(payload) {
+		t.Errorf("payload = %q, want %q", msg.Payload, payload)
+	}
+	// LogWrite is neither inbound nor outbound data
+	if msg.IsOutbound() {
+		t.Error("LogWrite should not be outbound")
+	}
+	if msg.IsInbound() {
+		t.Error("LogWrite should not be inbound")
+	}
+	if msg.IsSSL() {
+		t.Error("LogWrite should not be SSL")
 	}
 }
 

@@ -18,7 +18,8 @@ type Callbacks struct {
 	OnAccept  func(pid, tid uint32, fd int32, remoteAddr uint32, remotePort uint16, ts uint64) // R2.3: inbound
 	OnDataOut func(pid, tid uint32, fd int32, data []byte, ts uint64)
 	OnDataIn  func(pid, tid uint32, fd int32, data []byte, ts uint64)
-	OnClose   func(pid, tid uint32, fd int32, ts uint64)
+	OnClose    func(pid, tid uint32, fd int32, ts uint64)
+	OnLogWrite func(pid, tid uint32, fd int32, data []byte, ts uint64) // R6: log write capture
 }
 
 // Manager listens on a Unix DGRAM socket for hook events from libolly.so.
@@ -29,9 +30,10 @@ type Manager struct {
 	callbacks  Callbacks
 	numWorkers int
 
-	conn   *net.UnixConn
-	wg     sync.WaitGroup
-	stopCh chan struct{}
+	conn    *net.UnixConn
+	control *ControlFile
+	wg      sync.WaitGroup
+	stopCh  chan struct{}
 }
 
 // NewManager creates a new hook manager.
@@ -78,6 +80,15 @@ func (m *Manager) Start(ctx context.Context) error {
 	// Allow all users to write to the socket
 	os.Chmod(m.socketPath, 0777)
 
+	// Create shared memory control file for on-demand tracing
+	ctrl, err := CreateControlFile(dir)
+	if err != nil {
+		m.logger.Warn("failed to create control file (on-demand tracing unavailable)", zap.Error(err))
+	} else {
+		m.control = ctrl
+		m.logger.Info("control file created", zap.String("path", ctrl.Path()))
+	}
+
 	m.logger.Info("hook manager listening",
 		zap.String("socket", m.socketPath),
 		zap.Int("workers", m.numWorkers),
@@ -101,8 +112,39 @@ func (m *Manager) Stop() error {
 		m.conn.Close()
 	}
 	m.wg.Wait()
+	if m.control != nil {
+		m.control.Close()
+		m.control.Remove()
+	}
 	os.Remove(m.socketPath)
 	return nil
+}
+
+// EnableTracing activates tracing in all hooked processes via shared memory.
+func (m *Manager) EnableTracing() error {
+	if m.control == nil {
+		return fmt.Errorf("control file not available")
+	}
+	m.logger.Info("tracing enabled")
+	return m.control.Enable()
+}
+
+// DisableTracing deactivates tracing. Hooks become pass-through (~1ns overhead).
+func (m *Manager) DisableTracing() error {
+	if m.control == nil {
+		return fmt.Errorf("control file not available")
+	}
+	m.logger.Info("tracing disabled (dormant)")
+	return m.control.Disable()
+}
+
+// IsTracingEnabled returns the current tracing state.
+func (m *Manager) IsTracingEnabled() bool {
+	if m.control == nil {
+		return true // no control file = legacy always-active mode
+	}
+	enabled, _ := m.control.IsEnabled()
+	return enabled
 }
 
 func (m *Manager) readLoop(ctx context.Context, workerID int) {
@@ -186,6 +228,11 @@ func (m *Manager) dispatch(msg *Message) {
 	case MsgClose:
 		if m.callbacks.OnClose != nil {
 			m.callbacks.OnClose(h.PID, h.TID, h.FD, h.TimestampNS)
+		}
+
+	case MsgLogWrite:
+		if m.callbacks.OnLogWrite != nil && len(msg.Payload) > 0 {
+			m.callbacks.OnLogWrite(h.PID, h.TID, h.FD, msg.Payload, h.TimestampNS)
 		}
 	}
 }

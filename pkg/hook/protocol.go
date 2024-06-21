@@ -13,7 +13,8 @@ const (
 	MsgClose   = 4
 	MsgSSLOut  = 5
 	MsgSSLIn   = 6
-	MsgAccept  = 7 // R2.3: Inbound connection via accept()
+	MsgAccept   = 7 // R2.3: Inbound connection via accept()
+	MsgLogWrite = 8 // R6: Log write capture via write() hook
 )
 
 // HeaderSize is the fixed size of the binary wire protocol header.
@@ -55,6 +56,8 @@ func MsgTypeName(t uint8) string {
 		return "SSL_IN"
 	case MsgAccept:
 		return "ACCEPT"
+	case MsgLogWrite:
+		return "LOG_WRITE"
 	default:
 		return fmt.Sprintf("UNKNOWN(%d)", t)
 	}

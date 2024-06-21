@@ -6,3 +6,10 @@ logs:
       paths:
         - /var/log/demo-app/*.log
       format: json
+
+# Hook-based log capture (R6: write() hook)
+# Captures stdout/stderr/file writes at the syscall level via libolly.c.
+# Provides PID+TID context for automatic log-trace correlation.
+# hook logs have Source="hook", file-tailed logs have Source="file".
+hook:
+  log_capture: true

@@ -2,10 +2,14 @@ import json
 import logging
 import os
 import time
+import urllib.request
+import urllib.error
 from datetime import datetime
 
 import psycopg2
 from flask import Flask, jsonify, request
+
+ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://localhost:3001")
 
 app = Flask(__name__)
 
@@ -98,6 +102,39 @@ def get_user(user_id):
         )
     finally:
         conn.close()
+
+
+@app.route("/orders", methods=["GET"])
+def list_orders():
+    """Calls the Go order-service — creates a cross-service trace."""
+    app.logger.info("Listing orders (calling order-service)")
+    try:
+        resp = urllib.request.urlopen(f"{ORDER_SERVICE_URL}/api/orders")
+        data = json.loads(resp.read())
+        return jsonify(data)
+    except urllib.error.URLError as e:
+        app.logger.error(f"order-service call failed: {e}")
+        return jsonify({"error": "order-service unavailable"}), 502
+
+
+@app.route("/orders", methods=["POST"])
+def create_order():
+    """Calls the Go order-service — creates a cross-service trace."""
+    data = request.get_json(force=True)
+    app.logger.info(f"Creating order (calling order-service): {data}")
+    try:
+        req = urllib.request.Request(
+            f"{ORDER_SERVICE_URL}/api/orders",
+            data=json.dumps(data).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req)
+        result = json.loads(resp.read())
+        return jsonify(result), 201
+    except urllib.error.URLError as e:
+        app.logger.error(f"order-service call failed: {e}")
+        return jsonify({"error": "order-service unavailable"}), 502
 
 
 @app.route("/slow")

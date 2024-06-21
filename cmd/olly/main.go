@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/mbeema/olly/pkg/agent"
 	"github.com/mbeema/olly/pkg/config"
+	"github.com/mbeema/olly/pkg/hook"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -21,6 +23,12 @@ var (
 )
 
 func main() {
+	// Handle subcommands before flag parsing
+	if len(os.Args) > 1 && os.Args[1] == "trace" {
+		handleTraceCmd(os.Args[2:])
+		return
+	}
+
 	var (
 		configPath  string
 		configDir   string
@@ -191,4 +199,76 @@ func newLogger(level string) (*zap.Logger, error) {
 	cfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 
 	return cfg.Build()
+}
+
+// handleTraceCmd implements the 'olly trace <start|stop|status>' subcommands
+// for on-demand tracing control.
+func handleTraceCmd(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: olly trace <start|stop|status> [--socket-dir DIR]")
+		os.Exit(1)
+	}
+
+	subCmd := args[0]
+
+	fs := flag.NewFlagSet("trace", flag.ExitOnError)
+	socketDir := fs.String("socket-dir", "", "path to olly runtime directory")
+	fs.Parse(args[1:])
+
+	// Derive socket dir from config or default
+	dir := *socketDir
+	if dir == "" {
+		dir = filepath.Dir(config.DefaultConfig().Hook.SocketPath)
+	}
+
+	switch subCmd {
+	case "start":
+		ctrl, err := hook.OpenControlFile(dir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\nIs the olly agent running?\n", err)
+			os.Exit(1)
+		}
+		defer ctrl.Close()
+		if err := ctrl.Enable(); err != nil {
+			fmt.Fprintf(os.Stderr, "error enabling tracing: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("tracing enabled — all hooked processes are now active")
+
+	case "stop":
+		ctrl, err := hook.OpenControlFile(dir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\nIs the olly agent running?\n", err)
+			os.Exit(1)
+		}
+		defer ctrl.Close()
+		if err := ctrl.Disable(); err != nil {
+			fmt.Fprintf(os.Stderr, "error disabling tracing: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("tracing disabled — hooks are dormant (~0ns overhead)")
+
+	case "status":
+		ctrl, err := hook.OpenControlFile(dir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\nIs the olly agent running?\n", err)
+			os.Exit(1)
+		}
+		defer ctrl.Close()
+		enabled, err := ctrl.IsEnabled()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error reading status: %v\n", err)
+			os.Exit(1)
+		}
+		if enabled {
+			fmt.Println("tracing: active")
+		} else {
+			fmt.Println("tracing: dormant")
+		}
+
+	default:
+		fmt.Fprintf(os.Stderr, "unknown trace command: %s\n", subCmd)
+		fmt.Fprintln(os.Stderr, "usage: olly trace <start|stop|status> [--socket-dir DIR]")
+		os.Exit(1)
+	}
 }

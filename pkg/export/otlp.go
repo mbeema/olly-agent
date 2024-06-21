@@ -319,6 +319,9 @@ func (e *OTLPExporter) ExportLogs(ctx context.Context, logs []*LogRecord) error 
 			l.Attributes["log.file.path"] = l.FilePath
 			l.Attributes["log.file.name"] = filepath.Base(l.FilePath)
 		}
+		if l.Source != "" {
+			l.Attributes["source"] = l.Source
+		}
 
 		for k, v := range l.Attributes {
 			pl.Attributes = append(pl.Attributes, &commonpb.KeyValue{

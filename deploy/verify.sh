@@ -14,14 +14,39 @@ fi
 
 SSH_CMD="ssh -o StrictHostKeyChecking=no -i $KEY_PATH ec2-user@$EC2_IP"
 
-echo "=== Verifying OTEL Collector output on $EC2_IP ==="
+echo "=== Verifying Olly deployment on $EC2_IP ==="
 
 $SSH_CMD <<'VERIFY'
 echo ""
 echo "=== Process Status ==="
-echo "OTEL Collector: $(systemctl is-active otelcol-contrib)"
+echo "OTEL Collector: $(systemctl is-active otelcol-contrib 2>/dev/null || echo 'NOT FOUND')"
 echo "Olly Agent PID: $(pgrep -x olly || echo 'NOT RUNNING')"
-echo "Demo App PID:   $(pgrep -x python3 || echo 'NOT RUNNING')"
+echo "Demo App PID:   $(pgrep -f 'python3.*app.py' || echo 'NOT RUNNING')"
+
+echo ""
+echo "=== On-Demand Tracing Status ==="
+if [ -f /var/run/olly/control ]; then
+    BYTE=$(od -An -tx1 -N1 /var/run/olly/control 2>/dev/null | tr -d ' ')
+    if [ "$BYTE" = "01" ]; then
+        echo "Tracing: ACTIVE"
+    else
+        echo "Tracing: DORMANT (run: sudo /opt/olly/olly trace start)"
+    fi
+else
+    echo "Control file not found (always-active mode)"
+fi
+
+echo ""
+echo "=== OTEL Collector Export Metrics ==="
+if curl -s http://localhost:8888/metrics > /tmp/otel_metrics.txt 2>/dev/null; then
+    echo "--- Sent ---"
+    grep 'otelcol_exporter_sent_' /tmp/otel_metrics.txt | grep -v '^#' | grep 'grafana_cloud' || echo "  (no grafana_cloud exports)"
+    grep 'otelcol_exporter_sent_' /tmp/otel_metrics.txt | grep -v '^#' | grep 'file/' || echo "  (no file exports)"
+    echo "--- Failed ---"
+    grep 'otelcol_exporter_send_failed' /tmp/otel_metrics.txt | grep -v '^#' | grep 'grafana_cloud' || echo "  (no failures)"
+else
+    echo "Collector metrics endpoint not available"
+fi
 
 echo ""
 echo "=== Traces ==="
@@ -35,7 +60,25 @@ if [ -f /var/log/otel/traces.json ]; then
     echo "--- Last 3 span names ---"
     grep -o '"name":"[^"]*"' /var/log/otel/traces.json 2>/dev/null | tail -3
 else
-    echo "NOT FOUND"
+    echo "NOT FOUND (file exporter not enabled or no data yet)"
+fi
+
+echo ""
+echo "=== Logs ==="
+if [ -f /var/log/otel/logs.json ]; then
+    echo "File size: $(wc -c < /var/log/otel/logs.json) bytes"
+    TOTAL_LOGS=$(grep -c '"body"' /var/log/otel/logs.json 2>/dev/null || echo 0)
+    HOOK_LOGS=$(grep -c '"source","value":{"stringValue":"hook"}' /var/log/otel/logs.json 2>/dev/null || echo 0)
+    FILE_LOGS=$(grep -c '"source","value":{"stringValue":"file"}' /var/log/otel/logs.json 2>/dev/null || echo 0)
+    WITH_TRACE=$(grep -c '"traceId":"[0-9a-f]\{16,\}"' /var/log/otel/logs.json 2>/dev/null || echo 0)
+    echo "Total logs: $TOTAL_LOGS (hook: $HOOK_LOGS, file: $FILE_LOGS)"
+    echo "Logs with traceId: $WITH_TRACE"
+    if [ "$HOOK_LOGS" -gt 0 ]; then
+        PCT=$((WITH_TRACE * 100 / HOOK_LOGS))
+        echo "Hook-log correlation rate: ${PCT}%"
+    fi
+else
+    echo "NOT FOUND (file exporter not enabled or no data yet)"
 fi
 
 echo ""
@@ -45,25 +88,15 @@ if [ -f /var/log/otel/metrics.json ]; then
     echo "--- Metric names ---"
     grep -o '"name":"[^"]*"' /var/log/otel/metrics.json 2>/dev/null | sort -u | head -20
 else
-    echo "NOT FOUND"
-fi
-
-echo ""
-echo "=== Logs ==="
-if [ -f /var/log/otel/logs.json ]; then
-    echo "File size: $(wc -c < /var/log/otel/logs.json) bytes"
-    echo "--- Last 3 log entries ---"
-    tail -3 /var/log/otel/logs.json | python3 -m json.tool 2>/dev/null || tail -3 /var/log/otel/logs.json
-else
-    echo "NOT FOUND"
+    echo "NOT FOUND (file exporter not enabled or no data yet)"
 fi
 
 echo ""
 echo "=== Demo App Logs (last 5 lines) ==="
-if [ -f /var/log/demo-app/app.log ]; then
-    tail -5 /var/log/demo-app/app.log
-elif [ -f /var/log/demo-app/stdout.log ]; then
+if [ -f /var/log/demo-app/stdout.log ]; then
     tail -5 /var/log/demo-app/stdout.log
+elif [ -f /var/log/demo-app/app.log ]; then
+    tail -5 /var/log/demo-app/app.log
 else
     echo "NOT FOUND"
 fi
