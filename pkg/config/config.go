@@ -122,9 +122,17 @@ type DiscoveryConfig struct {
 }
 
 type ProfilingConfig struct {
-	Enabled    bool          `yaml:"enabled"`
-	SampleRate int           `yaml:"sample_rate"` // Hz
-	Interval   time.Duration `yaml:"interval"`
+	Enabled    bool            `yaml:"enabled"`
+	SampleRate int             `yaml:"sample_rate"` // Hz
+	Interval   time.Duration   `yaml:"interval"`
+	Pyroscope  PyroscopeConfig `yaml:"pyroscope"`
+}
+
+type PyroscopeConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Endpoint string `yaml:"endpoint"` // e.g., "https://profiles-prod-us-east-0.grafana.net"
+	Username string `yaml:"username"` // Grafana Cloud instance ID (or empty for unauthenticated)
+	Password string `yaml:"password"` // Grafana Cloud API token (or empty for unauthenticated)
 }
 
 type CaptureConfig struct {
@@ -225,6 +233,10 @@ func DefaultConfig() *Config {
 			Enabled:    false,
 			SampleRate: 99,
 			Interval:   10 * time.Second,
+			Pyroscope: PyroscopeConfig{
+				Enabled:  false,
+				Endpoint: "http://localhost:4040",
+			},
 		},
 		Capture: CaptureConfig{
 			Enabled: false,
@@ -295,6 +307,10 @@ func (c *Config) Validate() error {
 
 	if c.Profiling.Enabled && c.Profiling.SampleRate <= 0 {
 		return fmt.Errorf("profiling.sample_rate must be positive")
+	}
+
+	if c.Profiling.Enabled && c.Profiling.Pyroscope.Enabled && c.Profiling.Pyroscope.Endpoint == "" {
+		return fmt.Errorf("profiling.pyroscope.endpoint is required when pyroscope is enabled")
 	}
 
 	return nil

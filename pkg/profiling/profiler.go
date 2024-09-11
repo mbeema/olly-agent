@@ -14,7 +14,7 @@ type StackFrame struct {
 	Line     int
 }
 
-// Sample represents a CPU profiling sample.
+// Sample represents a CPU profiling sample (internal use).
 type Sample struct {
 	PID       uint32
 	TID       uint32
@@ -23,11 +23,20 @@ type Sample struct {
 	Count     uint64
 }
 
+// Profile is an aggregated CPU profile ready for export.
+type Profile struct {
+	ServiceName string
+	Start       time.Time
+	End         time.Time
+	PProfData   []byte // gzip'd pprof protobuf
+}
+
 // Profiler is the interface for CPU profiling.
 type Profiler interface {
 	Start(ctx context.Context) error
 	Stop() error
-	OnSample(fn func(*Sample))
+	OnProfile(fn func(*Profile))
+	SetServiceResolver(fn func(pid uint32) string)
 }
 
 // Config holds profiler configuration.
