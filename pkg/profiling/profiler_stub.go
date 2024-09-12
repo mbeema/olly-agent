@@ -26,6 +26,10 @@ func (p *stubProfiler) Stop() error {
 	return nil
 }
 
-func (p *stubProfiler) OnSample(fn func(*Sample)) {
+func (p *stubProfiler) OnProfile(fn func(*Profile)) {
+	// No-op
+}
+
+func (p *stubProfiler) SetServiceResolver(fn func(pid uint32) string) {
 	// No-op
 }

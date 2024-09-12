@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mbeema/olly/pkg/config"
+	"github.com/mbeema/olly/pkg/profiling"
 	"github.com/mbeema/olly/pkg/traces"
 	"go.uber.org/zap"
 )
@@ -89,29 +90,34 @@ type Manager struct {
 	logger    *zap.Logger
 	exporters []Exporter
 
-	spanCh   chan *traces.Span
-	logCh    chan *LogRecord
-	metricCh chan *Metric
+	spanCh    chan *traces.Span
+	logCh     chan *LogRecord
+	metricCh  chan *Metric
+	profileCh chan *profiling.Profile
 
-	spanCount   atomic.Int64
-	logCount    atomic.Int64
-	metricCount atomic.Int64
-	dropCount   atomic.Int64
+	spanCount    atomic.Int64
+	logCount     atomic.Int64
+	metricCount  atomic.Int64
+	profileCount atomic.Int64
+	dropCount    atomic.Int64
 
 	batchSize     int
 	flushInterval time.Duration
+
+	pyroscope *PyroscopeExporter
 
 	wg     sync.WaitGroup
 	stopCh chan struct{}
 }
 
 // NewManager creates a new export manager from configuration.
-func NewManager(cfg *config.ExportersConfig, serviceName string, logger *zap.Logger) (*Manager, error) {
+func NewManager(cfg *config.ExportersConfig, serviceName string, logger *zap.Logger, pyroscopeCfg ...*config.PyroscopeConfig) (*Manager, error) {
 	m := &Manager{
 		logger:        logger,
 		spanCh:        make(chan *traces.Span, defaultChannelSize),
 		logCh:         make(chan *LogRecord, defaultChannelSize),
 		metricCh:      make(chan *Metric, defaultChannelSize),
+		profileCh:     make(chan *profiling.Profile, defaultChannelSize),
 		batchSize:     defaultBatchSize,
 		flushInterval: defaultFlushInterval,
 		stopCh:        make(chan struct{}),
@@ -131,6 +137,12 @@ func NewManager(cfg *config.ExportersConfig, serviceName string, logger *zap.Log
 		m.exporters = append(m.exporters, NewStdoutExporter(cfg.Stdout.Format, logger))
 	}
 
+	// Initialize Pyroscope exporter if configured
+	if len(pyroscopeCfg) > 0 && pyroscopeCfg[0] != nil && pyroscopeCfg[0].Enabled {
+		m.pyroscope = NewPyroscopeExporter(pyroscopeCfg[0], logger)
+		logger.Info("pyroscope exporter enabled", zap.String("endpoint", pyroscopeCfg[0].Endpoint))
+	}
+
 	return m, nil
 }
 
@@ -141,10 +153,16 @@ func (m *Manager) Start(ctx context.Context) error {
 	go m.processLogs(ctx)
 	go m.processMetrics(ctx)
 
+	if m.pyroscope != nil {
+		m.wg.Add(1)
+		go m.processProfiles(ctx)
+	}
+
 	m.logger.Info("export manager started",
 		zap.Int("exporters", len(m.exporters)),
 		zap.Int("batch_size", m.batchSize),
 		zap.Duration("flush_interval", m.flushInterval),
+		zap.Bool("pyroscope", m.pyroscope != nil),
 	)
 
 	return nil
@@ -164,10 +182,17 @@ func (m *Manager) Stop() error {
 		}
 	}
 
+	if m.pyroscope != nil {
+		if err := m.pyroscope.Shutdown(ctx); err != nil {
+			m.logger.Error("pyroscope shutdown error", zap.Error(err))
+		}
+	}
+
 	m.logger.Info("export manager stopped",
 		zap.Int64("spans_exported", m.spanCount.Load()),
 		zap.Int64("logs_exported", m.logCount.Load()),
 		zap.Int64("metrics_exported", m.metricCount.Load()),
+		zap.Int64("profiles_exported", m.profileCount.Load()),
 		zap.Int64("dropped", m.dropCount.Load()),
 	)
 
@@ -201,6 +226,16 @@ func (m *Manager) ExportMetric(metric *Metric) {
 	default:
 		m.dropCount.Add(1)
 		m.logger.Warn("metric channel full, dropping metric")
+	}
+}
+
+// ExportProfile queues a profile for export.
+func (m *Manager) ExportProfile(p *profiling.Profile) {
+	select {
+	case m.profileCh <- p:
+	default:
+		m.dropCount.Add(1)
+		m.logger.Warn("profile channel full, dropping profile")
 	}
 }
 
@@ -328,6 +363,62 @@ func (m *Manager) processMetrics(ctx context.Context) {
 	}
 }
 
+func (m *Manager) processProfiles(ctx context.Context) {
+	defer m.wg.Done()
+
+	batch := make([]*profiling.Profile, 0, 16)
+	ticker := time.NewTicker(m.flushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case p := <-m.profileCh:
+			batch = append(batch, p)
+			if len(batch) >= 16 {
+				m.flushProfiles(ctx, batch)
+				batch = batch[:0]
+			}
+
+		case <-ticker.C:
+			if len(batch) > 0 {
+				m.flushProfiles(ctx, batch)
+				batch = batch[:0]
+			}
+
+		case <-m.stopCh:
+			for {
+				select {
+				case p := <-m.profileCh:
+					batch = append(batch, p)
+				default:
+					if len(batch) > 0 {
+						m.flushProfiles(ctx, batch)
+					}
+					return
+				}
+			}
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (m *Manager) flushProfiles(ctx context.Context, profiles []*profiling.Profile) {
+	if m.pyroscope == nil {
+		return
+	}
+	for _, p := range profiles {
+		if err := m.pyroscope.ExportProfile(ctx, p); err != nil {
+			m.logger.Error("pyroscope export error",
+				zap.String("service", p.ServiceName),
+				zap.Error(err),
+			)
+		}
+	}
+	m.profileCount.Add(int64(len(profiles)))
+}
+
 // H1 fix: flushSpans with exponential backoff retry.
 func (m *Manager) flushSpans(ctx context.Context, spans []*traces.Span) {
 	for _, exp := range m.exporters {
@@ -401,6 +492,6 @@ func (m *Manager) retryExport(ctx context.Context, signal string, exportFn func(
 }
 
 // Stats returns current export statistics.
-func (m *Manager) Stats() (spans, logs, metrics int64) {
-	return m.spanCount.Load(), m.logCount.Load(), m.metricCount.Load()
+func (m *Manager) Stats() (spans, logs, metrics, profiles int64) {
+	return m.spanCount.Load(), m.logCount.Load(), m.metricCount.Load(), m.profileCount.Load()
 }

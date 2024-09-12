@@ -3,3 +3,8 @@ profiling:
   enabled: true
   sample_rate: 99
   interval: 10s
+  pyroscope:
+    enabled: true
+    endpoint: "https://profiles-prod-001.grafana.net"
+    username: "${GRAFANA_CLOUD_INSTANCE_ID}"
+    password: "${GRAFANA_CLOUD_API_TOKEN}"
