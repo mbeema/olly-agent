@@ -14,6 +14,7 @@ import (
 	"github.com/mbeema/olly/pkg/discovery"
 	"github.com/mbeema/olly/pkg/export"
 	"github.com/mbeema/olly/pkg/hook"
+	hookebpf "github.com/mbeema/olly/pkg/hook/ebpf"
 	"github.com/mbeema/olly/pkg/logs"
 	"github.com/mbeema/olly/pkg/metrics"
 	rmetrics "github.com/mbeema/olly/pkg/metrics"
@@ -33,19 +34,21 @@ type Agent struct {
 	cfg    atomic.Pointer[config.Config]
 	logger *zap.Logger
 
-	hookMgr        *hook.Manager
-	logParser      *logs.Parser
-	connTracker    *conntrack.Tracker
-	reassembler    *reassembly.Reassembler
-	traceProc      *traces.Processor
-	correlation    *correlation.Engine
-	logCollector   *logs.Collector
-	metricsColl    *metrics.Collector
-	requestMetrics *rmetrics.RequestMetrics
-	exporter       *export.Manager
-	discoverer     *discovery.Discoverer
-	serviceMap     *servicemap.Generator
-	profiler       profiling.Profiler
+	hookProvider    hook.HookProvider
+	logParser       *logs.Parser
+	connTracker     *conntrack.Tracker
+	reassembler     *reassembly.Reassembler
+	traceProc       *traces.Processor
+	correlation     *correlation.Engine
+	logCollector    *logs.Collector
+	metricsColl     *metrics.Collector
+	requestMetrics  *rmetrics.RequestMetrics
+	processColl     *metrics.ProcessCollector
+	containerColl   *metrics.ContainerCollector
+	exporter        *export.Manager
+	discoverer      *discovery.Discoverer
+	serviceMap      *servicemap.Generator
+	profiler        profiling.Profiler
 
 	// Decoupled channels (C9 fix) - prevent callback deadlocks
 	pairCh chan *reassembly.RequestPair
@@ -109,13 +112,32 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 
 	// Initialize log collector
 	if cfg.Logs.Enabled {
-		a.logCollector = logs.NewCollector(&cfg.Logs, logger)
+		logsCfg := cfg.Logs
+		// Append security log sources if security logging is enabled
+		if logsCfg.Security.Enabled {
+			logsCfg.Sources = append(logsCfg.Sources, logs.DefaultSecurityLogSources()...)
+			logger.Info("security/audit log collection enabled")
+		}
+		a.logCollector = logs.NewCollector(&logsCfg, logger)
 	}
 
 	// Initialize metrics collector
 	if cfg.Metrics.Enabled {
 		a.metricsColl = metrics.NewCollector(&cfg.Metrics, logger)
 		a.requestMetrics = rmetrics.NewRequestMetrics(cfg.Metrics.Request.Buckets)
+
+		// Per-process metrics
+		if cfg.Metrics.PerProcess.Enabled {
+			a.processColl = metrics.NewProcessCollector(logger)
+			for _, pid := range cfg.Metrics.PerProcess.PIDs {
+				a.processColl.AddPID(pid)
+			}
+		}
+
+		// Container metrics (auto-detected)
+		if cfg.Metrics.Container.Enabled {
+			a.containerColl = metrics.NewContainerCollector(logger)
+		}
 	}
 
 	// Initialize discovery
@@ -128,6 +150,7 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 		a.profiler = profiling.New(&profiling.Config{
 			SampleRate: cfg.Profiling.SampleRate,
 			Interval:   cfg.Profiling.Interval,
+			OnDemand:   cfg.Profiling.OnDemand,
 			Logger:     logger,
 		})
 	}
@@ -135,7 +158,40 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 	// Initialize service map
 	a.serviceMap = servicemap.NewGenerator(logger)
 
+	// Select hook provider: prefer eBPF, fall back to socket manager, stub if unsupported
+	if cfg.Hook.Enabled {
+		a.hookProvider = selectHookProvider(cfg, logger)
+	}
+
 	return a, nil
+}
+
+// selectHookProvider picks the best available hook provider for the platform.
+func selectHookProvider(cfg *config.Config, logger *zap.Logger) hook.HookProvider {
+	// Try eBPF first (Linux 5.8+ with BTF)
+	support := hookebpf.Detect()
+	if support.Available {
+		logger.Info("eBPF support detected",
+			zap.String("kernel", support.KernelVersion),
+			zap.Bool("btf", support.HasBTF),
+		)
+		return hookebpf.NewProvider(cfg, logger)
+	}
+
+	logger.Info("eBPF not available, checking fallback options",
+		zap.String("reason", support.Reason),
+	)
+
+	// Fall back to legacy socket-based manager if socket_path is configured
+	if cfg.Hook.SocketPath != "" {
+		logger.Info("using legacy socket hook provider",
+			zap.String("socket", cfg.Hook.SocketPath),
+		)
+		return hook.NewManager(cfg.Hook.SocketPath, logger)
+	}
+
+	// Stub provider — agent runs without hook tracing
+	return hookebpf.NewStubProvider(support.Reason, logger)
 }
 
 // Start begins all agent subsystems and wires them together.
@@ -151,6 +207,11 @@ func (a *Agent) Start(ctx context.Context) error {
 	callbacks := hook.Callbacks{
 		OnConnect: func(pid, tid uint32, fd int32, remoteAddr uint32, remotePort uint16, ts uint64) {
 			a.connTracker.Register(pid, fd, remoteAddr, remotePort)
+
+			// Auto-discover PIDs for per-process metrics
+			if a.processColl != nil {
+				a.processColl.AddPID(pid)
+			}
 
 			// Update service map
 			if a.discoverer != nil && a.serviceMap != nil {
@@ -286,18 +347,16 @@ func (a *Agent) Start(ctx context.Context) error {
 		return fmt.Errorf("start exporter: %w", err)
 	}
 
-	if cfg.Hook.Enabled {
-		a.hookMgr = hook.NewManager(cfg.Hook.SocketPath, callbacks, a.logger)
-		if err := a.hookMgr.Start(ctx); err != nil {
-			return fmt.Errorf("start hook manager: %w", err)
+	if cfg.Hook.Enabled && a.hookProvider != nil {
+		if err := a.hookProvider.Start(ctx, callbacks); err != nil {
+			return fmt.Errorf("start hook provider: %w", err)
 		}
+		a.logger.Info("hook provider started", zap.String("provider", a.hookProvider.Name()))
 		// Set initial tracing state based on on_demand config
 		if cfg.Hook.OnDemand {
 			a.logger.Info("on-demand tracing: starting dormant (use 'olly trace start' to activate)")
-			// Control file starts dormant by default — no action needed
 		} else {
-			// Legacy mode: enable tracing immediately
-			if err := a.hookMgr.EnableTracing(); err != nil {
+			if err := a.hookProvider.EnableTracing(); err != nil {
 				a.logger.Warn("failed to enable tracing", zap.Error(err))
 			}
 		}
@@ -312,6 +371,42 @@ func (a *Agent) Start(ctx context.Context) error {
 	if a.metricsColl != nil {
 		if err := a.metricsColl.Start(ctx); err != nil {
 			a.logger.Warn("metrics collector start error", zap.Error(err))
+		}
+	}
+
+	// Start per-process metrics
+	if a.processColl != nil {
+		a.processColl.OnMetric(func(m *metrics.Metric) {
+			a.exporter.ExportMetric(&export.Metric{
+				Name:        m.Name,
+				Description: m.Description,
+				Unit:        m.Unit,
+				Type:        export.MetricType(m.Type),
+				Value:       m.Value,
+				Timestamp:   m.Timestamp,
+				Labels:      m.Labels,
+			})
+		})
+		if err := a.processColl.Start(ctx, cfg.Metrics.Interval); err != nil {
+			a.logger.Warn("process metrics start error", zap.Error(err))
+		}
+	}
+
+	// Start container metrics
+	if a.containerColl != nil {
+		a.containerColl.OnMetric(func(m *metrics.Metric) {
+			a.exporter.ExportMetric(&export.Metric{
+				Name:        m.Name,
+				Description: m.Description,
+				Unit:        m.Unit,
+				Type:        export.MetricType(m.Type),
+				Value:       m.Value,
+				Timestamp:   m.Timestamp,
+				Labels:      m.Labels,
+			})
+		})
+		if err := a.containerColl.Start(ctx, cfg.Metrics.Interval); err != nil {
+			a.logger.Warn("container metrics start error", zap.Error(err))
 		}
 	}
 
@@ -566,8 +661,8 @@ func (a *Agent) Stop() error {
 		a.cancel()
 	}
 
-	if a.hookMgr != nil {
-		a.hookMgr.Stop()
+	if a.hookProvider != nil {
+		a.hookProvider.Stop()
 	}
 
 	if a.logCollector != nil {
@@ -576,6 +671,14 @@ func (a *Agent) Stop() error {
 
 	if a.metricsColl != nil {
 		a.metricsColl.Stop()
+	}
+
+	if a.processColl != nil {
+		a.processColl.Stop()
+	}
+
+	if a.containerColl != nil {
+		a.containerColl.Stop()
 	}
 
 	if a.profiler != nil {
@@ -725,6 +828,7 @@ func (a *Agent) startProfiling() {
 	a.profiler = profiling.New(&profiling.Config{
 		SampleRate: cfg.Profiling.SampleRate,
 		Interval:   cfg.Profiling.Interval,
+		OnDemand:   cfg.Profiling.OnDemand,
 		Logger:     a.logger,
 	})
 	if a.discoverer != nil {

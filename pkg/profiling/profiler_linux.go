@@ -5,7 +5,11 @@ package profiling
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
+	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -52,6 +56,12 @@ type linuxProfiler struct {
 
 	// Service name resolution
 	resolveService func(pid uint32) string
+
+	// On-demand state
+	stateMu    sync.Mutex
+	state      ProfileState
+	ctx        context.Context
+	cancelFunc context.CancelFunc
 }
 
 // openPerfEvent opens a perf_event fd for CPU profiling on the given CPU.
@@ -96,6 +106,18 @@ func (p *linuxProfiler) SetServiceResolver(fn func(pid uint32) string) {
 }
 
 func (p *linuxProfiler) Start(ctx context.Context) error {
+	p.ctx = ctx
+
+	// On-demand mode: start idle, wait for TriggerProfile
+	if p.cfg.OnDemand {
+		p.logger.Info("CPU profiler started in on-demand mode (idle, zero overhead)")
+		return nil
+	}
+
+	return p.startPerfEvents()
+}
+
+func (p *linuxProfiler) startPerfEvents() error {
 	numCPUs := runtime.NumCPU()
 
 	// Open perf_event on each CPU for all PIDs (system-wide sampling).
@@ -157,10 +179,19 @@ func (p *linuxProfiler) Start(ctx context.Context) error {
 }
 
 func (p *linuxProfiler) Stop() error {
+	// Stop any on-demand session first
+	p.StopProfile()
+
 	close(p.stopCh)
 	p.wg.Wait()
 
-	// Disable and cleanup
+	p.cleanupPerfEvents()
+
+	p.logger.Info("CPU profiler stopped")
+	return nil
+}
+
+func (p *linuxProfiler) cleanupPerfEvents() {
 	for i, fd := range p.perfFDs {
 		unix.IoctlSetInt(fd, unix.PERF_EVENT_IOC_DISABLE, 0)
 		if i < len(p.mmaps) {
@@ -168,9 +199,192 @@ func (p *linuxProfiler) Stop() error {
 		}
 		unix.Close(fd)
 	}
+	p.perfFDs = nil
+	p.mmaps = nil
+}
 
-	p.logger.Info("CPU profiler stopped")
+// TriggerProfile starts an on-demand profiling session.
+// The profiler attaches perf events, collects for the specified duration,
+// then auto-stops and emits the profile. Zero cost before and after.
+func (p *linuxProfiler) TriggerProfile(req TriggerRequest) error {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+
+	if p.state == ProfileActive {
+		return fmt.Errorf("profiling already active")
+	}
+
+	duration := req.Duration
+	if duration == 0 {
+		duration = 30 * time.Second
+	}
+
+	p.state = ProfileActive
+	p.logger.Info("on-demand profiling triggered",
+		zap.Duration("duration", duration),
+		zap.Int("pid_count", len(req.PIDs)),
+	)
+
+	// Start perf events
+	if err := p.startPerfEvents(); err != nil {
+		p.state = ProfileIdle
+		return fmt.Errorf("start perf events: %w", err)
+	}
+
+	// Auto-stop after duration
+	go func() {
+		timer := time.NewTimer(duration)
+		defer timer.Stop()
+
+		select {
+		case <-timer.C:
+			p.logger.Info("on-demand profiling duration expired, stopping")
+			// Final flush before cleanup
+			p.flush(time.Now().Add(-duration), time.Now())
+			p.stateMu.Lock()
+			p.cleanupPerfEvents()
+			p.state = ProfileIdle
+			p.stateMu.Unlock()
+		case <-p.stopCh:
+			return
+		}
+	}()
+
+	// Collect memory profile if requested
+	for _, pt := range req.Types {
+		if pt == ProfileMemory {
+			go p.collectMemoryProfile(req.PIDs, duration)
+		}
+	}
+
 	return nil
+}
+
+// StopProfile stops an active on-demand profiling session.
+func (p *linuxProfiler) StopProfile() error {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+
+	if p.state != ProfileActive {
+		return nil
+	}
+
+	p.cleanupPerfEvents()
+	p.state = ProfileIdle
+	p.logger.Info("on-demand profiling stopped manually")
+	return nil
+}
+
+// State returns the current profiling state.
+func (p *linuxProfiler) State() ProfileState {
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	return p.state
+}
+
+// collectMemoryProfile reads /proc/<pid>/smaps_rollup for memory profiling.
+// This is a lightweight snapshot approach (like Datadog's memory profiler)
+// that captures RSS breakdown without any process modification.
+func (p *linuxProfiler) collectMemoryProfile(pids []uint32, duration time.Duration) {
+	start := time.Now()
+	end := start.Add(duration)
+
+	// If no specific PIDs, skip memory profiling (system-wide memory profiling
+	// doesn't make sense in the same way as CPU profiling)
+	if len(pids) == 0 {
+		return
+	}
+
+	// Take snapshots at intervals over the duration
+	interval := duration / 10
+	if interval < time.Second {
+		interval = time.Second
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	type memSample struct {
+		pid uint32
+		rss uint64
+	}
+	var samples []memSample
+
+	for {
+		select {
+		case <-ticker.C:
+			for _, pid := range pids {
+				rss := readSmapsRollupRSS(pid)
+				if rss > 0 {
+					samples = append(samples, memSample{pid: pid, rss: rss})
+				}
+			}
+		case <-timer.C:
+			goto done
+		case <-p.stopCh:
+			return
+		}
+	}
+
+done:
+	if len(samples) == 0 {
+		return
+	}
+
+	// Build a simple memory profile and emit
+	for _, pid := range pids {
+		var maxRSS uint64
+		for _, s := range samples {
+			if s.pid == pid && s.rss > maxRSS {
+				maxRSS = s.rss
+			}
+		}
+		if maxRSS == 0 {
+			continue
+		}
+
+		serviceName := "unknown"
+		if p.resolveService != nil {
+			serviceName = p.resolveService(pid)
+		}
+
+		profile := &Profile{
+			ServiceName: serviceName,
+			ProfileType: ProfileMemory,
+			Start:       start,
+			End:         end,
+			// Memory profiles are simpler — just the peak RSS snapshot
+			// Future: build full pprof with allocation stacks via BPF
+		}
+
+		p.mu.RLock()
+		for _, cb := range p.callbacks {
+			cb(profile)
+		}
+		p.mu.RUnlock()
+	}
+}
+
+// readSmapsRollupRSS reads RSS from /proc/<pid>/smaps_rollup (Linux 4.14+).
+// This is a single file read — very low overhead.
+func readSmapsRollupRSS(pid uint32) uint64 {
+	path := fmt.Sprintf("/proc/%d/smaps_rollup", pid)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "Rss:") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				v, _ := strconv.ParseUint(fields[1], 10, 64)
+				return v * 1024 // kB → bytes
+			}
+		}
+	}
+	return 0
 }
 
 // readLoop polls the ring buffers directly on a timer and parses perf samples.

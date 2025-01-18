@@ -24,6 +24,7 @@ type Callbacks struct {
 
 // Manager listens on a Unix DGRAM socket for hook events from libolly.so.
 // H3 fix: Uses a pool of reader goroutines for high-throughput dispatch.
+// Implements the HookProvider interface for backward compatibility.
 type Manager struct {
 	socketPath string
 	logger     *zap.Logger
@@ -36,8 +37,11 @@ type Manager struct {
 	stopCh  chan struct{}
 }
 
+// Verify Manager implements HookProvider at compile time.
+var _ HookProvider = (*Manager)(nil)
+
 // NewManager creates a new hook manager.
-func NewManager(socketPath string, callbacks Callbacks, logger *zap.Logger) *Manager {
+func NewManager(socketPath string, logger *zap.Logger) *Manager {
 	// Use at least 2 workers, up to GOMAXPROCS
 	workers := runtime.GOMAXPROCS(0)
 	if workers < 2 {
@@ -50,14 +54,14 @@ func NewManager(socketPath string, callbacks Callbacks, logger *zap.Logger) *Man
 	return &Manager{
 		socketPath: socketPath,
 		logger:     logger,
-		callbacks:  callbacks,
 		numWorkers: workers,
 		stopCh:     make(chan struct{}),
 	}
 }
 
 // Start begins listening for hook events.
-func (m *Manager) Start(ctx context.Context) error {
+func (m *Manager) Start(ctx context.Context, callbacks Callbacks) error {
+	m.callbacks = callbacks
 	// Ensure socket directory exists
 	dir := filepath.Dir(m.socketPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -145,6 +149,11 @@ func (m *Manager) IsTracingEnabled() bool {
 	}
 	enabled, _ := m.control.IsEnabled()
 	return enabled
+}
+
+// Name returns the provider name.
+func (m *Manager) Name() string {
+	return "socket"
 }
 
 func (m *Manager) readLoop(ctx context.Context, workerID int) {

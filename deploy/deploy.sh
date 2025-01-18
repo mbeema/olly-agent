@@ -50,10 +50,6 @@ sudo cp olly-deploy/olly /opt/olly/
 sudo chmod +x /opt/olly/olly
 sudo cp olly-deploy/configs/*.yaml /opt/olly/configs/
 
-# Compile libolly.so on target (C can't be cross-compiled — needs target glibc)
-gcc -shared -fPIC -O2 -o /tmp/libolly.so olly-deploy/libolly.c -ldl -lpthread
-sudo cp /tmp/libolly.so /opt/olly/libolly.so
-
 # Setup OTEL Collector config
 sudo cp olly-deploy/otel-collector.yaml /etc/otelcol-contrib/config.yaml
 sudo systemctl enable otelcol-contrib
@@ -72,16 +68,7 @@ sudo -u postgres psql -d demo -f olly-deploy/demo-app/init_db.sql || true
 sudo pip3 install -r olly-deploy/demo-app/requirements.txt
 sudo cp -r olly-deploy/demo-app /opt/olly/demo-app
 
-# Create wrapper script for demo app with LD_PRELOAD
-# (env vars don't propagate reliably through sudo bash -c)
-sudo tee /opt/olly/run-demo.sh > /dev/null <<'WRAPPER'
-#!/bin/bash
-export LD_PRELOAD=/opt/olly/libolly.so
-exec python3 /opt/olly/demo-app/app.py
-WRAPPER
-sudo chmod +x /opt/olly/run-demo.sh
-
-# Start olly agent first (creates hook.sock for libolly.so)
+# Start olly agent (eBPF hooks attach automatically — no LD_PRELOAD needed)
 sudo bash -c 'nohup /opt/olly/olly --config-dir /opt/olly/configs --log-level debug > /var/log/olly.log 2>&1 &'
 sleep 2
 
@@ -93,8 +80,8 @@ if [ -f olly-deploy/order-service ]; then
     sleep 1
 fi
 
-# Start demo app via wrapper (LD_PRELOAD for hook interception)
-sudo bash -c 'nohup /opt/olly/run-demo.sh > /var/log/demo-app/stdout.log 2>&1 &'
+# Start demo app (no wrapper needed — eBPF observes all processes automatically)
+sudo bash -c 'nohup python3 /opt/olly/demo-app/app.py > /var/log/demo-app/stdout.log 2>&1 &'
 sleep 3
 
 # Activate tracing if on-demand mode is configured

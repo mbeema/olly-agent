@@ -96,9 +96,10 @@ func (r *LogRecord) HasTraceContext() bool {
 
 // Collector manages log collection from multiple sources.
 type Collector struct {
-	cfg    *config.LogsConfig
-	logger *zap.Logger
-	parser *Parser
+	cfg         *config.LogsConfig
+	logger      *zap.Logger
+	parser      *Parser
+	auditParser *AuditParser
 
 	mu        sync.RWMutex
 	callbacks []func(*LogRecord)
@@ -111,10 +112,11 @@ type Collector struct {
 // NewCollector creates a new log collector.
 func NewCollector(cfg *config.LogsConfig, logger *zap.Logger) *Collector {
 	return &Collector{
-		cfg:    cfg,
-		logger: logger,
-		parser: NewParser(),
-		stopCh: make(chan struct{}),
+		cfg:         cfg,
+		logger:      logger,
+		parser:      NewParser(),
+		auditParser: NewAuditParser(),
+		stopCh:      make(chan struct{}),
 	}
 }
 
@@ -148,6 +150,55 @@ func (c *Collector) Start(ctx context.Context) error {
 				}
 				tailer.OnLog(func(record *LogRecord) {
 					c.emit(record)
+				})
+				c.tailers = append(c.tailers, tailer)
+
+				c.wg.Add(1)
+				go func(t *Tailer) {
+					defer c.wg.Done()
+					t.Run(ctx, c.stopCh)
+				}(tailer)
+			}
+
+		case "audit":
+			// Linux audit log (auditd format)
+			for _, pattern := range src.Paths {
+				tailer, err := NewTailer(pattern, nil, "raw", c.parser, c.logger)
+				if err != nil {
+					c.logger.Warn("failed to create audit tailer", zap.String("pattern", pattern), zap.Error(err))
+					continue
+				}
+				ap := c.auditParser
+				tailer.OnLog(func(record *LogRecord) {
+					auditRecord := ap.ParseAuditLine(record.Body)
+					if auditRecord != nil {
+						c.emit(auditRecord)
+					}
+				})
+				c.tailers = append(c.tailers, tailer)
+
+				c.wg.Add(1)
+				go func(t *Tailer) {
+					defer c.wg.Done()
+					t.Run(ctx, c.stopCh)
+				}(tailer)
+			}
+
+		case "auth":
+			// Auth/secure log (syslog auth format)
+			for _, pattern := range src.Paths {
+				tailer, err := NewTailer(pattern, nil, "raw", c.parser, c.logger)
+				if err != nil {
+					// Auth log paths vary by distro; missing files are expected
+					c.logger.Debug("auth log not found", zap.String("path", pattern))
+					continue
+				}
+				ap := c.auditParser
+				tailer.OnLog(func(record *LogRecord) {
+					authRecord := ap.ParseAuthLine(record.Body)
+					if authRecord != nil {
+						c.emit(authRecord)
+					}
 				})
 				c.tailers = append(c.tailers, tailer)
 

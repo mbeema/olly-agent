@@ -4,6 +4,7 @@ package profiling
 
 import (
 	"context"
+	"fmt"
 )
 
 // stubProfiler is a no-op profiler for non-Linux platforms.
@@ -32,4 +33,16 @@ func (p *stubProfiler) OnProfile(fn func(*Profile)) {
 
 func (p *stubProfiler) SetServiceResolver(fn func(pid uint32) string) {
 	// No-op
+}
+
+func (p *stubProfiler) TriggerProfile(req TriggerRequest) error {
+	return fmt.Errorf("profiling not available on this platform")
+}
+
+func (p *stubProfiler) StopProfile() error {
+	return nil
+}
+
+func (p *stubProfiler) State() ProfileState {
+	return ProfileIdle
 }

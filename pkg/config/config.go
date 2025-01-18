@@ -63,8 +63,13 @@ type ProtocolToggle struct {
 }
 
 type LogsConfig struct {
-	Enabled bool         `yaml:"enabled"`
-	Sources []LogSource  `yaml:"sources"`
+	Enabled  bool         `yaml:"enabled"`
+	Sources  []LogSource  `yaml:"sources"`
+	Security SecurityLogConfig `yaml:"security"`
+}
+
+type SecurityLogConfig struct {
+	Enabled bool `yaml:"enabled"` // Enable audit + auth log collection
 }
 
 type LogSource struct {
@@ -81,15 +86,22 @@ type CorrelationConfig struct {
 }
 
 type MetricsConfig struct {
-	Enabled  bool              `yaml:"enabled"`
-	Host     MetricsToggle     `yaml:"host"`
-	Process  MetricsToggle     `yaml:"process"`
-	Request  RequestMetricsCfg `yaml:"request"`
-	Interval time.Duration     `yaml:"interval"`
+	Enabled   bool                  `yaml:"enabled"`
+	Host      MetricsToggle         `yaml:"host"`
+	Process   MetricsToggle         `yaml:"process"`
+	Request   RequestMetricsCfg     `yaml:"request"`
+	Interval  time.Duration         `yaml:"interval"`
+	PerProcess PerProcessMetricsCfg `yaml:"per_process"`
+	Container MetricsToggle         `yaml:"container"`
 }
 
 type MetricsToggle struct {
 	Enabled bool `yaml:"enabled"`
+}
+
+type PerProcessMetricsCfg struct {
+	Enabled bool     `yaml:"enabled"`
+	PIDs    []uint32 `yaml:"pids"` // Specific PIDs to observe (empty = auto-discover from hook)
 }
 
 type RequestMetricsCfg struct {
@@ -125,6 +137,7 @@ type ProfilingConfig struct {
 	Enabled    bool            `yaml:"enabled"`
 	SampleRate int             `yaml:"sample_rate"` // Hz
 	Interval   time.Duration   `yaml:"interval"`
+	OnDemand   bool            `yaml:"on_demand"`   // If true, start idle; profile only when triggered
 	Pyroscope  PyroscopeConfig `yaml:"pyroscope"`
 }
 
@@ -198,7 +211,9 @@ func DefaultConfig() *Config {
 				Enabled: true,
 				Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
 			},
-			Interval: 15 * time.Second,
+			Interval:   15 * time.Second,
+			PerProcess: PerProcessMetricsCfg{Enabled: false},
+			Container:  MetricsToggle{Enabled: true},
 		},
 		Exporters: ExportersConfig{
 			OTLP: OTLPConfig{
@@ -233,6 +248,7 @@ func DefaultConfig() *Config {
 			Enabled:    false,
 			SampleRate: 99,
 			Interval:   10 * time.Second,
+			OnDemand:   true, // Default to on-demand (zero overhead when idle)
 			Pyroscope: PyroscopeConfig{
 				Enabled:  false,
 				Endpoint: "http://localhost:4040",

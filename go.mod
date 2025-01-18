@@ -1,15 +1,16 @@
 module github.com/mbeema/olly
 
-go 1.23
+go 1.24.0
 
 require (
+	github.com/cilium/ebpf v0.20.0
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/google/pprof v0.0.0-20240227163752-401108e1b7e7
 	github.com/shirou/gopsutil/v3 v3.24.1
 	go.opentelemetry.io/proto/otlp v1.1.0
 	go.uber.org/zap v1.26.0
-	golang.org/x/net v0.20.0
-	golang.org/x/sys v0.26.0
+	golang.org/x/net v0.46.0
+	golang.org/x/sys v0.37.0
 	google.golang.org/grpc v1.61.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -26,7 +27,7 @@ require (
 	github.com/tklauser/numcpus v0.7.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/text v0.14.0 // indirect
+	golang.org/x/text v0.30.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20240125205218-1f4bbc51befe // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240125205218-1f4bbc51befe // indirect
 	google.golang.org/protobuf v1.32.0 // indirect

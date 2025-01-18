@@ -36,8 +36,6 @@ cp order-service olly-deploy/
 cp "$SCRIPT_DIR/configs/"*.yaml olly-deploy/configs/
 cp "$SCRIPT_DIR/otel-collector.yaml" olly-deploy/
 cp -r "$SCRIPT_DIR/demo-app" olly-deploy/
-cp "$PROJECT_DIR/pkg/hook/c/libolly.c" olly-deploy/
-
 tar czf olly-deploy.tar.gz olly-deploy/
 rm -rf olly-deploy
 
