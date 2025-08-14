@@ -12,6 +12,8 @@ import (
 type Parser struct {
 	syslogRe   *regexp.Regexp
 	combinedRe *regexp.Regexp
+	pidRe      *regexp.Regexp
+	tidRe      *regexp.Regexp
 }
 
 // NewParser creates a new log parser.
@@ -24,6 +26,14 @@ func NewParser() *Parser {
 		// Combined (nginx/apache): `127.0.0.1 - - [02/Jan/2006:15:04:05 -0700] "GET /path HTTP/1.1" 200 1234`
 		combinedRe: regexp.MustCompile(
 			`^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"([^"]+)"\s+(\d{3})\s+(\d+)`,
+		),
+		// PID patterns: "pid=123", "PID 123", "process=123", "Process-123", "[pid:123]"
+		pidRe: regexp.MustCompile(
+			`(?i)(?:pid[=: ]|process[=: -])(\d+)`,
+		),
+		// TID patterns: "tid=456", "TID 456", "thread[=: -]456", "thread_id=456"
+		tidRe: regexp.MustCompile(
+			`(?i)(?:tid[=: ]|thread(?:_id)?[=: -])(\d+)`,
 		),
 	}
 }
@@ -70,6 +80,9 @@ func (p *Parser) autoDetect(line string) *LogRecord {
 		Level:      detectLevel(line),
 		Attributes: make(map[string]interface{}),
 	}
+
+	// Extract PID/TID from log content for correlation
+	p.extractPIDTID(record, line)
 
 	return record
 }
@@ -159,6 +172,15 @@ func (p *Parser) parseSyslog(line string) *LogRecord {
 	record.Body = matches[5]
 	record.Level = detectLevel(record.Body)
 
+	// Syslog extracts PID from header; also try TID from message body
+	if record.TID == 0 {
+		if m := p.tidRe.FindStringSubmatch(record.Body); m != nil {
+			if tid, err := strconv.Atoi(m[1]); err == nil {
+				record.TID = tid
+			}
+		}
+	}
+
 	return record
 }
 
@@ -201,6 +223,26 @@ func (p *Parser) parseCombined(line string) *LogRecord {
 	}
 
 	return record
+}
+
+// extractPIDTID attempts to extract PID and TID from a log line.
+// Handles common patterns: "pid=123", "PID 123", "process=123",
+// "tid=456", "thread=456", "thread_id=456".
+func (p *Parser) extractPIDTID(record *LogRecord, line string) {
+	if record.PID == 0 {
+		if m := p.pidRe.FindStringSubmatch(line); m != nil {
+			if pid, err := strconv.Atoi(m[1]); err == nil {
+				record.PID = pid
+			}
+		}
+	}
+	if record.TID == 0 {
+		if m := p.tidRe.FindStringSubmatch(line); m != nil {
+			if tid, err := strconv.Atoi(m[1]); err == nil {
+				record.TID = tid
+			}
+		}
+	}
 }
 
 // detectLevel infers log level from message content.

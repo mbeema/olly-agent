@@ -254,6 +254,58 @@ correlation:
   window: 100ms           # Correlation time window
 ```
 
+## Log-Trace Correlation
+
+The correlation engine (`pkg/correlation/engine.go`) links log records to active trace spans using PID+TID+timestamp matching. When a log is emitted during an active span on the same thread, the log is enriched with `traceID`, `spanID`, and `serviceName`.
+
+### How It Works
+
+```
+Span arrives ─> processSpan()
+                  ├─ correlation.RegisterSpanStart(PID, TID, traceID, spanID, ...)
+                  │    └─ activeSpans[PID<<32|TID] = SpanContext
+                  │    └─ correlateWithPendingLogs()  ← retroactive matching
+                  ├─ exporter.ExportSpan()
+                  └─ correlation.RegisterSpanEnd(PID, TID)
+                       └─ sets EndTime, removes from activeSpans, fires callbacks
+
+Log arrives ──> processLog()
+                  └─ correlation.EnrichLog(record)
+                       ├─ Try exact PID+TID match in activeSpans
+                       ├─ Try PID-only match (fallback for TID=0)
+                       └─ Buffer as pendingLog if no match yet
+                            └─ retroactively correlated when span registers
+```
+
+### Matching Strategies (in priority order)
+
+1. **Exact PID+TID** --- best accuracy; both process and thread match an active span within the time window
+2. **PID-only** --- fallback when TID is unavailable (TID=0); matches any span on the same process
+3. **Retroactive** --- logs arriving before their span are buffered (up to 1000) and correlated when `RegisterSpanStart()` fires
+
+### PID/TID Sources
+
+| Log Source | PID | TID | Accuracy |
+|------------|-----|-----|----------|
+| Hook-captured (`write()` syscall) | From kernel | From kernel | Exact |
+| JSON logs (`"pid":N, "tid":N`) | Parsed from field | Parsed from field | Exact |
+| Syslog (`process[pid]: ...`) | From header | Extracted from body | PID exact, TID best-effort |
+| Plain text (`pid=N tid=N`) | Regex extraction | Regex extraction | Best-effort |
+| Plain text (no PID/TID) | 0 | 0 | No correlation |
+
+The parser recognizes common PID/TID patterns in log text: `pid=123`, `PID 123`, `process=123`, `tid=456`, `TID 456`, `thread=456`, `thread_id=456`.
+
+### Enrichment Output
+
+When a log is correlated, `SetTraceContext()` populates:
+- `LogRecord.TraceID`, `.SpanID`, `.ServiceName` --- used by OTLP export
+- `Attributes["trace_id"]`, `["span_id"]`, `["service.name"]` --- structured fields for Loki/Elasticsearch/Splunk
+- `Attributes["traceparent"]` --- W3C format `00-{traceID}-{spanID}-01` for downstream systems without OTLP support
+
+### Time Window
+
+The correlation window (default: 100ms, configurable via `correlation.window`) defines how far a log's timestamp can be from a span's start/end time and still be considered part of that span. Span lifecycle is tracked precisely: `RegisterSpanEnd()` is called immediately after export, so the `EndTime` is accurate and spans are removed from the active set promptly.
+
 ## Challenges & Known Limitations
 
 ### Protocol Support

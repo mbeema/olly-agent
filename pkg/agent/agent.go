@@ -39,6 +39,7 @@ type Agent struct {
 	connTracker     *conntrack.Tracker
 	reassembler     *reassembly.Reassembler
 	traceProc       *traces.Processor
+	traceStitcher   *traces.Stitcher
 	correlation     *correlation.Engine
 	logCollector    *logs.Collector
 	metricsColl     *metrics.Collector
@@ -68,9 +69,11 @@ type Agent struct {
 
 // threadTraceCtx holds trace context for an active inbound request on a thread.
 type threadTraceCtx struct {
-	TraceID  string
-	SpanID   string
-	Created  time.Time
+	TraceID      string
+	SpanID       string // injected via sk_msg → becomes CLIENT span's own spanID
+	ServerSpanID string // SERVER span's own spanID (CLIENT spans reference this as parent)
+	ParentSpanID string // from incoming traceparent header (cross-service linking)
+	Created      time.Time
 }
 
 // New creates a new agent from configuration.
@@ -94,6 +97,9 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 
 	// Initialize trace processor
 	a.traceProc = traces.NewProcessor(logger)
+
+	// Initialize cross-service trace stitcher
+	a.traceStitcher = traces.NewStitcher(cfg.Correlation.Window, logger)
 
 	// Initialize correlation engine
 	a.correlation = correlation.NewEngine(cfg.Correlation.Window, logger)
@@ -262,15 +268,57 @@ func (a *Agent) Start(ctx context.Context) error {
 				// outbound CLIENT spans (e.g., DB queries) can inherit it.
 				ctxKey := uint64(pid)<<32 | uint64(tid)
 				if _, loaded := a.threadCtx.Load(ctxKey); !loaded {
-					traceCtx := protocol.ExtractTraceContext(data)
 					tctx := &threadTraceCtx{Created: time.Now()}
+
+					// Priority 1: Extract traceparent from HTTP headers in the data.
+					// This captures injected headers from upstream sk_msg and gives
+					// us both traceID (for trace continuity) and parentSpanID.
+					traceCtx := protocol.ExtractTraceContext(data)
 					if traceCtx.TraceID != "" {
 						tctx.TraceID = traceCtx.TraceID
-					} else {
+						tctx.ParentSpanID = traceCtx.SpanID
+						a.logger.Debug("extracted traceparent from inbound data",
+							zap.Uint32("pid", pid), zap.Uint32("tid", tid),
+							zap.String("traceID", traceCtx.TraceID),
+							zap.String("parentSpanID", traceCtx.SpanID),
+							zap.Uint16("port", remotePort))
+					}
+
+					// Priority 2: Check BPF-generated trace context.
+					// BPF generates context synchronously in kretprobe_read,
+					// extracting traceID from incoming traceparent or generating random.
+					if tctx.TraceID == "" {
+						if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
+							if bpfTraceID, bpfSpanID, bpfOK := injector.GetTraceContext(pid, tid); bpfOK {
+								tctx.TraceID = bpfTraceID
+								tctx.SpanID = bpfSpanID
+								a.logger.Debug("using BPF-generated trace context",
+									zap.Uint32("pid", pid), zap.Uint32("tid", tid),
+									zap.String("traceID", bpfTraceID))
+							}
+						}
+					}
+
+					// Priority 3: Generate new trace ID
+					if tctx.TraceID == "" {
 						tctx.TraceID = traces.GenerateTraceID()
 					}
-					tctx.SpanID = traces.GenerateSpanID()
+					if tctx.SpanID == "" {
+						tctx.SpanID = traces.GenerateSpanID()
+					}
+					// ServerSpanID is always a separate ID for the SERVER span.
+					// tctx.SpanID is what gets injected via sk_msg and becomes
+					// the CLIENT span's own spanID. This creates a proper chain:
+					// SERVER(ServerSpanID) → CLIENT(SpanID) → downstream SERVER(parent=SpanID)
+					tctx.ServerSpanID = traces.GenerateSpanID()
 					a.threadCtx.Store(ctxKey, tctx)
+
+					// Populate BPF trace context for sk_msg injection.
+					// If BPF already generated it, this overwrites with the
+					// same trace ID (agent may have generated a different spanID).
+					if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
+						injector.SetTraceContext(pid, tid, tctx.TraceID, tctx.SpanID)
+					}
 				}
 				a.reassembler.AppendSend(pid, tid, fd, data, remoteAddr, remotePort, false)
 				a.reassembler.SetDirection(pid, fd, 1) // 1=inbound; set after AppendSend creates the stream
@@ -349,7 +397,15 @@ func (a *Agent) Start(ctx context.Context) error {
 
 	if cfg.Hook.Enabled && a.hookProvider != nil {
 		if err := a.hookProvider.Start(ctx, callbacks); err != nil {
-			return fmt.Errorf("start hook provider: %w", err)
+			a.logger.Warn("hook provider failed to start, falling back to stub",
+				zap.String("provider", a.hookProvider.Name()),
+				zap.Error(err),
+			)
+			// Fall back to stub — agent runs without tracing
+			a.hookProvider = hookebpf.NewStubProvider(err.Error(), a.logger)
+			if err := a.hookProvider.Start(ctx, callbacks); err != nil {
+				a.logger.Warn("stub provider also failed", zap.Error(err))
+			}
 		}
 		a.logger.Info("hook provider started", zap.String("provider", a.hookProvider.Name()))
 		// Set initial tracing state based on on_demand config
@@ -504,15 +560,27 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 	// Only apply if context is recent (within 30s)
 	if time.Since(tctx.Created) > 30*time.Second {
 		a.threadCtx.Delete(ctxKey)
+		// Clean up leaked BPF map entry for this expired thread context
+		if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
+			injector.ClearTraceContext(pair.PID, pair.TID)
+		}
 		return
 	}
 	pair.ParentTraceID = tctx.TraceID
-	pair.ParentSpanID = tctx.SpanID
+	pair.ParentSpanID = tctx.ServerSpanID // SERVER span's own ID
 
 	// For inbound connections, the SERVER span consumes the context
 	connInfo := a.connTracker.Lookup(pair.PID, pair.FD)
 	if connInfo != nil && connInfo.Direction == conntrack.ConnInbound {
 		a.threadCtx.Delete(ctxKey)
+		// Clear BPF trace context since the request is done
+		if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
+			injector.ClearTraceContext(pair.PID, pair.TID)
+		}
+	} else {
+		// Outbound CLIENT span: pass the sk_msg-injected spanID so the
+		// CLIENT span uses it as its own spanID (matching what downstream sees)
+		pair.InjectedSpanID = tctx.SpanID
 	}
 }
 
@@ -545,6 +613,12 @@ func (a *Agent) processSpan(span *traces.Span) {
 		span.ServiceName = a.discoverer.GetServiceName(span.PID)
 	}
 
+	// Cross-service trace stitching: CLIENT spans are stored,
+	// SERVER spans are matched against stored CLIENT spans.
+	if a.traceStitcher != nil {
+		a.traceStitcher.ProcessSpan(span)
+	}
+
 	// Register with correlation engine
 	if a.correlation != nil {
 		a.correlation.RegisterSpanStart(
@@ -561,6 +635,11 @@ func (a *Agent) processSpan(span *traces.Span) {
 
 	// Export
 	a.exporter.ExportSpan(span)
+
+	// Mark span as complete so correlation engine tracks proper time window
+	if a.correlation != nil {
+		a.correlation.RegisterSpanEnd(span.PID, span.TID)
+	}
 }
 
 // logDispatchLoop reads logs from the channel and dispatches to correlation/exporter.
@@ -867,10 +946,36 @@ func (a *Agent) cleanupLoop(ctx context.Context) {
 			staleConns := a.connTracker.CleanStale(5 * time.Minute)
 			staleStreams := a.reassembler.CleanStale(5 * time.Minute)
 
-			if staleConns > 0 || staleStreams > 0 {
+			// Clean stale stitching entries
+			staleStitched := 0
+			if a.traceStitcher != nil {
+				staleStitched = a.traceStitcher.Cleanup()
+			}
+
+			// Clean stale thread trace contexts (and their BPF map entries)
+			staleThreadCtx := 0
+			a.threadCtx.Range(func(key, value any) bool {
+				tctx := value.(*threadTraceCtx)
+				if time.Since(tctx.Created) > 30*time.Second {
+					a.threadCtx.Delete(key)
+					staleThreadCtx++
+					// Clear leaked BPF map entry
+					if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
+						k := key.(uint64)
+						pid := uint32(k >> 32)
+						tid := uint32(k & 0xFFFFFFFF)
+						injector.ClearTraceContext(pid, tid)
+					}
+				}
+				return true
+			})
+
+			if staleConns > 0 || staleStreams > 0 || staleStitched > 0 || staleThreadCtx > 0 {
 				a.logger.Debug("cleanup",
 					zap.Int("stale_connections", staleConns),
 					zap.Int("stale_streams", staleStreams),
+					zap.Int("stale_stitched", staleStitched),
+					zap.Int("stale_thread_ctx", staleThreadCtx),
 					zap.Int("active_connections", a.connTracker.Count()),
 					zap.Int("active_streams", a.reassembler.StreamCount()),
 				)
