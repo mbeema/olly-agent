@@ -1,0 +1,40 @@
+image:
+  repository: olly
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+resources:
+  limits:
+    memory: 512Mi
+    cpu: 500m
+  requests:
+    memory: 256Mi
+    cpu: 200m
+
+# Required for eBPF
+privileged: true
+hostPID: true
+hostNetwork: true
+
+health:
+  port: 8686
+
+tolerations:
+  - operator: Exists
+
+nodeSelector: {}
+
+config:
+  logLevel: info
+  otlpEndpoint: "otel-collector:4317"
+  otlpProtocol: grpc
+  otlpInsecure: true
+  tracingEnabled: true
+  metricsEnabled: true
+  logsEnabled: true
+  samplingRate: 1.0
+  redactionEnabled: true
+
+serviceAccount:
+  create: true
+  name: ""

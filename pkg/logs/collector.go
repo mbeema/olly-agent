@@ -2,7 +2,10 @@ package logs
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mbeema/olly/pkg/config"
@@ -101,6 +104,12 @@ type Collector struct {
 	parser      *Parser
 	auditParser *AuditParser
 
+	// Sampling and rate limiting
+	sampleRate    float64 // 0.0-1.0, 0 = unset (keep all)
+	rateLimit     int     // max logs/sec, 0 = unlimited
+	tokenCount    atomic.Int64
+	lastRefill    atomic.Int64
+
 	mu        sync.RWMutex
 	callbacks []func(*LogRecord)
 	tailers   []*Tailer
@@ -111,13 +120,20 @@ type Collector struct {
 
 // NewCollector creates a new log collector.
 func NewCollector(cfg *config.LogsConfig, logger *zap.Logger) *Collector {
-	return &Collector{
+	c := &Collector{
 		cfg:         cfg,
 		logger:      logger,
 		parser:      NewParser(),
 		auditParser: NewAuditParser(),
 		stopCh:      make(chan struct{}),
+		sampleRate:  cfg.Sampling.Rate,
+		rateLimit:   cfg.RateLimit,
 	}
+	if c.rateLimit > 0 {
+		c.tokenCount.Store(int64(c.rateLimit))
+		c.lastRefill.Store(time.Now().UnixNano())
+	}
+	return c
 }
 
 // OnLog registers a callback for collected log records.
@@ -128,12 +144,53 @@ func (c *Collector) OnLog(fn func(*LogRecord)) {
 }
 
 func (c *Collector) emit(record *LogRecord) {
+	// Apply sampling
+	if c.sampleRate > 0 && c.sampleRate < 1.0 {
+		if !c.shouldSampleLog() {
+			return
+		}
+	}
+
+	// Apply rate limiting (token bucket)
+	if c.rateLimit > 0 && !c.tryConsumeToken() {
+		return
+	}
+
 	c.mu.RLock()
 	cbs := c.callbacks
 	c.mu.RUnlock()
 
 	for _, cb := range cbs {
 		cb(record)
+	}
+}
+
+func (c *Collector) shouldSampleLog() bool {
+	var b [8]byte
+	rand.Read(b[:])
+	r := float64(binary.LittleEndian.Uint64(b[:])) / float64(^uint64(0))
+	return r < c.sampleRate
+}
+
+func (c *Collector) tryConsumeToken() bool {
+	now := time.Now().UnixNano()
+	last := c.lastRefill.Load()
+	elapsed := now - last
+
+	// Refill tokens every second
+	if elapsed >= int64(time.Second) {
+		c.tokenCount.Store(int64(c.rateLimit))
+		c.lastRefill.Store(now)
+	}
+
+	for {
+		current := c.tokenCount.Load()
+		if current <= 0 {
+			return false
+		}
+		if c.tokenCount.CompareAndSwap(current, current-1) {
+			return true
+		}
 	}
 }
 

@@ -495,3 +495,13 @@ func (m *Manager) retryExport(ctx context.Context, signal string, exportFn func(
 func (m *Manager) Stats() (spans, logs, metrics, profiles int64) {
 	return m.spanCount.Load(), m.logCount.Load(), m.metricCount.Load(), m.profileCount.Load()
 }
+
+// DropCount returns the number of dropped telemetry items.
+func (m *Manager) DropCount() int64 {
+	return m.dropCount.Load()
+}
+
+// ChannelDepths returns current channel fill levels for monitoring.
+func (m *Manager) ChannelDepths() (spans, logs, metrics int) {
+	return len(m.spanCh), len(m.logCh), len(m.metricCh)
+}

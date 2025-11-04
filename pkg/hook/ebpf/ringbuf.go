@@ -68,14 +68,25 @@ func newEventReader(eventsMap *ebpf.Map, callbacks hook.Callbacks, logger *zap.L
 // readLoop reads events from the ring buffer and dispatches to callbacks.
 // It blocks until the reader is closed or an unrecoverable error occurs.
 func (er *eventReader) readLoop() {
+	er.logger.Info("ring buffer reader started")
+	eventCount := uint64(0)
 	for {
 		record, err := er.reader.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
+				er.logger.Info("ring buffer reader closed", zap.Uint64("total_events", eventCount))
 				return
 			}
 			er.logger.Debug("ring buffer read error", zap.Error(err))
 			continue
+		}
+
+		eventCount++
+		if eventCount <= 5 || eventCount%1000 == 0 {
+			er.logger.Debug("ring buffer event",
+				zap.Uint64("count", eventCount),
+				zap.Int("raw_len", len(record.RawSample)),
+			)
 		}
 
 		er.dispatch(record.RawSample)
@@ -115,14 +126,15 @@ func (er *eventReader) dispatch(raw []byte) {
 	case eventConnect:
 		if fd == -1 {
 			// Sentinel from sched_process_exec tracepoint — trigger SSL scan.
-			// This is handled by the SSL scanner in provider.go.
 			return
 		}
+		er.logger.Debug("dispatch CONNECT", zap.Uint32("pid", pid), zap.Int32("fd", fd), zap.Uint32("addr", remoteAddr), zap.Uint16("port", remotePort))
 		if er.callbacks.OnConnect != nil {
 			er.callbacks.OnConnect(pid, tid, fd, remoteAddr, remotePort, ts)
 		}
 
 	case eventAccept:
+		er.logger.Debug("dispatch ACCEPT", zap.Uint32("pid", pid), zap.Int32("fd", fd))
 		if er.callbacks.OnAccept != nil {
 			er.callbacks.OnAccept(pid, tid, fd, remoteAddr, remotePort, ts)
 		}

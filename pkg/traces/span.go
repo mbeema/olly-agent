@@ -135,12 +135,9 @@ func GenerateSpanID() string {
 }
 
 // TraceParent formats the W3C traceparent header value.
-// R1.5 fix: The sampled flag (01) indicates the trace is being recorded.
-// Since Olly records all traces, the flag is always 01. Error status is
-// conveyed through span status, not trace-flags.
+// Uses flags=01 (sampled) per W3C Trace Context Level 1 specification.
+// This matches the flags used in BPF sk_msg traceparent injection,
+// ensuring consistency across all trace propagation paths.
 func (s *Span) TraceParent() string {
-	// Bit 0 = sampled (trace is being recorded)
-	// Bit 1 = random (trace-id generated with randomness) - W3C Level 2
-	// Olly always records and generates random trace IDs → flags = 03
-	return "00-" + s.TraceID + "-" + s.SpanID + "-" + "03"
+	return "00-" + s.TraceID + "-" + s.SpanID + "-01"
 }

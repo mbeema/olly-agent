@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -11,8 +13,8 @@ import (
 
 // Config is the top-level configuration for the olly agent.
 type Config struct {
-	ServiceName string          `yaml:"service_name"`
-	LogLevel    string          `yaml:"log_level"`
+	ServiceName string          `yaml:"service_name" env:"OLLY_SERVICE_NAME"`
+	LogLevel    string          `yaml:"log_level" env:"OLLY_LOG_LEVEL"`
 	Hook        HookConfig      `yaml:"hook"`
 	Tracing     TracingConfig   `yaml:"tracing"`
 	Logs        LogsConfig      `yaml:"logs"`
@@ -22,6 +24,8 @@ type Config struct {
 	Discovery   DiscoveryConfig `yaml:"discovery"`
 	Profiling   ProfilingConfig `yaml:"profiling"`
 	Capture     CaptureConfig   `yaml:"capture"`
+	Health      HealthConfig    `yaml:"health"`
+	Redaction   RedactionConfig `yaml:"redaction"`
 }
 
 type HookConfig struct {
@@ -46,6 +50,7 @@ func (h *HookConfig) LogCaptureEnabled() bool {
 type TracingConfig struct {
 	Enabled   bool             `yaml:"enabled"`
 	Protocols ProtocolsConfig  `yaml:"protocols"`
+	Sampling  SamplingConfig   `yaml:"sampling"`
 }
 
 type ProtocolsConfig struct {
@@ -63,9 +68,11 @@ type ProtocolToggle struct {
 }
 
 type LogsConfig struct {
-	Enabled  bool         `yaml:"enabled"`
-	Sources  []LogSource  `yaml:"sources"`
-	Security SecurityLogConfig `yaml:"security"`
+	Enabled   bool              `yaml:"enabled"`
+	Sources   []LogSource       `yaml:"sources"`
+	Security  SecurityLogConfig `yaml:"security"`
+	Sampling  LogSamplingConfig `yaml:"sampling"`
+	RateLimit int               `yaml:"rate_limit"` // Max logs per second (0 = unlimited)
 }
 
 type SecurityLogConfig struct {
@@ -154,6 +161,35 @@ type CaptureConfig struct {
 	BPFFilter  string   `yaml:"bpf_filter"`
 }
 
+// HealthConfig configures the health HTTP server.
+type HealthConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Port    string `yaml:"port" env:"OLLY_HEALTH_PORT"` // e.g. ":8686"
+}
+
+// RedactionConfig configures PII redaction.
+type RedactionConfig struct {
+	Enabled bool            `yaml:"enabled"`
+	Rules   []RedactionRule `yaml:"rules"`
+}
+
+// RedactionRule is a user-defined redaction pattern.
+type RedactionRule struct {
+	Name        string `yaml:"name"`
+	Pattern     string `yaml:"pattern"`
+	Replacement string `yaml:"replacement"`
+}
+
+// SamplingConfig configures trace sampling.
+type SamplingConfig struct {
+	Rate float64 `yaml:"rate"` // 0.0-1.0, default 1.0 (keep all)
+}
+
+// LogSamplingConfig configures log sampling.
+type LogSamplingConfig struct {
+	Rate float64 `yaml:"rate"` // 0.0-1.0, default 1.0 (keep all)
+}
+
 // Load reads and parses a YAML configuration file.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -165,6 +201,8 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+
+	cfg.ApplyEnvOverrides()
 
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
@@ -185,6 +223,7 @@ func DefaultConfig() *Config {
 		},
 		Tracing: TracingConfig{
 			Enabled: true,
+			Sampling: SamplingConfig{Rate: 1.0},
 			Protocols: ProtocolsConfig{
 				HTTP:     ProtocolToggle{Enabled: true},
 				GRPC:     ProtocolToggle{Enabled: true},
@@ -257,6 +296,13 @@ func DefaultConfig() *Config {
 		Capture: CaptureConfig{
 			Enabled: false,
 		},
+		Health: HealthConfig{
+			Enabled: true,
+			Port:    ":8686",
+		},
+		Redaction: RedactionConfig{
+			Enabled: true,
+		},
 	}
 }
 
@@ -285,6 +331,8 @@ func LoadDir(dir string) (*Config, error) {
 		}
 	}
 
+	cfg.ApplyEnvOverrides()
+
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate config: %w", err)
 	}
@@ -300,6 +348,70 @@ func loadFileInto(path string, cfg *Config) error {
 		return err
 	}
 	return yaml.Unmarshal(data, cfg)
+}
+
+// ApplyEnvOverrides reads OLLY_* environment variables and applies them
+// to the config, overriding YAML values.
+func (c *Config) ApplyEnvOverrides() {
+	envOverrides := map[string]func(string){
+		"OLLY_SERVICE_NAME":            func(v string) { c.ServiceName = v },
+		"OLLY_LOG_LEVEL":               func(v string) { c.LogLevel = v },
+		"OLLY_HEALTH_PORT":             func(v string) { c.Health.Port = v },
+		"OLLY_EXPORTERS_OTLP_ENDPOINT": func(v string) { c.Exporters.OTLP.Endpoint = v },
+		"OLLY_EXPORTERS_OTLP_PROTOCOL": func(v string) { c.Exporters.OTLP.Protocol = v },
+		"OLLY_HOOK_SOCKET_PATH":        func(v string) { c.Hook.SocketPath = v },
+	}
+
+	// Also handle boolean overrides
+	boolOverrides := map[string]*bool{
+		"OLLY_TRACING_ENABLED":   &c.Tracing.Enabled,
+		"OLLY_LOGS_ENABLED":      &c.Logs.Enabled,
+		"OLLY_METRICS_ENABLED":   &c.Metrics.Enabled,
+		"OLLY_PROFILING_ENABLED": &c.Profiling.Enabled,
+		"OLLY_HEALTH_ENABLED":    &c.Health.Enabled,
+		"OLLY_REDACTION_ENABLED": &c.Redaction.Enabled,
+	}
+
+	// Float overrides
+	floatOverrides := map[string]*float64{
+		"OLLY_TRACING_SAMPLING_RATE": &c.Tracing.Sampling.Rate,
+		"OLLY_LOGS_SAMPLING_RATE":    &c.Logs.Sampling.Rate,
+	}
+
+	for envKey, setter := range envOverrides {
+		if val := os.Getenv(envKey); val != "" {
+			setter(val)
+		}
+	}
+
+	for envKey, target := range boolOverrides {
+		if val := os.Getenv(envKey); val != "" {
+			*target = parseBool(val)
+		}
+	}
+
+	for envKey, target := range floatOverrides {
+		if val := os.Getenv(envKey); val != "" {
+			if f, ok := parseFloat(val); ok {
+				*target = f
+			}
+		}
+	}
+}
+
+func parseBool(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	return s == "true" || s == "1" || s == "yes"
+}
+
+func parseFloat(s string) (float64, bool) {
+	s = strings.TrimSpace(s)
+	// Simple float parser to avoid importing strconv
+	v := reflect.New(reflect.TypeOf(float64(0)))
+	if _, err := fmt.Sscanf(s, "%f", v.Interface()); err != nil {
+		return 0, false
+	}
+	return v.Elem().Float(), true
 }
 
 // Validate checks the configuration for errors.

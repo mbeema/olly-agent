@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/mbeema/olly/pkg/correlation"
 	"github.com/mbeema/olly/pkg/discovery"
 	"github.com/mbeema/olly/pkg/export"
+	"github.com/mbeema/olly/pkg/health"
 	"github.com/mbeema/olly/pkg/hook"
 	hookebpf "github.com/mbeema/olly/pkg/hook/ebpf"
 	"github.com/mbeema/olly/pkg/logs"
@@ -21,6 +23,7 @@ import (
 	"github.com/mbeema/olly/pkg/profiling"
 	"github.com/mbeema/olly/pkg/protocol"
 	"github.com/mbeema/olly/pkg/reassembly"
+	"github.com/mbeema/olly/pkg/redact"
 	"github.com/mbeema/olly/pkg/servicemap"
 	"github.com/mbeema/olly/pkg/traces"
 	"go.uber.org/zap"
@@ -35,6 +38,10 @@ type Agent struct {
 	logger *zap.Logger
 
 	hookProvider    hook.HookProvider
+	healthServer    *health.Server
+	healthStats     *health.Stats
+	redactor        *redact.Redactor
+	sampler         *traces.Sampler
 	logParser       *logs.Parser
 	connTracker     *conntrack.Tracker
 	reassembler     *reassembly.Reassembler
@@ -85,6 +92,32 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 		spanCh: make(chan *traces.Span, 10000),
 	}
 	a.cfg.Store(cfg)
+
+	// Initialize health stats
+	a.healthStats = health.NewStats()
+
+	// Initialize PII redactor
+	var extraRules []redact.Rule
+	for _, r := range cfg.Redaction.Rules {
+		compiled, err := regexp.Compile(r.Pattern)
+		if err != nil {
+			logger.Warn("invalid redaction rule pattern", zap.String("name", r.Name), zap.Error(err))
+			continue
+		}
+		extraRules = append(extraRules, redact.Rule{
+			Name:        r.Name,
+			Pattern:     compiled,
+			Replacement: r.Replacement,
+		})
+	}
+	a.redactor = redact.New(cfg.Redaction.Enabled, extraRules)
+
+	// Initialize trace sampler
+	samplingRate := cfg.Tracing.Sampling.Rate
+	if samplingRate == 0 {
+		samplingRate = 1.0 // default: keep all
+	}
+	a.sampler = traces.NewSampler(samplingRate)
 
 	// Initialize log parser for hook-captured log writes
 	a.logParser = logs.NewParser()
@@ -511,6 +544,16 @@ func (a *Agent) Start(ctx context.Context) error {
 		go a.requestMetricsLoop(metricsCtx)
 	}
 
+	// Start health server
+	if cfg.Health.Enabled {
+		a.healthServer = health.NewServer(cfg.Health.Port, "dev", a.healthStats, a.logger)
+		if err := a.healthServer.Start(ctx); err != nil {
+			a.logger.Warn("health server start error", zap.Error(err))
+		} else {
+			a.healthServer.SetReady(true)
+		}
+	}
+
 	a.logger.Info("agent started",
 		zap.Bool("hook", cfg.Hook.Enabled),
 		zap.Bool("logs", cfg.Logs.Enabled),
@@ -608,9 +651,26 @@ func (a *Agent) spanDispatchLoop(ctx context.Context) {
 
 // processSpan enriches and exports a single span.
 func (a *Agent) processSpan(span *traces.Span) {
+	a.healthStats.SpansReceived.Add(1)
+
+	// Apply sampling (always keep errors)
+	isError := span.Status == traces.StatusError
+	if !a.sampler.ShouldSample(span.TraceID, isError) {
+		a.healthStats.SpansDropped.Add(1)
+		return
+	}
+
 	// Enrich with service name
 	if a.discoverer != nil && span.ServiceName == "" {
 		span.ServiceName = a.discoverer.GetServiceName(span.PID)
+	}
+
+	// Apply PII redaction to sensitive attributes
+	a.redactor.RedactMap(span.Attributes, "db.query.text", "http.request.header.authorization", "url.query")
+
+	// Normalize SQL queries
+	if stmt, ok := span.Attributes["db.query.text"]; ok && stmt != "" {
+		span.Attributes["db.query.text"] = redact.NormalizeSQL(stmt)
 	}
 
 	// Cross-service trace stitching: CLIENT spans are stored,
@@ -635,6 +695,7 @@ func (a *Agent) processSpan(span *traces.Span) {
 
 	// Export
 	a.exporter.ExportSpan(span)
+	a.healthStats.SpansExported.Add(1)
 
 	// Mark span as complete so correlation engine tracks proper time window
 	if a.correlation != nil {
@@ -665,6 +726,11 @@ func (a *Agent) logDispatchLoop(ctx context.Context) {
 
 // processLog enriches and exports a single log record.
 func (a *Agent) processLog(record *logs.LogRecord) {
+	a.healthStats.LogsReceived.Add(1)
+
+	// Apply PII redaction to log body
+	record.Body = a.redactor.Redact(record.Body)
+
 	// Try to enrich with trace context
 	if a.correlation != nil {
 		a.correlation.EnrichLog(record)
@@ -672,6 +738,7 @@ func (a *Agent) processLog(record *logs.LogRecord) {
 
 	// Convert and export
 	// R3.1: Map LogLevel enum to OTEL SeverityNumber
+	a.healthStats.LogsExported.Add(1)
 	a.exporter.ExportLog(&export.LogRecord{
 		Timestamp:      record.Timestamp,
 		ObservedTime:   time.Now(),
@@ -738,6 +805,11 @@ func (a *Agent) Stop() error {
 
 	if a.cancel != nil {
 		a.cancel()
+	}
+
+	if a.healthServer != nil {
+		a.healthServer.SetReady(false)
+		a.healthServer.Stop()
 	}
 
 	if a.hookProvider != nil {

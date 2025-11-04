@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+  labels:
+    app.kubernetes.io/name: olly
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  base.yaml: |
+    service_name: auto
+    log_level: {{ .Values.config.logLevel }}
+    hook:
+      enabled: true
+      socket_path: /var/run/olly/hook.sock
+    exporters:
+      otlp:
+        enabled: true
+        endpoint: {{ .Values.config.otlpEndpoint }}
+        protocol: {{ .Values.config.otlpProtocol }}
+        insecure: {{ .Values.config.otlpInsecure }}
+      stdout:
+        enabled: false
+    health:
+      enabled: true
+      port: ":{{ .Values.health.port }}"
+    redaction:
+      enabled: {{ .Values.config.redactionEnabled }}
+  traces.yaml: |
+    tracing:
+      enabled: {{ .Values.config.tracingEnabled }}
+      sampling:
+        rate: {{ .Values.config.samplingRate }}
+  metrics.yaml: |
+    metrics:
+      enabled: {{ .Values.config.metricsEnabled }}
+      host:
+        enabled: true
+      process:
+        enabled: true
+      container:
+        enabled: true
+  logs.yaml: |
+    logs:
+      enabled: {{ .Values.config.logsEnabled }}

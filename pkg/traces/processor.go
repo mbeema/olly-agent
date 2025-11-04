@@ -100,19 +100,25 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 
 	// Intra-process parent-child linking: if a parent context was set from
 	// the inbound request on this PID+TID, use it for trace correlation.
-	// For CLIENT spans, thread context ALWAYS takes precedence over
-	// extracted traceparent — the traceparent was injected by libolly.c for
-	// the downstream service, not from an upstream parent.
-	// For SERVER spans, extracted traceparent takes precedence (from upstream).
+	// Creates a proper chain: SERVER(ParentSpanID) → CLIENT(InjectedSpanID) → downstream
 	if pair.ParentTraceID != "" {
 		if kind == SpanKindClient {
-			// CLIENT span: thread context overrides injected traceparent
+			// CLIENT span: use thread context for parent linkage.
+			// InjectedSpanID is what sk_msg injected into the outbound HTTP,
+			// so the downstream service's parentSpanID matches this CLIENT span.
 			span.TraceID = pair.ParentTraceID
-			span.SpanID = GenerateSpanID()
+			if pair.InjectedSpanID != "" {
+				span.SpanID = pair.InjectedSpanID
+			} else {
+				span.SpanID = GenerateSpanID()
+			}
 			span.ParentSpanID = pair.ParentSpanID
-		} else if span.TraceID == "" {
-			// SERVER span without upstream traceparent: use thread context
-			span.TraceID = pair.ParentTraceID
+		} else {
+			// SERVER span: use ParentSpanID as this span's own ID so
+			// CLIENT child spans can reference it as their parent.
+			if span.TraceID == "" {
+				span.TraceID = pair.ParentTraceID
+			}
 			span.SpanID = pair.ParentSpanID
 		}
 	}

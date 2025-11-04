@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/mbeema/olly/pkg/agent"
 	"github.com/mbeema/olly/pkg/config"
@@ -123,10 +124,23 @@ func main() {
 				watcher.Stop()
 			}
 			cancel()
-			if err := a.Stop(); err != nil {
-				logger.Error("error during shutdown", zap.Error(err))
+
+			// Graceful shutdown with 30s timeout
+			shutdownDone := make(chan struct{})
+			go func() {
+				if err := a.Stop(); err != nil {
+					logger.Error("error during shutdown", zap.Error(err))
+				}
+				close(shutdownDone)
+			}()
+
+			select {
+			case <-shutdownDone:
+				logger.Info("olly agent stopped")
+			case <-time.After(30 * time.Second):
+				logger.Error("shutdown timed out after 30s, forcing exit")
+				os.Exit(1)
 			}
-			logger.Info("olly agent stopped")
 			return
 
 		case <-hupCh:
