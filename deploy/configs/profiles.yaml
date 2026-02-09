@@ -1,0 +1,5 @@
+# Profiling signal configuration
+profiling:
+  enabled: true
+  sample_rate: 99
+  interval: 10s

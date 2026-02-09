@@ -1,0 +1,538 @@
+package export
+
+import (
+	"context"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sync"
+
+	"github.com/mbeema/olly/pkg/config"
+	"github.com/mbeema/olly/pkg/traces"
+	"go.uber.org/zap"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials/insecure"
+
+	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
+	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	coltracepb "go.opentelemetry.io/proto/otlp/collector/trace/v1"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
+	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+)
+
+// OTLPExporter sends telemetry via OTLP gRPC with automatic reconnection.
+type OTLPExporter struct {
+	logger      *zap.Logger
+	serviceName string
+	endpoint    string
+	opts        []grpc.DialOption
+
+	mu        sync.RWMutex
+	conn      *grpc.ClientConn
+	traceSvc  coltracepb.TraceServiceClient
+	logSvc    collogspb.LogsServiceClient
+	metricSvc colmetricspb.MetricsServiceClient
+}
+
+// NewOTLPExporter creates a new OTLP gRPC exporter.
+func NewOTLPExporter(cfg *config.OTLPConfig, serviceName string, logger *zap.Logger) (*OTLPExporter, error) {
+	opts := []grpc.DialOption{
+		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(4 * 1024 * 1024)),
+	}
+
+	if cfg.Insecure {
+		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	e := &OTLPExporter{
+		logger:      logger,
+		serviceName: serviceName,
+		endpoint:    cfg.Endpoint,
+		opts:        opts,
+	}
+
+	if err := e.connect(); err != nil {
+		return nil, err
+	}
+
+	return e, nil
+}
+
+// connect establishes or re-establishes the gRPC connection.
+func (e *OTLPExporter) connect() error {
+	conn, err := grpc.Dial(e.endpoint, e.opts...)
+	if err != nil {
+		return fmt.Errorf("dial OTLP endpoint %s: %w", e.endpoint, err)
+	}
+
+	e.conn = conn
+	e.traceSvc = coltracepb.NewTraceServiceClient(conn)
+	e.logSvc = collogspb.NewLogsServiceClient(conn)
+	e.metricSvc = colmetricspb.NewMetricsServiceClient(conn)
+
+	return nil
+}
+
+// ensureConnected checks connection health and reconnects if needed.
+func (e *OTLPExporter) ensureConnected() error {
+	e.mu.RLock()
+	conn := e.conn
+	e.mu.RUnlock()
+
+	if conn == nil {
+		return e.reconnect()
+	}
+
+	state := conn.GetState()
+	switch state {
+	case connectivity.Ready, connectivity.Idle:
+		return nil
+	case connectivity.TransientFailure, connectivity.Shutdown:
+		return e.reconnect()
+	case connectivity.Connecting:
+		// Let it finish connecting
+		return nil
+	default:
+		return nil
+	}
+}
+
+// reconnect closes the old connection and creates a new one.
+func (e *OTLPExporter) reconnect() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// Double-check under write lock
+	if e.conn != nil {
+		state := e.conn.GetState()
+		if state == connectivity.Ready || state == connectivity.Idle {
+			return nil
+		}
+		e.conn.Close()
+	}
+
+	e.logger.Info("reconnecting to OTLP endpoint", zap.String("endpoint", e.endpoint))
+
+	if err := e.connect(); err != nil {
+		e.logger.Error("reconnect failed", zap.Error(err))
+		return err
+	}
+
+	e.logger.Info("reconnected to OTLP endpoint")
+	return nil
+}
+
+// R4.1 fix: Include all required/recommended OTEL resource attributes.
+func (e *OTLPExporter) resource() *resourcepb.Resource {
+	hostname, _ := os.Hostname()
+	execPath, _ := os.Executable()
+	execName := filepath.Base(execPath)
+
+	attrs := []*commonpb.KeyValue{
+		strAttr("service.name", e.serviceName),
+		strAttr("service.instance.id", fmt.Sprintf("%s-%d", hostname, os.Getpid())),
+		strAttr("telemetry.sdk.name", "olly"),
+		strAttr("telemetry.sdk.language", "go"),
+		strAttr("telemetry.sdk.version", "0.1.0"),
+		strAttr("host.name", hostname),
+		strAttr("host.arch", runtime.GOARCH),
+		strAttr("os.type", runtime.GOOS),
+		intAttr("process.pid", int64(os.Getpid())),
+		strAttr("process.executable.name", execName),
+		strAttr("process.runtime.name", "go"),
+		strAttr("process.runtime.version", runtime.Version()),
+	}
+
+	return &resourcepb.Resource{Attributes: attrs}
+}
+
+func strAttr(key, value string) *commonpb.KeyValue {
+	return &commonpb.KeyValue{
+		Key:   key,
+		Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: value}},
+	}
+}
+
+func intAttr(key string, value int64) *commonpb.KeyValue {
+	return &commonpb.KeyValue{
+		Key:   key,
+		Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: value}},
+	}
+}
+
+// ExportSpans sends spans via OTLP gRPC.
+func (e *OTLPExporter) ExportSpans(ctx context.Context, spans []*traces.Span) error {
+	if len(spans) == 0 {
+		return nil
+	}
+
+	if err := e.ensureConnected(); err != nil {
+		return fmt.Errorf("connection not ready: %w", err)
+	}
+
+	protoSpans := make([]*tracepb.Span, 0, len(spans))
+	for _, s := range spans {
+		ps, err := e.convertSpan(s)
+		if err != nil {
+			e.logger.Debug("skip span conversion", zap.Error(err))
+			continue
+		}
+		protoSpans = append(protoSpans, ps)
+	}
+
+	req := &coltracepb.ExportTraceServiceRequest{
+		ResourceSpans: []*tracepb.ResourceSpans{
+			{
+				Resource: e.resource(),
+				ScopeSpans: []*tracepb.ScopeSpans{
+					{
+						Scope: &commonpb.InstrumentationScope{
+							Name:    "olly",
+							Version: "0.1.0",
+						},
+						Spans: protoSpans,
+					},
+				},
+			},
+		},
+	}
+
+	e.mu.RLock()
+	svc := e.traceSvc
+	e.mu.RUnlock()
+
+	_, err := svc.Export(ctx, req)
+	return err
+}
+
+func (e *OTLPExporter) convertSpan(s *traces.Span) (*tracepb.Span, error) {
+	traceID, err := hexToBytes(s.TraceID, 16)
+	if err != nil {
+		return nil, fmt.Errorf("invalid trace ID: %w", err)
+	}
+
+	spanID, err := hexToBytes(s.SpanID, 8)
+	if err != nil {
+		return nil, fmt.Errorf("invalid span ID: %w", err)
+	}
+
+	ps := &tracepb.Span{
+		TraceId:           traceID,
+		SpanId:            spanID,
+		TraceState:        s.TraceState, // R1.2: propagate tracestate
+		Name:              s.Name,
+		Kind:              convertSpanKind(s.Kind),
+		StartTimeUnixNano: uint64(s.StartTime.UnixNano()),
+		EndTimeUnixNano:   uint64(s.EndTime.UnixNano()),
+	}
+
+	if s.ParentSpanID != "" {
+		parentID, err := hexToBytes(s.ParentSpanID, 8)
+		if err == nil {
+			ps.ParentSpanId = parentID
+		}
+	}
+
+	// Status
+	ps.Status = &tracepb.Status{}
+	switch s.Status {
+	case traces.StatusOK:
+		ps.Status.Code = tracepb.Status_STATUS_CODE_OK
+	case traces.StatusError:
+		ps.Status.Code = tracepb.Status_STATUS_CODE_ERROR
+		ps.Status.Message = s.StatusMsg
+	}
+
+	// Attributes
+	for k, v := range s.Attributes {
+		ps.Attributes = append(ps.Attributes, &commonpb.KeyValue{
+			Key:   k,
+			Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: v}},
+		})
+	}
+
+	// Events
+	for _, ev := range s.Events {
+		pe := &tracepb.Span_Event{
+			Name:         ev.Name,
+			TimeUnixNano: uint64(ev.Timestamp.UnixNano()),
+		}
+		for k, v := range ev.Attributes {
+			pe.Attributes = append(pe.Attributes, &commonpb.KeyValue{
+				Key:   k,
+				Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: v}},
+			})
+		}
+		ps.Events = append(ps.Events, pe)
+	}
+
+	return ps, nil
+}
+
+// ExportLogs sends log records via OTLP gRPC.
+func (e *OTLPExporter) ExportLogs(ctx context.Context, logs []*LogRecord) error {
+	if len(logs) == 0 {
+		return nil
+	}
+
+	if err := e.ensureConnected(); err != nil {
+		return fmt.Errorf("connection not ready: %w", err)
+	}
+
+	protoLogs := make([]*logspb.LogRecord, 0, len(logs))
+	for _, l := range logs {
+		pl := &logspb.LogRecord{
+			TimeUnixNano: uint64(l.Timestamp.UnixNano()),
+			Body: &commonpb.AnyValue{
+				Value: &commonpb.AnyValue_StringValue{StringValue: l.Body},
+			},
+			SeverityText:   l.Level,
+			SeverityNumber: logspb.SeverityNumber(l.SeverityNumber), // R3.1
+		}
+
+		// R3.2: Set ObservedTimestamp (when collector received the log)
+		if !l.ObservedTime.IsZero() {
+			pl.ObservedTimeUnixNano = uint64(l.ObservedTime.UnixNano())
+		}
+
+		if l.TraceID != "" {
+			if tid, err := hexToBytes(l.TraceID, 16); err == nil {
+				pl.TraceId = tid
+				// R3.3: Set TraceFlags when correlated
+				pl.Flags = 0x01 // sampled
+			}
+		}
+		if l.SpanID != "" {
+			if sid, err := hexToBytes(l.SpanID, 8); err == nil {
+				pl.SpanId = sid
+			}
+		}
+
+		// R3.4: Add log source attributes
+		if l.FilePath != "" {
+			l.Attributes["log.file.path"] = l.FilePath
+			l.Attributes["log.file.name"] = filepath.Base(l.FilePath)
+		}
+
+		for k, v := range l.Attributes {
+			pl.Attributes = append(pl.Attributes, &commonpb.KeyValue{
+				Key:   k,
+				Value: toAnyValue(v),
+			})
+		}
+
+		protoLogs = append(protoLogs, pl)
+	}
+
+	req := &collogspb.ExportLogsServiceRequest{
+		ResourceLogs: []*logspb.ResourceLogs{
+			{
+				Resource: e.resource(),
+				ScopeLogs: []*logspb.ScopeLogs{
+					{
+						Scope: &commonpb.InstrumentationScope{
+							Name:    "olly",
+							Version: "0.1.0",
+						},
+						LogRecords: protoLogs,
+					},
+				},
+			},
+		},
+	}
+
+	e.mu.RLock()
+	svc := e.logSvc
+	e.mu.RUnlock()
+
+	_, err := svc.Export(ctx, req)
+	return err
+}
+
+// ExportMetrics sends metrics via OTLP gRPC.
+func (e *OTLPExporter) ExportMetrics(ctx context.Context, metrics []*Metric) error {
+	if len(metrics) == 0 {
+		return nil
+	}
+
+	if err := e.ensureConnected(); err != nil {
+		return fmt.Errorf("connection not ready: %w", err)
+	}
+
+	protoMetrics := make([]*metricspb.Metric, 0, len(metrics))
+	for _, m := range metrics {
+		pm := e.convertMetric(m)
+		if pm != nil {
+			protoMetrics = append(protoMetrics, pm)
+		}
+	}
+
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{
+			{
+				Resource: e.resource(),
+				ScopeMetrics: []*metricspb.ScopeMetrics{
+					{
+						Scope: &commonpb.InstrumentationScope{
+							Name:    "olly",
+							Version: "0.1.0",
+						},
+						Metrics: protoMetrics,
+					},
+				},
+			},
+		},
+	}
+
+	e.mu.RLock()
+	svc := e.metricSvc
+	e.mu.RUnlock()
+
+	_, err := svc.Export(ctx, req)
+	return err
+}
+
+func (e *OTLPExporter) convertMetric(m *Metric) *metricspb.Metric {
+	pm := &metricspb.Metric{
+		Name:        m.Name,
+		Description: m.Description,
+		Unit:        m.Unit,
+	}
+
+	attrs := make([]*commonpb.KeyValue, 0, len(m.Labels))
+	for k, v := range m.Labels {
+		attrs = append(attrs, &commonpb.KeyValue{
+			Key:   k,
+			Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: v}},
+		})
+	}
+
+	ts := uint64(m.Timestamp.UnixNano())
+
+	switch m.Type {
+	case MetricGauge:
+		pm.Data = &metricspb.Metric_Gauge{
+			Gauge: &metricspb.Gauge{
+				DataPoints: []*metricspb.NumberDataPoint{
+					{
+						TimeUnixNano: ts,
+						Value:        &metricspb.NumberDataPoint_AsDouble{AsDouble: m.Value},
+						Attributes:   attrs,
+					},
+				},
+			},
+		}
+
+	case MetricCounter:
+		pm.Data = &metricspb.Metric_Sum{
+			Sum: &metricspb.Sum{
+				IsMonotonic:            true,
+				AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
+				DataPoints: []*metricspb.NumberDataPoint{
+					{
+						TimeUnixNano: ts,
+						Value:        &metricspb.NumberDataPoint_AsDouble{AsDouble: m.Value},
+						Attributes:   attrs,
+					},
+				},
+			},
+		}
+
+	case MetricHistogram:
+		if m.Histogram != nil {
+			// R5.2: OTLP requires len(BucketCounts) == len(ExplicitBounds) + 1
+			// The last bucket count is the +Inf overflow bucket.
+			nBuckets := len(m.Histogram.Buckets)
+			bounds := make([]float64, nBuckets)
+			counts := make([]uint64, nBuckets+1) // +1 for +Inf overflow
+			for i, b := range m.Histogram.Buckets {
+				bounds[i] = b.UpperBound
+				counts[i] = b.Count
+			}
+			// +Inf bucket: total count minus the cumulative count in the last explicit bucket
+			if nBuckets > 0 {
+				counts[nBuckets] = m.Histogram.Count - counts[nBuckets-1]
+			} else {
+				counts[0] = m.Histogram.Count
+			}
+
+			pm.Data = &metricspb.Metric_Histogram{
+				Histogram: &metricspb.Histogram{
+					AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
+					DataPoints: []*metricspb.HistogramDataPoint{
+						{
+							TimeUnixNano:   ts,
+							Count:          m.Histogram.Count,
+							Sum:            &m.Histogram.Sum,
+							ExplicitBounds: bounds,
+							BucketCounts:   counts,
+							Attributes:     attrs,
+						},
+					},
+				},
+			}
+		}
+	}
+
+	return pm
+}
+
+// Shutdown closes the gRPC connection.
+func (e *OTLPExporter) Shutdown(ctx context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.conn != nil {
+		return e.conn.Close()
+	}
+	return nil
+}
+
+func hexToBytes(s string, expectedLen int) ([]byte, error) {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nil, err
+	}
+	if len(b) != expectedLen {
+		return nil, fmt.Errorf("expected %d bytes, got %d", expectedLen, len(b))
+	}
+	return b, nil
+}
+
+func convertSpanKind(k traces.SpanKind) tracepb.Span_SpanKind {
+	switch k {
+	case traces.SpanKindServer:
+		return tracepb.Span_SPAN_KIND_SERVER
+	case traces.SpanKindClient:
+		return tracepb.Span_SPAN_KIND_CLIENT
+	case traces.SpanKindProducer:
+		return tracepb.Span_SPAN_KIND_PRODUCER
+	case traces.SpanKindConsumer:
+		return tracepb.Span_SPAN_KIND_CONSUMER
+	default:
+		return tracepb.Span_SPAN_KIND_INTERNAL
+	}
+}
+
+func toAnyValue(v interface{}) *commonpb.AnyValue {
+	switch val := v.(type) {
+	case string:
+		return &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: val}}
+	case int:
+		return &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: int64(val)}}
+	case int64:
+		return &commonpb.AnyValue{Value: &commonpb.AnyValue_IntValue{IntValue: val}}
+	case float64:
+		return &commonpb.AnyValue{Value: &commonpb.AnyValue_DoubleValue{DoubleValue: val}}
+	case bool:
+		return &commonpb.AnyValue{Value: &commonpb.AnyValue_BoolValue{BoolValue: val}}
+	default:
+		return &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: fmt.Sprintf("%v", val)}}
+	}
+}

@@ -1,0 +1,96 @@
+package protocol
+
+import (
+	"testing"
+)
+
+func TestHTTPDetect(t *testing.T) {
+	p := &HTTPParser{}
+
+	tests := []struct {
+		name   string
+		data   []byte
+		port   uint16
+		expect bool
+	}{
+		{"GET request", []byte("GET / HTTP/1.1\r\n"), 0, true},
+		{"POST request", []byte("POST /api HTTP/1.1\r\n"), 0, true},
+		{"HTTP response", []byte("HTTP/1.1 200 OK\r\n"), 0, true},
+		{"Binary data", []byte{0x00, 0x01, 0x02, 0x03}, 0, false},
+		{"Too short", []byte("GE"), 0, false},
+		{"PUT request", []byte("PUT /resource HTTP/1.1\r\n"), 0, true},
+		{"DELETE request", []byte("DELETE /item/1 HTTP/1.1\r\n"), 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := p.Detect(tt.data, tt.port)
+			if got != tt.expect {
+				t.Errorf("Detect(%q, %d) = %v, want %v", tt.data, tt.port, got, tt.expect)
+			}
+		})
+	}
+}
+
+func TestHTTPParse(t *testing.T) {
+	p := &HTTPParser{}
+
+	request := []byte("GET /api/users?page=1 HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test\r\n\r\n")
+	response := []byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")
+
+	attrs, err := p.Parse(request, response)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	if attrs.HTTPMethod != "GET" {
+		t.Errorf("method = %q, want GET", attrs.HTTPMethod)
+	}
+	if attrs.HTTPPath != "/api/users?page=1" {
+		t.Errorf("path = %q, want /api/users?page=1", attrs.HTTPPath)
+	}
+	if attrs.HTTPStatusCode != 200 {
+		t.Errorf("status = %d, want 200", attrs.HTTPStatusCode)
+	}
+	if attrs.HTTPHost != "example.com" {
+		t.Errorf("host = %q, want example.com", attrs.HTTPHost)
+	}
+	if attrs.Error {
+		t.Error("unexpected error flag")
+	}
+}
+
+func TestHTTPParseError(t *testing.T) {
+	p := &HTTPParser{}
+
+	request := []byte("GET /fail HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	response := []byte("HTTP/1.1 500 Internal Server Error\r\n\r\n")
+
+	attrs, err := p.Parse(request, response)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	if attrs.HTTPStatusCode != 500 {
+		t.Errorf("status = %d, want 500", attrs.HTTPStatusCode)
+	}
+	if !attrs.Error {
+		t.Error("expected error flag for 500")
+	}
+}
+
+func TestExtractTraceParent(t *testing.T) {
+	request := []byte("GET / HTTP/1.1\r\ntraceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\r\n\r\n")
+
+	traceID, spanID, sampled := ExtractTraceParent(request)
+
+	if traceID != "0af7651916cd43dd8448eb211c80319c" {
+		t.Errorf("traceID = %q", traceID)
+	}
+	if spanID != "b7ad6b7169203331" {
+		t.Errorf("spanID = %q", spanID)
+	}
+	if !sampled {
+		t.Error("expected sampled=true")
+	}
+}
