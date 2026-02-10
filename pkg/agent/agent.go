@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
@@ -32,6 +33,7 @@ type Agent struct {
 	logger *zap.Logger
 
 	hookMgr        *hook.Manager
+	logParser      *logs.Parser
 	connTracker    *conntrack.Tracker
 	reassembler    *reassembly.Reassembler
 	traceProc      *traces.Processor
@@ -75,6 +77,9 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 		spanCh: make(chan *traces.Span, 10000),
 	}
 	a.cfg.Store(cfg)
+
+	// Initialize log parser for hook-captured log writes
+	a.logParser = logs.NewParser()
 
 	// Initialize connection tracker
 	a.connTracker = conntrack.NewTracker()
@@ -206,6 +211,13 @@ func (a *Agent) Start(ctx context.Context) error {
 			a.reassembler.RemoveStream(pid, fd, tid)
 			a.connTracker.Remove(pid, fd)
 		},
+
+		// R6: Capture log writes with PID+TID for trace correlation
+		OnLogWrite: func(pid, tid uint32, fd int32, data []byte, ts uint64) {
+			if cfg.Hook.LogCaptureEnabled() {
+				a.processHookLog(pid, tid, fd, data, ts)
+			}
+		},
 	}
 
 	// C9 fix: Reassembler sends pairs to channel instead of calling callbacks directly.
@@ -267,6 +279,16 @@ func (a *Agent) Start(ctx context.Context) error {
 		a.hookMgr = hook.NewManager(cfg.Hook.SocketPath, callbacks, a.logger)
 		if err := a.hookMgr.Start(ctx); err != nil {
 			return fmt.Errorf("start hook manager: %w", err)
+		}
+		// Set initial tracing state based on on_demand config
+		if cfg.Hook.OnDemand {
+			a.logger.Info("on-demand tracing: starting dormant (use 'olly trace start' to activate)")
+			// Control file starts dormant by default — no action needed
+		} else {
+			// Legacy mode: enable tracing immediately
+			if err := a.hookMgr.EnableTracing(); err != nil {
+				a.logger.Warn("failed to enable tracing", zap.Error(err))
+			}
 		}
 	}
 
@@ -465,6 +487,48 @@ func (a *Agent) processLog(record *logs.LogRecord) {
 		Source:         record.Source,
 		FilePath:       record.FilePath,
 	})
+}
+
+// processHookLog handles log data captured by the write() hook in libolly.c.
+// The key advantage: PID and TID come from the syscall context, enabling
+// automatic correlation with active traces via the correlation engine.
+func (a *Agent) processHookLog(pid, tid uint32, fd int32, data []byte, ts uint64) {
+	// Binary filter: skip if >10% non-printable bytes in first 256 bytes
+	checkLen := len(data)
+	if checkLen > 256 {
+		checkLen = 256
+	}
+	nonPrintable := 0
+	for i := 0; i < checkLen; i++ {
+		b := data[i]
+		if b < 0x20 && b != '\n' && b != '\r' && b != '\t' {
+			nonPrintable++
+		}
+	}
+	if checkLen > 0 && nonPrintable*10 > checkLen {
+		return // binary data, not a log
+	}
+
+	// Split on newlines and process each line
+	lines := bytes.Split(data, []byte("\n"))
+	for _, line := range lines {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+
+		record := a.logParser.Parse(string(line), "auto")
+		// Override PID/TID from syscall context — this is the key advantage
+		record.PID = int(pid)
+		record.TID = int(tid)
+		record.Source = "hook"
+
+		select {
+		case a.logCh <- record:
+		default:
+			// Channel full, drop
+		}
+	}
 }
 
 // Stop shuts down all subsystems gracefully.

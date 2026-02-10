@@ -85,14 +85,28 @@ sudo chmod +x /opt/olly/run-demo.sh
 sudo bash -c 'nohup /opt/olly/olly --config-dir /opt/olly/configs --log-level debug > /var/log/olly.log 2>&1 &'
 sleep 2
 
+# Install order-service (Go microservice for cross-service tracing demo)
+if [ -f olly-deploy/order-service ]; then
+    sudo cp olly-deploy/order-service /opt/olly/order-service
+    sudo chmod +x /opt/olly/order-service
+    sudo bash -c 'nohup /opt/olly/order-service > /var/log/demo-app/order-service.log 2>&1 &'
+    sleep 1
+fi
+
 # Start demo app via wrapper (LD_PRELOAD for hook interception)
 sudo bash -c 'nohup /opt/olly/run-demo.sh > /var/log/demo-app/stdout.log 2>&1 &'
 sleep 3
 
+# Activate tracing if on-demand mode is configured
+# (base.yaml has on_demand: true — agent starts dormant, must be explicitly activated)
+if [ -f /var/run/olly/control ]; then
+    sudo /opt/olly/olly trace start 2>/dev/null && echo "Tracing activated (on-demand mode)" || true
+fi
+
 echo "=== Deployment complete ==="
 echo "Demo app: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):5000"
 echo "Olly agent PID: $(pgrep -x olly || echo 'not running')"
-echo "Demo app PID:   $(pgrep -x python3 || echo 'not running')"
+echo "Demo app PID:   $(pgrep -f 'python3.*app.py' || echo 'not running')"
 REMOTE_SCRIPT
 
 echo ""

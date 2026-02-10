@@ -30,6 +30,17 @@ type HookConfig struct {
 	LibraryPath string `yaml:"library_path"`
 	HTTPPorts   []int  `yaml:"http_ports"`
 	Debug       bool   `yaml:"debug"`
+	OnDemand    bool   `yaml:"on_demand"`    // Start dormant; activate via 'olly trace start'
+	LogCapture  *bool  `yaml:"log_capture"`  // Capture log writes via write() hook (default: true)
+}
+
+// LogCaptureEnabled returns whether log capture via write() hook is enabled.
+// Defaults to true when not explicitly set.
+func (h *HookConfig) LogCaptureEnabled() bool {
+	if h.LogCapture == nil {
+		return true
+	}
+	return *h.LogCapture
 }
 
 type TracingConfig struct {

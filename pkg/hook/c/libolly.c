@@ -30,6 +30,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <time.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -76,13 +78,14 @@ static inline int     raw_close(int fd) { return syscall(SYS_close, fd); }
 
 /* ─── Wire protocol ─────────────────────────────────────────────── */
 
-#define MSG_CONNECT   1
-#define MSG_DATA_OUT  2
-#define MSG_DATA_IN   3
-#define MSG_CLOSE     4
-#define MSG_SSL_OUT   5
-#define MSG_SSL_IN    6
-#define MSG_ACCEPT    7
+#define MSG_CONNECT    1
+#define MSG_DATA_OUT   2
+#define MSG_DATA_IN    3
+#define MSG_CLOSE      4
+#define MSG_SSL_OUT    5
+#define MSG_SSL_IN     6
+#define MSG_ACCEPT     7
+#define MSG_LOG_WRITE  8
 
 #define MAX_PAYLOAD   (16 * 1024)
 #define HEADER_SIZE   32
@@ -140,7 +143,97 @@ static int debug_enabled = 0;
 static int urandom_fd = -1;
 #endif
 
+/* ─── On-demand tracing control (shared memory) ────────────────── */
+/*
+ * Zero-overhead dormant mode: the agent creates a shared memory file
+ * and writes a single byte to enable/disable tracing. Each hooked
+ * function checks this byte via mmap — a single L1-cache memory load
+ * (~0.3ns). When the byte is 0, hooks pass through to the original
+ * function with no further work. When no control file exists, tracing
+ * is always active (backward compatible with agents that don't create it).
+ */
+static volatile uint8_t *g_control = NULL;
+static int control_fd = -1;
+#define CONTROL_FILE_SIZE 4096
+#define DEFAULT_CONTROL_PATH "/var/run/olly/control"
+
 #define DEFAULT_SOCKET_PATH "/var/run/olly/hook.sock"
+
+/* ─── Log FD cache ──────────────────────────────────────────────── */
+/*
+ * Caches whether an fd points to a regular file or stdout/stderr.
+ * Used by write() hook to decide whether to send MSG_LOG_WRITE.
+ * Hash-indexed by fd, invalidated on close().
+ */
+
+#define LOG_FD_CACHE_SIZE 256
+#define LOG_FD_CACHE_MASK (LOG_FD_CACHE_SIZE - 1)
+
+#define LOG_FD_UNKNOWN   0  /* not yet classified */
+#define LOG_FD_YES       1  /* regular file, stdout, or stderr */
+#define LOG_FD_NO        2  /* socket, pipe, agent fd, etc. */
+
+typedef struct {
+    _Atomic(int32_t) fd;     /* cached fd value, -1 = empty */
+    _Atomic(uint8_t) result; /* LOG_FD_UNKNOWN / YES / NO */
+} log_fd_entry_t;
+
+static log_fd_entry_t log_fd_cache[LOG_FD_CACHE_SIZE];
+
+static inline uint32_t log_fd_hash(int fd) {
+    return ((uint32_t)fd) & LOG_FD_CACHE_MASK;
+}
+
+/*
+ * is_log_fd: Returns 1 if fd is a regular file, stdout, or stderr.
+ * Uses cached result when available. First call does fstat (~200ns),
+ * subsequent calls are ~2ns (cache lookup).
+ */
+static int is_log_fd(int fd) {
+    /* stdout/stderr are always log FDs */
+    if (fd == STDOUT_FILENO || fd == STDERR_FILENO)
+        return 1;
+
+    /* Our internal fds are never log FDs */
+    if (fd == agent_sock || fd == control_fd)
+        return 0;
+#ifdef __linux__
+    if (fd == urandom_fd)
+        return 0;
+#endif
+
+    uint32_t idx = log_fd_hash(fd);
+    log_fd_entry_t *entry = &log_fd_cache[idx];
+
+    int32_t cached_fd = atomic_load_explicit(&entry->fd, memory_order_acquire);
+    if (cached_fd == fd) {
+        uint8_t r = atomic_load_explicit(&entry->result, memory_order_relaxed);
+        if (r != LOG_FD_UNKNOWN)
+            return r == LOG_FD_YES;
+    }
+
+    /* Cache miss — classify with fstat */
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        atomic_store_explicit(&entry->fd, (int32_t)fd, memory_order_relaxed);
+        atomic_store_explicit(&entry->result, LOG_FD_NO, memory_order_release);
+        return 0;
+    }
+
+    uint8_t result = S_ISREG(st.st_mode) ? LOG_FD_YES : LOG_FD_NO;
+    atomic_store_explicit(&entry->fd, (int32_t)fd, memory_order_relaxed);
+    atomic_store_explicit(&entry->result, result, memory_order_release);
+    return result == LOG_FD_YES;
+}
+
+static void log_fd_cache_invalidate(int fd) {
+    uint32_t idx = log_fd_hash(fd);
+    log_fd_entry_t *entry = &log_fd_cache[idx];
+    if (atomic_load(&entry->fd) == fd) {
+        atomic_store_explicit(&entry->result, LOG_FD_UNKNOWN, memory_order_relaxed);
+        atomic_store_explicit(&entry->fd, (int32_t)-1, memory_order_release);
+    }
+}
 
 /* Async-signal-safe debug: uses write() not fprintf() */
 static void dbg_write(const char *msg) {
@@ -156,6 +249,64 @@ static void dbg_write(const char *msg) {
     (void)!write(STDERR_FILENO, msg, strlen(msg));
     (void)!write(STDERR_FILENO, "\n", 1);
 #endif
+}
+
+/* ─── Shared memory control ────────────────────────────────────── */
+
+/*
+ * try_mmap_control: Map the control file into this process's address space.
+ * The control file path is derived from OLLY_CONTROL env, or from the
+ * socket directory (sibling of hook.sock), or the default path.
+ */
+static void try_mmap_control(void) {
+    if (g_control) return;
+
+    const char *path = getenv("OLLY_CONTROL");
+
+    /* Derive from socket directory if not explicitly set */
+    static char derived_path[256];
+    if (!path) {
+        const char *sock = getenv("OLLY_SOCKET");
+        if (!sock) sock = DEFAULT_SOCKET_PATH;
+        const char *slash = strrchr(sock, '/');
+        if (slash && (size_t)(slash - sock) + 9 < sizeof(derived_path)) {
+            memcpy(derived_path, sock, (size_t)(slash - sock));
+            memcpy(derived_path + (size_t)(slash - sock), "/control", 9);
+            path = derived_path;
+        } else {
+            path = DEFAULT_CONTROL_PATH;
+        }
+    }
+
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        dbg_write("no control file (tracing always active)");
+        return;
+    }
+
+    void *p = mmap(NULL, CONTROL_FILE_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+#ifdef __linux__
+        syscall(SYS_close, fd);
+#else
+        close(fd);
+#endif
+        return;
+    }
+
+    control_fd = fd;
+    g_control = (volatile uint8_t *)p;
+    dbg_write("control file mapped (on-demand mode)");
+}
+
+/*
+ * olly_active: Check if tracing is currently enabled.
+ * When no control file is mapped (legacy/standalone mode), returns 1 (always active).
+ * When control file exists, returns its first byte (0=dormant, 1=active).
+ * Cost: one NULL check + one memory load ≈ 0.3–1ns.
+ */
+static inline int olly_active(void) {
+    return g_control == NULL || *(volatile uint8_t *)g_control;
 }
 
 /* ─── Original function pointers ────────────────────────────────── */
@@ -241,6 +392,12 @@ static void init_agent_socket(void) {
     orig_recvfrom = (recvfrom_fn)dlsym(RTLD_NEXT, "recvfrom");
     orig_close    = (close_fn)dlsym(RTLD_NEXT, "close");
 
+    /* Initialize log FD cache */
+    for (int i = 0; i < LOG_FD_CACHE_SIZE; i++) {
+        atomic_store_explicit(&log_fd_cache[i].fd, (int32_t)-1, memory_order_relaxed);
+        atomic_store_explicit(&log_fd_cache[i].result, LOG_FD_UNKNOWN, memory_order_relaxed);
+    }
+
     /* Initialize connection table */
     for (int i = 0; i < MAX_CONNECTIONS; i++) {
         atomic_store_explicit(&conn_table[i].fd, -1, memory_order_relaxed);
@@ -255,6 +412,9 @@ static void init_agent_socket(void) {
         dbg_write("warning: cannot open /dev/urandom");
     }
 #endif
+
+    /* Map shared memory control file for on-demand tracing */
+    try_mmap_control();
 }
 
 static _Atomic(int) init_state = 0; /* 0=not started, 1=in progress, 2=done */
@@ -466,11 +626,13 @@ static uint8_t *try_inject_traceparent(const void *buf, size_t len, size_t *new_
     /* Generate fresh trace context for this request */
     generate_trace_context();
 
-    /* Build: "traceparent: 00-{trace_id}-{span_id}-03\r\n" */
-    char tp_hdr[64];
+    /* Build: "traceparent: 00-{trace_id}-{span_id}-03\r\n"
+     * = 16 + 32 + 1 + 16 + 5 = 70 chars + NUL = 71 bytes */
+    char tp_hdr[128];
     int tp_len = snprintf(tp_hdr, sizeof(tp_hdr),
         "traceparent: 00-%s-%s-03\r\n",
         tl_trace_ctx.trace_id, tl_trace_ctx.span_id);
+    if (tp_len <= 0 || (size_t)tp_len >= sizeof(tp_hdr)) return NULL;
 
     /*
      * Split at \r\n\r\n: insert new header between last header's \r\n
@@ -573,11 +735,74 @@ static int untrack_conn(int fd) {
     return 0;
 }
 
+/*
+ * try_discover_conn: Auto-discover a pre-existing socket connection.
+ * When tracing activates on-demand, connections established while dormant
+ * aren't in our table. On the first data event for such an fd, we call
+ * getpeername() to discover it and register it.
+ * Cost: ~200ns (getpeername + getsockname syscalls). Called once per fd.
+ */
+static conn_slot_t *try_discover_conn(int fd) {
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+
+    if (getpeername(fd, (struct sockaddr *)&ss, &slen) != 0)
+        return NULL;  /* Not a connected socket (file, pipe, etc.) */
+
+    uint32_t ip = 0;
+    uint16_t port = 0;
+    uint16_t nport = 0;
+
+    if (ss.ss_family == AF_INET) {
+        struct sockaddr_in *in = (struct sockaddr_in *)&ss;
+        ip = in->sin_addr.s_addr;
+        port = ntohs(in->sin_port);
+        nport = in->sin_port;
+    } else if (ss.ss_family == AF_INET6) {
+        struct sockaddr_in6 *in6 = (struct sockaddr_in6 *)&ss;
+        port = ntohs(in6->sin6_port);
+        nport = in6->sin6_port;
+        if (IN6_IS_ADDR_V4MAPPED(&in6->sin6_addr))
+            memcpy(&ip, &in6->sin6_addr.s6_addr[12], 4);
+    } else {
+        return NULL;  /* Unix socket or other unsupported family */
+    }
+
+    /* Direction heuristic: if remote port is in the ephemeral range (>=32768)
+     * and our local port is low (<32768), we're likely a server (inbound).
+     * This correctly handles: app→DB:5432 (outbound), client→app:8080 (inbound). */
+    uint8_t direction = CONN_DIR_OUTBOUND;
+    struct sockaddr_storage local_ss;
+    socklen_t local_len = sizeof(local_ss);
+    if (getsockname(fd, (struct sockaddr *)&local_ss, &local_len) == 0) {
+        uint16_t local_port = 0;
+        if (local_ss.ss_family == AF_INET)
+            local_port = ntohs(((struct sockaddr_in *)&local_ss)->sin_port);
+        else if (local_ss.ss_family == AF_INET6)
+            local_port = ntohs(((struct sockaddr_in6 *)&local_ss)->sin6_port);
+        if (port >= 32768 && local_port > 0 && local_port < 32768)
+            direction = CONN_DIR_INBOUND;
+    }
+
+    track_connect(fd, ip, port, direction);
+
+    /* Notify agent of the discovered connection */
+    uint8_t payload[6];
+    memcpy(payload, &ip, 4);
+    memcpy(payload + 4, &nport, 2);
+    send_msg(direction == CONN_DIR_INBOUND ? MSG_ACCEPT : MSG_CONNECT,
+             fd, payload, 6);
+
+    dbg_write("discovered pre-existing connection");
+    return find_conn(fd);
+}
+
 /* ─── Hooked functions ──────────────────────────────────────────── */
 
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     ensure_init();
     if (!orig_connect) return raw_connect(sockfd, addr, addrlen);
+    if (!olly_active()) goto passthrough;
 
     /* Always call the real connect first */
     int ret = orig_connect(sockfd, addr, addrlen);
@@ -629,6 +854,7 @@ passthrough:
 int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     ensure_init();
     if (!orig_accept) return raw_accept(sockfd, addr, addrlen);
+    if (!olly_active()) goto passthrough;
 
     int ret = orig_accept(sockfd, addr, addrlen);
     if (ret < 0) {
@@ -677,6 +903,7 @@ passthrough:
 int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
     ensure_init();
     if (!orig_accept4) return raw_accept4(sockfd, addr, addrlen, flags);
+    if (!olly_active()) goto passthrough;
 
     int ret = orig_accept4(sockfd, addr, addrlen, flags);
     if (ret < 0) {
@@ -725,9 +952,11 @@ passthrough:
 ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
     ensure_init();
     if (!orig_send) return raw_send(sockfd, buf, len, flags);
+    if (!olly_active()) goto passthrough;
     HOOK_GUARD_ENTER();
 
     conn_slot_t *conn = find_conn(sockfd);
+    if (!conn) conn = try_discover_conn(sockfd);
     const void *send_buf = buf;
     size_t send_len = len;
     uint8_t *injected = NULL;
@@ -739,15 +968,30 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
     }
 
     ssize_t ret = orig_send(sockfd, send_buf, send_len, flags);
-    if (ret > 0 && conn) {
-        uint32_t cap = (uint32_t)(ret < MAX_PAYLOAD ? ret : MAX_PAYLOAD);
-        send_msg(MSG_DATA_OUT, sockfd, send_buf, cap);
-    }
 
     if (injected) {
+        /* Retry remaining bytes if partial send of injected buffer */
+        if (ret > 0 && (size_t)ret < send_len) {
+            size_t sent = (size_t)ret;
+            while (sent < send_len) {
+                ssize_t n = orig_send(sockfd, send_buf + sent, send_len - sent, flags);
+                if (n <= 0) break;
+                sent += (size_t)n;
+            }
+            ret = (ssize_t)sent;
+        }
+        if (ret > 0 && conn) {
+            uint32_t cap = (uint32_t)(ret < MAX_PAYLOAD ? ret : MAX_PAYLOAD);
+            send_msg(MSG_DATA_OUT, sockfd, send_buf, cap);
+        }
         free(injected);
         HOOK_GUARD_EXIT();
         return (ret > 0) ? (ssize_t)len : ret;
+    }
+
+    if (ret > 0 && conn) {
+        uint32_t cap = (uint32_t)(ret < MAX_PAYLOAD ? ret : MAX_PAYLOAD);
+        send_msg(MSG_DATA_OUT, sockfd, send_buf, cap);
     }
 
     HOOK_GUARD_EXIT();
@@ -760,10 +1004,11 @@ passthrough:
 ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
     ensure_init();
     if (!orig_recv) return raw_recv(sockfd, buf, len, flags);
+    if (!olly_active()) goto passthrough;
     HOOK_GUARD_ENTER();
 
     ssize_t ret = orig_recv(sockfd, buf, len, flags);
-    if (ret > 0 && find_conn(sockfd)) {
+    if (ret > 0 && (find_conn(sockfd) || try_discover_conn(sockfd))) {
         uint32_t cap = (uint32_t)(ret < MAX_PAYLOAD ? ret : MAX_PAYLOAD);
         send_msg(MSG_DATA_IN, sockfd, buf, cap);
     }
@@ -778,9 +1023,11 @@ passthrough:
 ssize_t write(int fd, const void *buf, size_t count) {
     ensure_init();
     if (!orig_write) return raw_write(fd, buf, count);
+    if (!olly_active()) goto passthrough;
     HOOK_GUARD_ENTER();
 
     conn_slot_t *conn = find_conn(fd);
+    if (!conn) conn = try_discover_conn(fd);
     const void *write_buf = buf;
     size_t write_len = count;
     uint8_t *injected = NULL;
@@ -791,15 +1038,36 @@ ssize_t write(int fd, const void *buf, size_t count) {
     }
 
     ssize_t ret = orig_write(fd, write_buf, write_len);
+
+    if (injected) {
+        /* Retry remaining bytes if partial write of injected buffer */
+        if (ret > 0 && (size_t)ret < write_len) {
+            size_t written = (size_t)ret;
+            while (written < write_len) {
+                ssize_t n = orig_write(fd, (const uint8_t *)write_buf + written, write_len - written);
+                if (n <= 0) break;
+                written += (size_t)n;
+            }
+            ret = (ssize_t)written;
+        }
+        if (ret > 0 && conn) {
+            uint32_t cap = (uint32_t)(ret < MAX_PAYLOAD ? ret : MAX_PAYLOAD);
+            send_msg(MSG_DATA_OUT, fd, write_buf, cap);
+        }
+        free(injected);
+        HOOK_GUARD_EXIT();
+        return (ret > 0) ? (ssize_t)count : ret;
+    }
+
     if (ret > 0 && conn) {
         uint32_t cap = (uint32_t)(ret < MAX_PAYLOAD ? ret : MAX_PAYLOAD);
         send_msg(MSG_DATA_OUT, fd, write_buf, cap);
     }
 
-    if (injected) {
-        free(injected);
-        HOOK_GUARD_EXIT();
-        return (ret > 0) ? (ssize_t)count : ret;
+    /* R6: Capture log writes to regular files and stdout/stderr */
+    if (!conn && ret > 0 && is_log_fd(fd)) {
+        uint32_t cap = (uint32_t)(ret < MAX_PAYLOAD ? ret : MAX_PAYLOAD);
+        send_msg(MSG_LOG_WRITE, fd, buf, cap);
     }
 
     HOOK_GUARD_EXIT();
@@ -812,10 +1080,11 @@ passthrough:
 ssize_t read(int fd, void *buf, size_t count) {
     ensure_init();
     if (!orig_read) return raw_read(fd, buf, count);
+    if (!olly_active()) goto passthrough;
     HOOK_GUARD_ENTER();
 
     ssize_t ret = orig_read(fd, buf, count);
-    if (ret > 0 && find_conn(fd)) {
+    if (ret > 0 && (find_conn(fd) || try_discover_conn(fd))) {
         uint32_t cap = (uint32_t)(ret < MAX_PAYLOAD ? ret : MAX_PAYLOAD);
         send_msg(MSG_DATA_IN, fd, buf, cap);
     }
@@ -831,9 +1100,11 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
                const struct sockaddr *dest_addr, socklen_t addrlen) {
     ensure_init();
     if (!orig_sendto) return raw_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+    if (!olly_active()) goto passthrough;
     HOOK_GUARD_ENTER();
 
     conn_slot_t *conn = find_conn(sockfd);
+    if (!conn) conn = try_discover_conn(sockfd);
     const void *send_buf = buf;
     size_t send_len = len;
     uint8_t *injected = NULL;
@@ -844,15 +1115,31 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
     }
 
     ssize_t ret = orig_sendto(sockfd, send_buf, send_len, flags, dest_addr, addrlen);
-    if (ret > 0 && conn) {
-        uint32_t cap = (uint32_t)(ret < MAX_PAYLOAD ? ret : MAX_PAYLOAD);
-        send_msg(MSG_DATA_OUT, sockfd, send_buf, cap);
-    }
 
     if (injected) {
+        /* For injected buffers on connected sockets, retry partial sends */
+        if (ret > 0 && (size_t)ret < send_len) {
+            size_t sent = (size_t)ret;
+            while (sent < send_len) {
+                ssize_t n = orig_sendto(sockfd, (const uint8_t *)send_buf + sent,
+                                        send_len - sent, flags, NULL, 0);
+                if (n <= 0) break;
+                sent += (size_t)n;
+            }
+            ret = (ssize_t)sent;
+        }
+        if (ret > 0 && conn) {
+            uint32_t cap = (uint32_t)(ret < MAX_PAYLOAD ? ret : MAX_PAYLOAD);
+            send_msg(MSG_DATA_OUT, sockfd, send_buf, cap);
+        }
         free(injected);
         HOOK_GUARD_EXIT();
         return (ret > 0) ? (ssize_t)len : ret;
+    }
+
+    if (ret > 0 && conn) {
+        uint32_t cap = (uint32_t)(ret < MAX_PAYLOAD ? ret : MAX_PAYLOAD);
+        send_msg(MSG_DATA_OUT, sockfd, send_buf, cap);
     }
 
     HOOK_GUARD_EXIT();
@@ -867,10 +1154,11 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
                  struct sockaddr *src_addr, socklen_t *addrlen) {
     ensure_init();
     if (!orig_recvfrom) return raw_recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
+    if (!olly_active()) goto passthrough;
     HOOK_GUARD_ENTER();
 
     ssize_t ret = orig_recvfrom(sockfd, buf, len, flags, src_addr, addrlen);
-    if (ret > 0 && find_conn(sockfd)) {
+    if (ret > 0 && (find_conn(sockfd) || try_discover_conn(sockfd))) {
         uint32_t cap = (uint32_t)(ret < MAX_PAYLOAD ? ret : MAX_PAYLOAD);
         send_msg(MSG_DATA_IN, sockfd, buf, cap);
     }
@@ -886,11 +1174,15 @@ passthrough:
 int close(int fd) {
     ensure_init();
     if (!orig_close) return raw_close(fd);
+    if (!olly_active()) goto passthrough;
     HOOK_GUARD_ENTER();
 
     if (untrack_conn(fd)) {
         send_msg(MSG_CLOSE, fd, NULL, 0);
     }
+
+    /* Invalidate log FD cache on close */
+    log_fd_cache_invalidate(fd);
 
     HOOK_GUARD_EXIT();
     return orig_close(fd);
@@ -909,6 +1201,7 @@ int SSL_write(void *ssl, const void *buf, int num) {
         errno = ENOSYS;
         return -1;
     }
+    if (!olly_active()) goto passthrough;
 
     HOOK_GUARD_ENTER();
 
@@ -924,6 +1217,7 @@ int SSL_write(void *ssl, const void *buf, int num) {
     /* Inject traceparent on outbound SSL connections */
     if (fd >= 0) {
         conn_slot_t *conn = find_conn(fd);
+        if (!conn) conn = try_discover_conn(fd);
         if (conn && conn->direction == CONN_DIR_OUTBOUND) {
             size_t new_len;
             injected = try_inject_traceparent(buf, (size_t)num, &new_len);
@@ -961,6 +1255,7 @@ int SSL_read(void *ssl, void *buf, int num) {
         errno = ENOSYS;
         return -1;
     }
+    if (!olly_active()) goto passthrough;
 
     HOOK_GUARD_ENTER();
 
@@ -970,6 +1265,8 @@ int SSL_read(void *ssl, void *buf, int num) {
         if (orig_ssl_get_fd) {
             fd = orig_ssl_get_fd(ssl);
         }
+        if (fd >= 0 && !find_conn(fd))
+            try_discover_conn(fd);
         uint32_t cap = (uint32_t)(ret < MAX_PAYLOAD ? ret : MAX_PAYLOAD);
         send_msg(MSG_SSL_IN, fd, buf, cap);
     }
@@ -993,6 +1290,21 @@ static void olly_init(void) {
 
 __attribute__((destructor))
 static void olly_fini(void) {
+    /* Unmap shared memory control file */
+    if (g_control) {
+        munmap((void *)g_control, CONTROL_FILE_SIZE);
+        g_control = NULL;
+    }
+    if (control_fd >= 0) {
+#ifdef __linux__
+        if (orig_close) orig_close(control_fd);
+        else raw_close(control_fd);
+#else
+        if (orig_close) orig_close(control_fd);
+#endif
+        control_fd = -1;
+    }
+
 #ifdef __linux__
     if (urandom_fd >= 0 && orig_close) {
         orig_close(urandom_fd);

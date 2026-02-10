@@ -22,10 +22,17 @@ GOOS=linux GOARCH=amd64 go build \
 
 echo "Binary: $BUILD_DIR/olly"
 
+# Cross-compile Go order-service
+echo "Building order-service..."
+cd "$PROJECT_DIR/deploy/demo-app/order-service"
+GOOS=linux GOARCH=amd64 go build -o "$BUILD_DIR/order-service" .
+echo "Binary: $BUILD_DIR/order-service"
+
 # Package tarball
 cd "$BUILD_DIR"
 mkdir -p olly-deploy/configs
 cp olly olly-deploy/
+cp order-service olly-deploy/
 cp "$SCRIPT_DIR/configs/"*.yaml olly-deploy/configs/
 cp "$SCRIPT_DIR/otel-collector.yaml" olly-deploy/
 cp -r "$SCRIPT_DIR/demo-app" olly-deploy/
