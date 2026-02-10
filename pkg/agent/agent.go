@@ -17,6 +17,7 @@ import (
 	"github.com/mbeema/olly/pkg/logs"
 	"github.com/mbeema/olly/pkg/metrics"
 	rmetrics "github.com/mbeema/olly/pkg/metrics"
+	"github.com/mbeema/olly/pkg/profiling"
 	"github.com/mbeema/olly/pkg/protocol"
 	"github.com/mbeema/olly/pkg/reassembly"
 	"github.com/mbeema/olly/pkg/servicemap"
@@ -44,6 +45,7 @@ type Agent struct {
 	exporter       *export.Manager
 	discoverer     *discovery.Discoverer
 	serviceMap     *servicemap.Generator
+	profiler       profiling.Profiler
 
 	// Decoupled channels (C9 fix) - prevent callback deadlocks
 	pairCh chan *reassembly.RequestPair
@@ -99,7 +101,7 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 		serviceName = "olly-agent"
 	}
 
-	exporter, err := export.NewManager(&cfg.Exporters, serviceName, logger)
+	exporter, err := export.NewManager(&cfg.Exporters, serviceName, logger, &cfg.Profiling.Pyroscope)
 	if err != nil {
 		return nil, fmt.Errorf("create exporter: %w", err)
 	}
@@ -119,6 +121,15 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 	// Initialize discovery
 	if cfg.Discovery.Enabled {
 		a.discoverer = discovery.NewDiscoverer(cfg.Discovery.EnvVars, cfg.Discovery.PortMappings, logger)
+	}
+
+	// Initialize profiler
+	if cfg.Profiling.Enabled {
+		a.profiler = profiling.New(&profiling.Config{
+			SampleRate: cfg.Profiling.SampleRate,
+			Interval:   cfg.Profiling.Interval,
+			Logger:     logger,
+		})
 	}
 
 	// Initialize service map
@@ -307,6 +318,21 @@ func (a *Agent) Start(ctx context.Context) error {
 	if a.correlation != nil {
 		if err := a.correlation.Start(ctx); err != nil {
 			a.logger.Warn("correlation engine start error", zap.Error(err))
+		}
+	}
+
+	// Start profiler
+	if a.profiler != nil {
+		if a.discoverer != nil {
+			a.profiler.SetServiceResolver(func(pid uint32) string {
+				return a.discoverer.GetServiceName(pid)
+			})
+		}
+		a.profiler.OnProfile(func(p *profiling.Profile) {
+			a.exporter.ExportProfile(p)
+		})
+		if err := a.profiler.Start(ctx); err != nil {
+			a.logger.Warn("profiler start error", zap.Error(err))
 		}
 	}
 
@@ -552,6 +578,10 @@ func (a *Agent) Stop() error {
 		a.metricsColl.Stop()
 	}
 
+	if a.profiler != nil {
+		a.profiler.Stop()
+	}
+
 	if a.correlation != nil {
 		a.correlation.Stop()
 	}
@@ -564,11 +594,12 @@ func (a *Agent) Stop() error {
 	}
 
 	// Log final stats
-	spans, logCount, metricCount := a.exporter.Stats()
+	spans, logCount, metricCount, profileCount := a.exporter.Stats()
 	a.logger.Info("agent stopped",
 		zap.Int64("total_spans", spans),
 		zap.Int64("total_logs", logCount),
 		zap.Int64("total_metrics", metricCount),
+		zap.Int64("total_profiles", profileCount),
 		zap.Int("active_connections", a.connTracker.Count()),
 	)
 
@@ -597,6 +628,13 @@ func (a *Agent) Reload(cfg *config.Config) error {
 		a.startMetrics()
 	} else if oldCfg.Metrics.Enabled && !cfg.Metrics.Enabled {
 		a.stopMetrics()
+	}
+
+	// Profiling: start/stop profiler
+	if !oldCfg.Profiling.Enabled && cfg.Profiling.Enabled {
+		a.startProfiling()
+	} else if oldCfg.Profiling.Enabled && !cfg.Profiling.Enabled {
+		a.stopProfiling()
 	}
 
 	a.logger.Info("configuration reloaded",
@@ -677,6 +715,39 @@ func (a *Agent) stopMetrics() {
 	a.metricsColl = nil
 	a.requestMetrics = nil
 	a.logger.Info("metrics collector stopped via reload")
+}
+
+func (a *Agent) startProfiling() {
+	if a.profiler != nil {
+		return // already running
+	}
+	cfg := a.cfg.Load()
+	a.profiler = profiling.New(&profiling.Config{
+		SampleRate: cfg.Profiling.SampleRate,
+		Interval:   cfg.Profiling.Interval,
+		Logger:     a.logger,
+	})
+	if a.discoverer != nil {
+		a.profiler.SetServiceResolver(func(pid uint32) string {
+			return a.discoverer.GetServiceName(pid)
+		})
+	}
+	a.profiler.OnProfile(func(p *profiling.Profile) {
+		a.exporter.ExportProfile(p)
+	})
+	if err := a.profiler.Start(a.ctx); err != nil {
+		a.logger.Warn("profiler start error on reload", zap.Error(err))
+	}
+	a.logger.Info("profiler started via reload")
+}
+
+func (a *Agent) stopProfiling() {
+	if a.profiler == nil {
+		return
+	}
+	a.profiler.Stop()
+	a.profiler = nil
+	a.logger.Info("profiler stopped via reload")
 }
 
 func (a *Agent) cleanupLoop(ctx context.Context) {
