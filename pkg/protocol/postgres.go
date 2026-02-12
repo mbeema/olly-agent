@@ -6,7 +6,6 @@ package protocol
 
 import (
 	"encoding/binary"
-	"fmt"
 	"strings"
 	"sync"
 )
@@ -96,16 +95,8 @@ func (p *PostgresParser) Parse(request, response []byte) (*SpanAttributes, error
 		p.parseResponse(response, attrs)
 	}
 
-	// Build span name
-	if attrs.DBStatement != "" {
-		stmt := attrs.DBStatement
-		if len(stmt) > 50 {
-			stmt = stmt[:50] + "..."
-		}
-		attrs.Name = fmt.Sprintf("PG %s", stmt)
-	} else {
-		attrs.Name = fmt.Sprintf("PG %s", attrs.DBOperation)
-	}
+	// Build span name (OTEL: low-cardinality, use operation name)
+	attrs.Name = attrs.DBOperation
 
 	return attrs, nil
 }
@@ -144,6 +135,9 @@ func (p *PostgresParser) parseExtendedQuery(data []byte, attrs *SpanAttributes) 
 		case pgParse:
 			// Parse: name(cstring) + query(cstring) + numparams(int16) + param types
 			stmtName := extractCString(payload)
+			if len(stmtName)+1 > len(payload) {
+				break // C3 fix: truncated message, no null terminator
+			}
 			remaining := payload[len(stmtName)+1:]
 			query := extractCString(remaining)
 
@@ -162,6 +156,9 @@ func (p *PostgresParser) parseExtendedQuery(data []byte, attrs *SpanAttributes) 
 		case pgBind:
 			// Bind: portal(cstring) + statement(cstring) + ...
 			portalName := extractCString(payload)
+			if len(portalName)+1 > len(payload) {
+				break // C3 fix: truncated message
+			}
 			remaining := payload[len(portalName)+1:]
 			stmtName := extractCString(remaining)
 

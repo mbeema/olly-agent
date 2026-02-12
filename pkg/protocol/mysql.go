@@ -151,16 +151,8 @@ func (p *MySQLParser) Parse(request, response []byte) (*SpanAttributes, error) {
 		}
 	}
 
-	// Build span name
-	if attrs.DBStatement != "" {
-		stmt := attrs.DBStatement
-		if len(stmt) > 50 {
-			stmt = stmt[:50] + "..."
-		}
-		attrs.Name = fmt.Sprintf("MySQL %s", stmt)
-	} else {
-		attrs.Name = fmt.Sprintf("MySQL %s", attrs.DBOperation)
-	}
+	// Build span name (OTEL: low-cardinality, use operation name)
+	attrs.Name = attrs.DBOperation
 
 	return attrs, nil
 }

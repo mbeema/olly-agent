@@ -59,7 +59,7 @@ func (e *StdoutExporter) ExportSpans(ctx context.Context, spans []*traces.Span) 
 			}
 			fmt.Fprintf(os.Stdout,
 				"[SPAN] trace=%s span=%s name=%-40s %s %6dms %s:%d pid=%d %s\n",
-				s.TraceID[:16], s.SpanID[:8], s.Name,
+				s.TraceID[:min(len(s.TraceID), 16)], s.SpanID[:min(len(s.SpanID), 8)], s.Name,
 				status, s.Duration.Milliseconds(),
 				s.RemoteAddr, s.RemotePort, s.PID,
 				formatAttrs(s.Attributes),

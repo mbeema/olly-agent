@@ -28,6 +28,7 @@ type SpanAttributes struct {
 	// HTTP
 	HTTPMethod     string
 	HTTPPath       string
+	HTTPQuery      string // query string without '?' prefix
 	HTTPStatusCode int
 	HTTPHost       string
 	HTTPUserAgent  string

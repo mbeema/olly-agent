@@ -261,7 +261,7 @@ func (e *OTLPExporter) convertSpan(s *traces.Span) (*tracepb.Span, error) {
 		}
 	}
 
-	// Status
+	// Status (S1 fix: StatusUnset maps to UNSET, not OK)
 	ps.Status = &tracepb.Status{}
 	switch s.Status {
 	case traces.StatusOK:
@@ -269,6 +269,8 @@ func (e *OTLPExporter) convertSpan(s *traces.Span) (*tracepb.Span, error) {
 	case traces.StatusError:
 		ps.Status.Code = tracepb.Status_STATUS_CODE_ERROR
 		ps.Status.Message = s.StatusMsg
+	default:
+		ps.Status.Code = tracepb.Status_STATUS_CODE_UNSET
 	}
 
 	// Attributes

@@ -61,12 +61,10 @@ func (p *HTTPParser) Parse(request, response []byte) (*SpanAttributes, error) {
 		if err == nil {
 			attrs.HTTPMethod = req.Method
 			attrs.HTTPPath = req.URL.Path
-			if req.URL.RawQuery != "" {
-				attrs.HTTPPath += "?" + req.URL.RawQuery
-			}
+			attrs.HTTPQuery = req.URL.RawQuery
 			attrs.HTTPHost = req.Host
 			attrs.HTTPUserAgent = req.UserAgent()
-			attrs.ContentLength = req.ContentLength
+			attrs.ContentLength = req.ContentLength // H8 fix: request content length
 			req.Body.Close()
 		} else {
 			// Fallback: parse first line manually
@@ -86,7 +84,7 @@ func (p *HTTPParser) Parse(request, response []byte) (*SpanAttributes, error) {
 		resp, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(response)), nil)
 		if err == nil {
 			attrs.HTTPStatusCode = resp.StatusCode
-			attrs.ContentLength = resp.ContentLength
+			// H8 fix: don't overwrite request ContentLength with response
 			resp.Body.Close()
 		} else {
 			// Fallback: parse status line
@@ -101,8 +99,12 @@ func (p *HTTPParser) Parse(request, response []byte) (*SpanAttributes, error) {
 		}
 	}
 
-	// Build span name
-	attrs.Name = fmt.Sprintf("%s %s", attrs.HTTPMethod, attrs.HTTPPath)
+	// Build span name (OTEL: low-cardinality, use method only when route unknown)
+	if attrs.HTTPMethod != "" {
+		attrs.Name = attrs.HTTPMethod
+	} else {
+		attrs.Name = "HTTP"
+	}
 	if attrs.HTTPStatusCode >= 400 {
 		attrs.Error = true
 		attrs.ErrorMsg = fmt.Sprintf("HTTP %d", attrs.HTTPStatusCode)

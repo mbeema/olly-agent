@@ -48,17 +48,13 @@ func TestStitcherMatchesClientToServer(t *testing.T) {
 		ServiceName: "service-b",
 	}
 
-	// Process CLIENT first, then SERVER
+	// Process CLIENT first (stored as clone), then SERVER (arrives, matches)
 	s.ProcessSpan(clientSpan)
 	s.ProcessSpan(serverSpan)
 
-	// CLIENT should adopt SERVER's traceID (preserving SERVER's intra-process children)
-	if clientSpan.TraceID != serverSpan.TraceID {
-		t.Errorf("expected CLIENT traceID=%s (SERVER's), got %s", serverSpan.TraceID, clientSpan.TraceID)
-	}
-	// SERVER should have CLIENT as parent
-	if serverSpan.ParentSpanID != clientSpan.SpanID {
-		t.Errorf("expected SERVER parentSpanID=%s, got %s", clientSpan.SpanID, serverSpan.ParentSpanID)
+	// SERVER (arriving span) should have CLIENT as parent and stitched attributes
+	if serverSpan.ParentSpanID != "bbbb0000bbbb0000" {
+		t.Errorf("expected SERVER parentSpanID=bbbb0000bbbb0000, got %s", serverSpan.ParentSpanID)
 	}
 	if serverSpan.Attributes["olly.stitched"] != "true" {
 		t.Error("expected olly.stitched=true attribute on SERVER")
@@ -66,8 +62,16 @@ func TestStitcherMatchesClientToServer(t *testing.T) {
 	if serverSpan.Attributes["olly.stitched.client_service"] != "service-a" {
 		t.Errorf("expected client_service=service-a, got %s", serverSpan.Attributes["olly.stitched.client_service"])
 	}
+
+	// H1 fix: The stitched callback receives the CLIENT clone with updated traceID
 	if stitched == nil {
-		t.Error("expected stitched callback to be called")
+		t.Fatal("expected stitched callback to be called")
+	}
+	if stitched.TraceID != "cccc0000cccc0000cccc0000cccc0000" {
+		t.Errorf("expected stitched CLIENT clone traceID=cccc0000cccc0000cccc0000cccc0000, got %s", stitched.TraceID)
+	}
+	if stitched.SpanID != "bbbb0000bbbb0000" {
+		t.Errorf("expected stitched CLIENT clone spanID=bbbb0000bbbb0000, got %s", stitched.SpanID)
 	}
 }
 
@@ -128,12 +132,13 @@ func TestStitcherSkipsAlreadyParented(t *testing.T) {
 	s.ProcessSpan(serverSpan2)
 
 	// Should be stitched: parent was from thread context, not traceparent
+	// SERVER (arriving span) gets stitched attributes
 	if serverSpan2.Attributes["olly.stitched"] != "true" {
 		t.Error("should stitch spans whose parent came from thread context (no traceparent)")
 	}
-	// CLIENT should adopt SERVER's traceID
-	if clientSpan2.TraceID != serverSpan2.TraceID {
-		t.Errorf("expected CLIENT2 traceID=%s (SERVER2's), got %s", serverSpan2.TraceID, clientSpan2.TraceID)
+	// SERVER (arriving) gets CLIENT's spanID as parent
+	if serverSpan2.ParentSpanID != "1111000011110000" {
+		t.Errorf("expected SERVER2 parentSpanID=1111000011110000, got %s", serverSpan2.ParentSpanID)
 	}
 }
 
@@ -175,21 +180,26 @@ func TestStitcherServerBeforeClient(t *testing.T) {
 		ServiceName: "service-a",
 	}
 
-	s.ProcessSpan(serverSpan) // SERVER first
-	s.ProcessSpan(clientSpan) // CLIENT second — should match stored SERVER
+	s.ProcessSpan(serverSpan) // SERVER first (stored as clone)
+	s.ProcessSpan(clientSpan) // CLIENT second — should match stored SERVER clone
 
-	// CLIENT should adopt SERVER's traceID
-	if clientSpan.TraceID != serverSpan.TraceID {
-		t.Errorf("expected CLIENT traceID=%s (SERVER's), got %s", serverSpan.TraceID, clientSpan.TraceID)
+	// CLIENT (arriving span) should adopt SERVER's traceID
+	if clientSpan.TraceID != "cccc0000cccc0000cccc0000cccc0000" {
+		t.Errorf("expected CLIENT traceID=cccc0000cccc0000cccc0000cccc0000, got %s", clientSpan.TraceID)
 	}
-	if serverSpan.ParentSpanID != clientSpan.SpanID {
-		t.Errorf("expected SERVER parentSpanID=%s, got %s", clientSpan.SpanID, serverSpan.ParentSpanID)
+	if clientSpan.Attributes["olly.stitched"] != "true" {
+		t.Error("expected olly.stitched=true on CLIENT span")
 	}
-	if serverSpan.Attributes["olly.stitched"] != "true" {
-		t.Error("expected olly.stitched=true on SERVER span")
-	}
+
+	// H1 fix: The stitched callback receives the SERVER clone with updated parentSpanID
 	if stitched == nil {
-		t.Error("expected stitched callback to be called")
+		t.Fatal("expected stitched callback to be called")
+	}
+	if stitched.ParentSpanID != clientSpan.SpanID {
+		t.Errorf("expected stitched SERVER clone parentSpanID=%s, got %s", clientSpan.SpanID, stitched.ParentSpanID)
+	}
+	if stitched.Attributes["olly.stitched"] != "true" {
+		t.Error("expected olly.stitched=true on stitched SERVER clone")
 	}
 }
 

@@ -74,22 +74,11 @@ func (p *RedisParser) Parse(request, response []byte) (*SpanAttributes, error) {
 		}
 	}
 
-	// Build span name
+	// Build span name (OTEL: low-cardinality, use command only)
 	if attrs.RedisCommand != "" {
-		name := attrs.RedisCommand
-		if attrs.RedisArgs != "" {
-			argParts := strings.Fields(attrs.RedisArgs)
-			if len(argParts) > 0 {
-				key := argParts[0]
-				if len(key) > 30 {
-					key = key[:30] + "..."
-				}
-				name += " " + key
-			}
-		}
-		attrs.Name = name
+		attrs.Name = attrs.RedisCommand
 	} else {
-		attrs.Name = "Redis"
+		attrs.Name = "REDIS"
 	}
 
 	return attrs, nil

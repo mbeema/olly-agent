@@ -70,8 +70,11 @@ func NewStitcher(window time.Duration, logger *zap.Logger) *Stitcher {
 
 // OnStitchedSpan registers a callback for spans that have been stitched
 // (had their parent set from a matching CLIENT span).
+// C4 fix: protected by s.mu for thread safety.
 func (s *Stitcher) OnStitchedSpan(fn func(*Span)) {
+	s.mu.Lock()
 	s.callbacks = append(s.callbacks, fn)
+	s.mu.Unlock()
 }
 
 // ProcessSpan examines a completed span for stitching opportunities.
@@ -165,11 +168,12 @@ func (s *Stitcher) processClientSpan(span *Span) {
 		return
 	}
 
-	// No SERVER match found — store CLIENT for future matching (with cap)
+	// No SERVER match found — store a clone for future matching (with cap).
+	// H1 fix: clone prevents mutation of the original span in the export pipeline.
 	if s.pendingCount() < maxPendingSpans {
 		key := fmt.Sprintf("%s:%d", span.RemoteAddr, span.RemotePort)
 		ps := &pendingSpan{
-			span:      span,
+			span:      cloneSpan(span),
 			method:    method,
 			path:      path,
 			createdAt: time.Now(),
@@ -228,6 +232,7 @@ func (s *Stitcher) processServerSpan(span *Span) {
 		// Stitch: CLIENT adopts SERVER's traceID (preserving the SERVER's
 		// intra-process children which share that traceID), and SERVER
 		// gets CLIENT as parent for the cross-service hierarchy.
+		// H1 fix: bestMatch.span is already a clone (safe to mutate).
 		bestMatch.span.TraceID = span.TraceID
 		span.ParentSpanID = bestMatch.span.SpanID
 
@@ -250,23 +255,40 @@ func (s *Stitcher) processServerSpan(span *Span) {
 			delete(s.pendingClients, bestKey)
 		}
 
+		// Re-export the CLIENT clone with updated traceID
 		for _, cb := range s.callbacks {
-			cb(span)
+			cb(bestMatch.span)
 		}
 		return
 	}
 
-	// No CLIENT match found — store SERVER for future matching (with cap)
+	// No CLIENT match found — store a clone for future matching (with cap).
+	// H1 fix: clone prevents mutation of the original span in the export pipeline.
 	if s.pendingCount() < maxPendingSpans {
 		key := fmt.Sprintf("server:%s:%s", serverMethod, serverPath)
 		ps := &pendingSpan{
-			span:      span,
+			span:      cloneSpan(span),
 			method:    serverMethod,
 			path:      serverPath,
 			createdAt: time.Now(),
 		}
 		s.pendingServers[key] = append(s.pendingServers[key], ps)
 	}
+}
+
+// cloneSpan creates a shallow copy of a span with a new Attributes map.
+// H1 fix: prevents mutation of spans that may already be in the export pipeline.
+func cloneSpan(s *Span) *Span {
+	clone := *s
+	clone.Attributes = make(map[string]string, len(s.Attributes))
+	for k, v := range s.Attributes {
+		clone.Attributes[k] = v
+	}
+	if len(s.Events) > 0 {
+		clone.Events = make([]SpanEvent, len(s.Events))
+		copy(clone.Events, s.Events)
+	}
+	return &clone
 }
 
 // pendingCount returns the total pending spans (must be called under s.mu).

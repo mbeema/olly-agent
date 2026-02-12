@@ -6,9 +6,11 @@ package reassembly
 
 import (
 	"bytes"
+	"encoding/binary"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -52,8 +54,8 @@ type streamState struct {
 	detected   bool
 	reqFramer  *httpFramer // framing state for request direction
 	respFramer *httpFramer // framing state for response direction
-	lastTID    uint32
-	direction  int // 0=outbound, 1=inbound; set by caller
+	lastTID    atomic.Uint32 // H2 fix: atomic to prevent data race
+	direction  atomic.Int32  // H2b fix: atomic to prevent data race; 0=outbound, 1=inbound
 }
 
 // Reassembler manages streams and emits request/response pairs.
@@ -106,13 +108,14 @@ func (r *Reassembler) getOrCreate(pid uint32, fd int32, remoteAddr string, remot
 }
 
 // SetDirection sets the connection direction for a stream (0=outbound, 1=inbound).
+// H2b fix: uses atomic store for thread safety.
 func (r *Reassembler) SetDirection(pid uint32, fd int32, direction int) {
 	key := streamKey{PID: pid, FD: fd}
 	r.mu.RLock()
 	ss, ok := r.streams[key]
 	r.mu.RUnlock()
 	if ok {
-		ss.direction = direction
+		ss.direction.Store(int32(direction))
 	}
 }
 
@@ -121,7 +124,7 @@ func (r *Reassembler) AppendSend(pid, tid uint32, fd int32, data []byte, remoteA
 	ss := r.getOrCreate(pid, fd, remoteAddr, remotePort)
 	ss.stream.IsSSL = ss.stream.IsSSL || isSSL
 	ss.stream.AppendSend(data)
-	ss.lastTID = tid
+	ss.lastTID.Store(tid) // H2 fix: atomic store
 
 	r.tryExtractPairs(ss)
 }
@@ -131,50 +134,52 @@ func (r *Reassembler) AppendRecv(pid, tid uint32, fd int32, data []byte, remoteA
 	ss := r.getOrCreate(pid, fd, remoteAddr, remotePort)
 	ss.stream.IsSSL = ss.stream.IsSSL || isSSL
 	ss.stream.AppendRecv(data)
-	ss.lastTID = tid
+	ss.lastTID.Store(tid) // H2 fix: atomic store
 
 	r.tryExtractPairs(ss)
 }
 
 // tryExtractPairs attempts to extract complete request/response pairs.
 // Protocol-aware: uses framing to find message boundaries.
+// C1 fix: holds single lock for buffer read, frame computation, and extraction
+// to prevent TOCTOU race where concurrent goroutines could consume buffer data
+// between frame length computation and data extraction.
 func (r *Reassembler) tryExtractPairs(ss *streamState) {
 	s := ss.stream
 
 	for {
 		s.mu.Lock()
-		sendBuf := s.sendBuf
-		recvBuf := s.recvBuf
-		s.mu.Unlock()
 
-		if len(sendBuf) == 0 || len(recvBuf) == 0 {
+		if len(s.sendBuf) == 0 || len(s.recvBuf) == 0 {
+			s.mu.Unlock()
 			return
 		}
 
 		// Detect protocol on first data
 		if !ss.detected {
-			ss.protocol = detectProtocol(sendBuf, ss.stream.RemotePort)
+			ss.protocol = detectProtocol(s.sendBuf, ss.stream.RemotePort)
 			ss.detected = true
 			ss.stream.Protocol = ss.protocol
 		}
 
 		// Extract one complete request
-		reqLen := frameMessage(sendBuf, ss.protocol, true)
+		reqLen := frameMessage(s.sendBuf, ss.protocol, true)
 		if reqLen <= 0 {
+			s.mu.Unlock()
 			return // incomplete request
 		}
 
 		// Extract one complete response
-		respLen := frameMessage(recvBuf, ss.protocol, false)
+		respLen := frameMessage(s.recvBuf, ss.protocol, false)
 		if respLen <= 0 {
+			s.mu.Unlock()
 			return // incomplete response
 		}
 
 		// Build pair from exactly one request + one response
-		s.mu.Lock()
 		pair := &RequestPair{
 			PID:         s.PID,
-			TID:         ss.lastTID,
+			TID:         ss.lastTID.Load(),
 			FD:          s.FD,
 			RemoteAddr:  s.RemoteAddr,
 			RemotePort:  s.RemotePort,
@@ -184,7 +189,7 @@ func (r *Reassembler) tryExtractPairs(ss *streamState) {
 			Response:    make([]byte, respLen),
 			RequestTime: s.lastSend,
 			Duration:    s.lastRecv.Sub(s.lastSend),
-			Direction:   ss.direction,
+			Direction:   int(ss.direction.Load()),
 		}
 		copy(pair.Request, s.sendBuf[:reqLen])
 		copy(pair.Response, s.recvBuf[:respLen])
@@ -234,7 +239,7 @@ func (r *Reassembler) RemoveStream(pid uint32, fd int32, tid uint32) {
 			Response:    make([]byte, len(s.recvBuf)),
 			RequestTime: s.lastSend,
 			Duration:    s.lastRecv.Sub(s.lastSend),
-			Direction:   ss.direction,
+			Direction:   int(ss.direction.Load()),
 		}
 		copy(pair.Request, s.sendBuf)
 		copy(pair.Response, s.recvBuf)
@@ -420,6 +425,7 @@ func frameChunked(buf []byte, bodyStart int) int {
 }
 
 // framePostgres finds the boundary of one PostgreSQL wire message.
+// C5 fix: uses binary.BigEndian.Uint32 to prevent integer overflow on 32-bit.
 func framePostgres(buf []byte) int {
 	if len(buf) < 5 {
 		return 0
@@ -433,7 +439,10 @@ func framePostgres(buf []byte) int {
 		return len(buf) // consume all for startup
 	}
 
-	msgLen := int(buf[1])<<24 | int(buf[2])<<16 | int(buf[3])<<8 | int(buf[4])
+	msgLen := int(binary.BigEndian.Uint32(buf[1:5]))
+	if msgLen < 4 {
+		return len(buf) // malformed, consume all
+	}
 	totalLen := 1 + msgLen // type byte + payload (length includes itself)
 
 	if totalLen > len(buf) {
@@ -600,7 +609,7 @@ func detectProtocol(data []byte, port uint16) string {
 	// PostgreSQL: type byte + 4-byte length
 	if len(data) >= 5 {
 		if data[0] == 'Q' || data[0] == 'P' || data[0] == 'B' || data[0] == 'E' {
-			msgLen := int(data[1])<<24 | int(data[2])<<16 | int(data[3])<<8 | int(data[4])
+			msgLen := int(binary.BigEndian.Uint32(data[1:5]))
 			if msgLen > 4 && msgLen < 1<<20 {
 				return "postgres"
 			}

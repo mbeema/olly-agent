@@ -71,11 +71,11 @@ func (p *MongoDBParser) Parse(request, response []byte) (*SpanAttributes, error)
 		}
 	}
 
-	// Build span name
+	// Build span name (OTEL: low-cardinality, operation + collection)
 	if attrs.DBName != "" {
-		attrs.Name = fmt.Sprintf("MongoDB %s %s", attrs.DBOperation, attrs.DBName)
+		attrs.Name = fmt.Sprintf("%s %s", attrs.DBOperation, attrs.DBName)
 	} else {
-		attrs.Name = fmt.Sprintf("MongoDB %s", attrs.DBOperation)
+		attrs.Name = attrs.DBOperation
 	}
 
 	return attrs, nil
