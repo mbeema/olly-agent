@@ -48,15 +48,16 @@ func TestStitcherMatchesClientToServer(t *testing.T) {
 	s.ProcessSpan(clientSpan)
 	s.ProcessSpan(serverSpan)
 
-	// SERVER span should be stitched to CLIENT's trace
-	if serverSpan.TraceID != clientSpan.TraceID {
-		t.Errorf("expected SERVER traceID=%s, got %s", clientSpan.TraceID, serverSpan.TraceID)
+	// CLIENT should adopt SERVER's traceID (preserving SERVER's intra-process children)
+	if clientSpan.TraceID != serverSpan.TraceID {
+		t.Errorf("expected CLIENT traceID=%s (SERVER's), got %s", serverSpan.TraceID, clientSpan.TraceID)
 	}
+	// SERVER should have CLIENT as parent
 	if serverSpan.ParentSpanID != clientSpan.SpanID {
 		t.Errorf("expected SERVER parentSpanID=%s, got %s", clientSpan.SpanID, serverSpan.ParentSpanID)
 	}
 	if serverSpan.Attributes["olly.stitched"] != "true" {
-		t.Error("expected olly.stitched=true attribute")
+		t.Error("expected olly.stitched=true attribute on SERVER")
 	}
 	if serverSpan.Attributes["olly.stitched.client_service"] != "service-a" {
 		t.Errorf("expected client_service=service-a, got %s", serverSpan.Attributes["olly.stitched.client_service"])
@@ -80,22 +81,111 @@ func TestStitcherSkipsAlreadyParented(t *testing.T) {
 		Attributes: map[string]string{},
 	}
 
-	// SERVER span already has a parent (from traceparent injection)
+	// SERVER span already has a parent from traceparent header injection
 	serverSpan := &Span{
 		TraceID:      "aaaa0000aaaa0000aaaa0000aaaa0000",
 		SpanID:       "dddd0000dddd0000",
 		ParentSpanID: "bbbb0000bbbb0000",
 		Kind:         SpanKindServer,
 		StartTime:    clientSpan.StartTime.Add(5 * time.Millisecond),
-		Attributes:   map[string]string{},
+		Attributes:   map[string]string{"olly.trace_source": "traceparent"},
 	}
 
 	s.ProcessSpan(clientSpan)
 	s.ProcessSpan(serverSpan)
 
-	// Should NOT have been modified by stitcher (already parented)
+	// Should NOT stitch: parent came from actual traceparent header
 	if serverSpan.Attributes["olly.stitched"] == "true" {
-		t.Error("should not stitch spans that already have a parent")
+		t.Error("should not stitch spans that already have a traceparent parent")
+	}
+
+	// But a span with parent from thread context (no olly.trace_source) SHOULD be stitchable
+	serverSpan2 := &Span{
+		TraceID:      "cccc0000cccc0000cccc0000cccc0000",
+		SpanID:       "eeee0000eeee0000",
+		ParentSpanID: "ffff0000ffff0000",
+		Kind:         SpanKindServer,
+		StartTime:    clientSpan.StartTime.Add(5 * time.Millisecond),
+		Attributes:   map[string]string{},
+	}
+
+	// Need a new client span since the first was consumed
+	clientSpan2 := &Span{
+		TraceID:     "aaaa0000aaaa0000aaaa0000aaaa0000",
+		SpanID:      "1111000011110000",
+		Kind:        SpanKindClient,
+		StartTime:   time.Now(),
+		RemoteAddr:  "10.0.0.2",
+		RemotePort:  3001,
+		Attributes:  map[string]string{},
+		ServiceName: "service-a",
+	}
+	s.ProcessSpan(clientSpan2)
+	s.ProcessSpan(serverSpan2)
+
+	// Should be stitched: parent was from thread context, not traceparent
+	if serverSpan2.Attributes["olly.stitched"] != "true" {
+		t.Error("should stitch spans whose parent came from thread context (no traceparent)")
+	}
+	// CLIENT should adopt SERVER's traceID
+	if clientSpan2.TraceID != serverSpan2.TraceID {
+		t.Errorf("expected CLIENT2 traceID=%s (SERVER2's), got %s", serverSpan2.TraceID, clientSpan2.TraceID)
+	}
+}
+
+func TestStitcherServerBeforeClient(t *testing.T) {
+	logger := zap.NewNop()
+	s := NewStitcher(500*time.Millisecond, logger)
+
+	var stitched *Span
+	s.OnStitchedSpan(func(span *Span) {
+		stitched = span
+	})
+
+	now := time.Now()
+	// SERVER span arrives FIRST (common when Flask responds before curl pair completes)
+	serverSpan := &Span{
+		TraceID:   "cccc0000cccc0000cccc0000cccc0000",
+		SpanID:    "dddd0000dddd0000",
+		Kind:      SpanKindServer,
+		StartTime: now.Add(2 * time.Millisecond),
+		Attributes: map[string]string{
+			"http.request.method": "POST",
+			"url.path":            "/orders",
+		},
+		ServiceName: "service-b",
+	}
+
+	// CLIENT span arrives SECOND
+	clientSpan := &Span{
+		TraceID:    "aaaa0000aaaa0000aaaa0000aaaa0000",
+		SpanID:     "bbbb0000bbbb0000",
+		Kind:       SpanKindClient,
+		StartTime:  now,
+		RemoteAddr: "10.0.0.2",
+		RemotePort: 3001,
+		Attributes: map[string]string{
+			"http.request.method": "POST",
+			"url.path":            "/orders",
+		},
+		ServiceName: "service-a",
+	}
+
+	s.ProcessSpan(serverSpan) // SERVER first
+	s.ProcessSpan(clientSpan) // CLIENT second — should match stored SERVER
+
+	// CLIENT should adopt SERVER's traceID
+	if clientSpan.TraceID != serverSpan.TraceID {
+		t.Errorf("expected CLIENT traceID=%s (SERVER's), got %s", serverSpan.TraceID, clientSpan.TraceID)
+	}
+	if serverSpan.ParentSpanID != clientSpan.SpanID {
+		t.Errorf("expected SERVER parentSpanID=%s, got %s", clientSpan.SpanID, serverSpan.ParentSpanID)
+	}
+	if serverSpan.Attributes["olly.stitched"] != "true" {
+		t.Error("expected olly.stitched=true on SERVER span")
+	}
+	if stitched == nil {
+		t.Error("expected stitched callback to be called")
 	}
 }
 

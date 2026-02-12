@@ -87,7 +87,8 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 		Attributes:  make(map[string]string),
 	}
 
-	// Try to extract trace context from HTTP headers (R1.2: include tracestate)
+	// Try to extract trace context from HTTP headers (R1.2: include tracestate).
+	// This covers: (a) traceparent injected by upstream sk_msg, (b) app-level headers.
 	if proto == protocol.ProtoHTTP || proto == protocol.ProtoGRPC {
 		traceCtx := protocol.ExtractTraceContext(pair.Request)
 		if traceCtx.TraceID != "" {
@@ -95,6 +96,7 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 			span.ParentSpanID = traceCtx.SpanID
 			span.SpanID = GenerateSpanID()
 			span.TraceState = traceCtx.TraceState
+			span.SetAttribute("olly.trace_source", "traceparent")
 		}
 	}
 
@@ -114,11 +116,9 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 			}
 			span.ParentSpanID = pair.ParentSpanID
 		} else {
-			// SERVER span: use ParentSpanID as this span's own ID so
-			// CLIENT child spans can reference it as their parent.
-			if span.TraceID == "" {
-				span.TraceID = pair.ParentTraceID
-			}
+			// SERVER span: always use the thread context trace ID and
+			// set SpanID so child CLIENT spans can reference it as parent.
+			span.TraceID = pair.ParentTraceID
 			span.SpanID = pair.ParentSpanID
 		}
 	}

@@ -128,25 +128,31 @@ func (e *OTLPExporter) reconnect() error {
 	return nil
 }
 
-// R4.1 fix: Include all required/recommended OTEL resource attributes.
+// resource returns the default OTEL resource for non-span signals (logs, metrics).
 func (e *OTLPExporter) resource() *resourcepb.Resource {
+	return e.resourceForService(e.serviceName, uint32(os.Getpid()))
+}
+
+// resourceForService returns OTEL resource attributes for a specific service.
+// Each observed service gets its own ResourceSpans with accurate service.name
+// and process attributes.
+func (e *OTLPExporter) resourceForService(serviceName string, pid uint32) *resourcepb.Resource {
 	hostname, _ := os.Hostname()
-	execPath, _ := os.Executable()
-	execName := filepath.Base(execPath)
+
+	if serviceName == "" {
+		serviceName = e.serviceName
+	}
 
 	attrs := []*commonpb.KeyValue{
-		strAttr("service.name", e.serviceName),
-		strAttr("service.instance.id", fmt.Sprintf("%s-%d", hostname, os.Getpid())),
+		strAttr("service.name", serviceName),
+		strAttr("service.instance.id", fmt.Sprintf("%s-%d", hostname, pid)),
 		strAttr("telemetry.sdk.name", "olly"),
 		strAttr("telemetry.sdk.language", "go"),
 		strAttr("telemetry.sdk.version", "0.1.0"),
 		strAttr("host.name", hostname),
 		strAttr("host.arch", runtime.GOARCH),
-		strAttr("os.type", runtime.GOOS),
-		intAttr("process.pid", int64(os.Getpid())),
-		strAttr("process.executable.name", execName),
-		strAttr("process.runtime.name", "go"),
-		strAttr("process.runtime.version", runtime.Version()),
+		strAttr("process.executable.name", serviceName),
+		intAttr("process.pid", int64(pid)),
 	}
 
 	return &resourcepb.Resource{Attributes: attrs}
@@ -166,7 +172,8 @@ func intAttr(key string, value int64) *commonpb.KeyValue {
 	}
 }
 
-// ExportSpans sends spans via OTLP gRPC.
+// ExportSpans sends spans via OTLP gRPC, grouping by service name so each
+// service gets its own ResourceSpans with accurate resource attributes.
 func (e *OTLPExporter) ExportSpans(ctx context.Context, spans []*traces.Span) error {
 	if len(spans) == 0 {
 		return nil
@@ -176,31 +183,42 @@ func (e *OTLPExporter) ExportSpans(ctx context.Context, spans []*traces.Span) er
 		return fmt.Errorf("connection not ready: %w", err)
 	}
 
-	protoSpans := make([]*tracepb.Span, 0, len(spans))
+	// Group spans by service name for per-service ResourceSpans.
+	type svcKey struct {
+		name string
+		pid  uint32
+	}
+	grouped := make(map[svcKey][]*tracepb.Span)
 	for _, s := range spans {
 		ps, err := e.convertSpan(s)
 		if err != nil {
 			e.logger.Debug("skip span conversion", zap.Error(err))
 			continue
 		}
-		protoSpans = append(protoSpans, ps)
+		key := svcKey{name: s.ServiceName, pid: s.PID}
+		grouped[key] = append(grouped[key], ps)
+	}
+
+	scope := &commonpb.InstrumentationScope{
+		Name:    "olly",
+		Version: "0.1.0",
+	}
+
+	resourceSpans := make([]*tracepb.ResourceSpans, 0, len(grouped))
+	for key, protoSpans := range grouped {
+		resourceSpans = append(resourceSpans, &tracepb.ResourceSpans{
+			Resource: e.resourceForService(key.name, key.pid),
+			ScopeSpans: []*tracepb.ScopeSpans{
+				{
+					Scope: scope,
+					Spans: protoSpans,
+				},
+			},
+		})
 	}
 
 	req := &coltracepb.ExportTraceServiceRequest{
-		ResourceSpans: []*tracepb.ResourceSpans{
-			{
-				Resource: e.resource(),
-				ScopeSpans: []*tracepb.ScopeSpans{
-					{
-						Scope: &commonpb.InstrumentationScope{
-							Name:    "olly",
-							Version: "0.1.0",
-						},
-						Spans: protoSpans,
-					},
-				},
-			},
-		},
+		ResourceSpans: resourceSpans,
 	}
 
 	e.mu.RLock()

@@ -300,7 +300,11 @@ func (a *Agent) Start(ctx context.Context) error {
 				// When the request arrives, generate/extract trace context so
 				// outbound CLIENT spans (e.g., DB queries) can inherit it.
 				ctxKey := uint64(pid)<<32 | uint64(tid)
-				if _, loaded := a.threadCtx.Load(ctxKey); !loaded {
+				// Always create fresh context for each inbound request.
+				// Previous context is NOT deleted in enrichPairContext (to allow
+				// CLIENT spans to inherit it), so we must overwrite here when
+				// the next request arrives on the same thread.
+				{
 					tctx := &threadTraceCtx{Created: time.Now()}
 
 					// Priority 1: Extract traceparent from HTTP headers in the data.
@@ -376,6 +380,12 @@ func (a *Agent) Start(ctx context.Context) error {
 	// C9 fix: Reassembler sends pairs to channel instead of calling callbacks directly.
 	// This ensures the reassembler's stream lock is released before trace processing begins.
 	a.reassembler.OnPair(func(pair *reassembly.RequestPair) {
+		// Enrich context HERE (in ring buffer reader goroutine) to avoid race:
+		// OnDataIn creates threadCtx in this same goroutine, so the context
+		// is guaranteed to still be for this request. If we waited until
+		// pairDispatchLoop (separate goroutine), a new inbound request could
+		// overwrite the context before the pair is processed.
+		a.enrichPairContext(pair)
 		select {
 		case a.pairCh <- pair:
 		default:
@@ -571,7 +581,8 @@ func (a *Agent) pairDispatchLoop(ctx context.Context) {
 	for {
 		select {
 		case pair := <-a.pairCh:
-			a.enrichPairContext(pair)
+			// enrichPairContext already called in OnPair callback (same goroutine
+			// as OnDataIn, avoiding race with thread context overwrites).
 			connInfo := a.connTracker.Lookup(pair.PID, pair.FD)
 			a.traceProc.ProcessPair(pair, connInfo)
 		case <-ctx.Done():
@@ -579,7 +590,6 @@ func (a *Agent) pairDispatchLoop(ctx context.Context) {
 			for {
 				select {
 				case pair := <-a.pairCh:
-					a.enrichPairContext(pair)
 					connInfo := a.connTracker.Lookup(pair.PID, pair.FD)
 					a.traceProc.ProcessPair(pair, connInfo)
 				default:
@@ -597,7 +607,24 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 	ctxKey := uint64(pair.PID)<<32 | uint64(pair.TID)
 	val, ok := a.threadCtx.Load(ctxKey)
 	if !ok {
-		return
+		// Fallback: search by PID only. Go goroutines execute on different
+		// OS threads, so the PG query may run on a different TID than the
+		// inbound HTTP handler. Find the most recent context for this PID.
+		var bestCtx *threadTraceCtx
+		a.threadCtx.Range(func(key, value any) bool {
+			k := key.(uint64)
+			if uint32(k>>32) == pair.PID {
+				tctx := value.(*threadTraceCtx)
+				if bestCtx == nil || tctx.Created.After(bestCtx.Created) {
+					bestCtx = tctx
+				}
+			}
+			return true
+		})
+		if bestCtx == nil {
+			return
+		}
+		val = bestCtx
 	}
 	tctx := val.(*threadTraceCtx)
 	// Only apply if context is recent (within 30s)
@@ -612,11 +639,15 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 	pair.ParentTraceID = tctx.TraceID
 	pair.ParentSpanID = tctx.ServerSpanID // SERVER span's own ID
 
-	// For inbound connections, the SERVER span consumes the context
+	// For inbound connections, the SERVER span uses the context but does NOT
+	// delete it. Subsequent outbound CLIENT spans on the same thread need to
+	// inherit the trace ID to maintain end-to-end trace continuity.
+	// Context is cleaned up when the next inbound request arrives (line 303
+	// only stores if !loaded) or by the 30s TTL above.
 	connInfo := a.connTracker.Lookup(pair.PID, pair.FD)
 	if connInfo != nil && connInfo.Direction == conntrack.ConnInbound {
-		a.threadCtx.Delete(ctxKey)
-		// Clear BPF trace context since the request is done
+		// Don't delete context — CLIENT spans on this thread still need it.
+		// Clear BPF trace context since sk_msg injection already happened.
 		if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
 			injector.ClearTraceContext(pair.PID, pair.TID)
 		}
