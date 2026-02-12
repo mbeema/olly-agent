@@ -313,12 +313,12 @@ func frameHTTP(buf []byte, isRequest bool) int {
 	cl := extractHeaderValue(headers, "content-length")
 	if cl != "" {
 		contentLen, err := strconv.Atoi(strings.TrimSpace(cl))
-		if err != nil || contentLen < 0 {
-			return headerEnd // malformed, treat as headers-only
+		if err != nil || contentLen <= 0 || contentLen > MaxBufferSize {
+			return headerEnd // malformed or out of range, treat as headers-only
 		}
 		totalLen := headerEnd + contentLen
-		if totalLen > len(buf) {
-			return 0 // body incomplete
+		if totalLen < headerEnd || totalLen > len(buf) {
+			return 0 // overflow or body incomplete
 		}
 		return totalLen
 	}
@@ -333,7 +333,11 @@ func frameHTTP(buf []byte, isRequest bool) int {
 	// For requests: HEAD, GET, DELETE typically have no body → headers only
 	// For responses: 1xx, 204, 304 have no body; otherwise body ends at close
 	if isRequest {
-		firstLine := headers[:strings.Index(headers, "\r\n")]
+		idx := strings.Index(headers, "\r\n")
+		if idx < 0 {
+			return headerEnd
+		}
+		firstLine := headers[:idx]
 		method := strings.Fields(firstLine)
 		if len(method) > 0 {
 			switch method[0] {
@@ -348,7 +352,11 @@ func frameHTTP(buf []byte, isRequest bool) int {
 
 	// Response without Content-Length and not chunked
 	// Check status code
-	firstLine := headers[:strings.Index(headers, "\r\n")]
+	idx := strings.Index(headers, "\r\n")
+	if idx < 0 {
+		return headerEnd
+	}
+	firstLine := headers[:idx]
 	parts := strings.Fields(firstLine)
 	if len(parts) >= 2 {
 		code, _ := strconv.Atoi(parts[1])
@@ -395,6 +403,10 @@ func frameChunked(buf []byte, bodyStart int) int {
 				return 0 // incomplete
 			}
 			return offset + trailerEnd + 2
+		}
+
+		if chunkSize < 0 || chunkSize > int64(len(buf)-offset) {
+			return 0 // invalid chunk size
 		}
 
 		// Skip chunk data + trailing \r\n
@@ -446,8 +458,14 @@ func frameMySQL(buf []byte) int {
 	return totalLen
 }
 
+const maxRedisDepth = 32
+
 // frameRedis finds the boundary of one RESP message.
 func frameRedis(buf []byte) int {
+	return frameRedisWithDepth(buf, 0)
+}
+
+func frameRedisWithDepth(buf []byte, depth int) int {
 	if len(buf) < 3 {
 		return 0
 	}
@@ -482,7 +500,7 @@ func frameRedis(buf []byte) int {
 
 	case '*':
 		// Array: recursively frame each element
-		return frameRESPArray(buf)
+		return frameRESPArrayWithDepth(buf, depth)
 
 	default:
 		// Inline command
@@ -494,7 +512,11 @@ func frameRedis(buf []byte) int {
 	}
 }
 
-func frameRESPArray(buf []byte) int {
+func frameRESPArrayWithDepth(buf []byte, depth int) int {
+	if depth > maxRedisDepth {
+		return 0
+	}
+
 	lineEnd := bytes.Index(buf, []byte("\r\n"))
 	if lineEnd < 0 {
 		return 0
@@ -510,7 +532,7 @@ func frameRESPArray(buf []byte) int {
 		if offset >= len(buf) {
 			return 0
 		}
-		elemLen := frameRedis(buf[offset:])
+		elemLen := frameRedisWithDepth(buf[offset:], depth+1)
 		if elemLen <= 0 {
 			return 0
 		}

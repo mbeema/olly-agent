@@ -616,9 +616,15 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 		// inbound HTTP handler. Find the most recent context for this PID.
 		var bestCtx *threadTraceCtx
 		a.threadCtx.Range(func(key, value any) bool {
-			k := key.(uint64)
+			k, ok := key.(uint64)
+			if !ok {
+				return true
+			}
 			if uint32(k>>32) == pair.PID {
-				tctx := value.(*threadTraceCtx)
+				tctx, ok := value.(*threadTraceCtx)
+				if !ok {
+					return true
+				}
 				if bestCtx == nil || tctx.Created.After(bestCtx.Created) {
 					bestCtx = tctx
 				}
@@ -630,7 +636,10 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 		}
 		val = bestCtx
 	}
-	tctx := val.(*threadTraceCtx)
+	tctx, ok := val.(*threadTraceCtx)
+	if !ok {
+		return
+	}
 	// Only apply if context is recent (within 30s)
 	if time.Since(tctx.Created) > 30*time.Second {
 		a.threadCtx.Delete(ctxKey)
@@ -1062,16 +1071,22 @@ func (a *Agent) cleanupLoop(ctx context.Context) {
 			// Clean stale thread trace contexts (and their BPF map entries)
 			staleThreadCtx := 0
 			a.threadCtx.Range(func(key, value any) bool {
-				tctx := value.(*threadTraceCtx)
+				tctx, ok := value.(*threadTraceCtx)
+				if !ok {
+					a.threadCtx.Delete(key)
+					return true
+				}
 				if time.Since(tctx.Created) > 30*time.Second {
 					a.threadCtx.Delete(key)
 					staleThreadCtx++
 					// Clear leaked BPF map entry
 					if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
-						k := key.(uint64)
-						pid := uint32(k >> 32)
-						tid := uint32(k & 0xFFFFFFFF)
-						injector.ClearTraceContext(pid, tid)
+						k, ok := key.(uint64)
+						if ok {
+							pid := uint32(k >> 32)
+							tid := uint32(k & 0xFFFFFFFF)
+							injector.ClearTraceContext(pid, tid)
+						}
 					}
 				}
 				return true
