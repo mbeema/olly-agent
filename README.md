@@ -333,8 +333,16 @@ olly/
 | Linux (kernel 5.8+ with BTF) | Full (eBPF) | Full | Full | Full |
 | macOS | Stub | File tailing | Host metrics | Stub |
 
+## Status
+
+**This project is under active development.** APIs, configuration formats, and behavior may change without notice. Not recommended for mission-critical production environments without thorough testing.
+
+## Disclaimer
+
+THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. THE AUTHOR SHALL NOT BE LIABLE FOR ANY DAMAGES ARISING FROM THE USE OF THIS SOFTWARE. This software interacts with the Linux kernel via eBPF and intercepts system calls. While designed to be non-intrusive, use at your own risk. See [LICENSE](LICENSE) for full terms.
+
 ## License
 
-Copyright 2024-2026 Madhukar Beema. All rights reserved.
+Copyright 2024-2026 Madhukar Beema, Distinguished Engineer. All rights reserved.
 
 Licensed under the [Business Source License 1.1](LICENSE). You may use this software for non-production purposes. Production use is permitted as long as you are not offering it as a competing commercial service. After 4 years, each release converts to Apache 2.0.
