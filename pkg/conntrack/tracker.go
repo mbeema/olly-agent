@@ -58,6 +58,10 @@ type connKey struct {
 	FD  int32
 }
 
+// maxTrackedConns limits the number of tracked connections to prevent
+// unbounded memory growth under connection storms.
+const maxTrackedConns = 100000
+
 // Tracker maps (pid, fd) to connection metadata.
 type Tracker struct {
 	mu    sync.RWMutex
@@ -85,6 +89,10 @@ func (t *Tracker) Register(pid uint32, fd int32, remoteAddr uint32, remotePort u
 	}
 
 	t.mu.Lock()
+	if len(t.conns) >= maxTrackedConns {
+		// Evict the oldest connection to stay within bounds
+		t.evictOldestLocked()
+	}
 	t.conns[key] = info
 	t.mu.Unlock()
 
@@ -105,6 +113,9 @@ func (t *Tracker) RegisterInbound(pid uint32, fd int32, remoteAddr uint32, remot
 	}
 
 	t.mu.Lock()
+	if len(t.conns) >= maxTrackedConns {
+		t.evictOldestLocked()
+	}
 	t.conns[key] = info
 	t.mu.Unlock()
 
@@ -198,6 +209,23 @@ func (t *Tracker) Count() int {
 	n := len(t.conns)
 	t.mu.RUnlock()
 	return n
+}
+
+// evictOldestLocked removes the oldest connection. Must be called under t.mu.
+func (t *Tracker) evictOldestLocked() {
+	var oldestKey connKey
+	var oldestTime time.Time
+	first := true
+	for k, info := range t.conns {
+		if first || info.ConnectTime.Before(oldestTime) {
+			oldestKey = k
+			oldestTime = info.ConnectTime
+			first = false
+		}
+	}
+	if !first {
+		delete(t.conns, oldestKey)
+	}
 }
 
 // CleanStale removes connections older than maxAge.

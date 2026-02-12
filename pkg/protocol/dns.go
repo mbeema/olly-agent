@@ -124,6 +124,9 @@ func parseDNSQuestion(data []byte) (name string, qtype uint16) {
 
 		// Pointer (compression)
 		if labelLen&0xC0 == 0xC0 {
+			if offset+2 > len(data) {
+				break // truncated compression pointer
+			}
 			offset += 2
 			break
 		}

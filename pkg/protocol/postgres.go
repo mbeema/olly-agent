@@ -6,7 +6,6 @@ package protocol
 
 import (
 	"encoding/binary"
-	"fmt"
 	"strings"
 	"sync"
 )
@@ -96,16 +95,8 @@ func (p *PostgresParser) Parse(request, response []byte) (*SpanAttributes, error
 		p.parseResponse(response, attrs)
 	}
 
-	// Build span name
-	if attrs.DBStatement != "" {
-		stmt := attrs.DBStatement
-		if len(stmt) > 50 {
-			stmt = stmt[:50] + "..."
-		}
-		attrs.Name = fmt.Sprintf("PG %s", stmt)
-	} else {
-		attrs.Name = fmt.Sprintf("PG %s", attrs.DBOperation)
-	}
+	// Build span name (OTEL: low-cardinality, use operation name)
+	attrs.Name = attrs.DBOperation
 
 	return attrs, nil
 }
@@ -144,6 +135,9 @@ func (p *PostgresParser) parseExtendedQuery(data []byte, attrs *SpanAttributes) 
 		case pgParse:
 			// Parse: name(cstring) + query(cstring) + numparams(int16) + param types
 			stmtName := extractCString(payload)
+			if len(stmtName)+1 > len(payload) {
+				break // C3 fix: truncated message, no null terminator
+			}
 			remaining := payload[len(stmtName)+1:]
 			query := extractCString(remaining)
 
@@ -162,6 +156,9 @@ func (p *PostgresParser) parseExtendedQuery(data []byte, attrs *SpanAttributes) 
 		case pgBind:
 			// Bind: portal(cstring) + statement(cstring) + ...
 			portalName := extractCString(payload)
+			if len(portalName)+1 > len(payload) {
+				break // C3 fix: truncated message
+			}
 			remaining := payload[len(portalName)+1:]
 			stmtName := extractCString(remaining)
 
@@ -285,6 +282,10 @@ func (p *PostgresParser) parseResponse(data []byte, attrs *SpanAttributes) {
 
 // Statement cache operations
 
+// maxCacheSize limits the prepared statement cache to prevent memory leaks
+// from long-running connections that prepare many unique statements.
+const maxCacheSize = 1000
+
 func (p *PostgresParser) cacheStatement(name, sql string) {
 	if name == "" {
 		return // unnamed statements are transient
@@ -292,6 +293,13 @@ func (p *PostgresParser) cacheStatement(name, sql string) {
 	p.mu.Lock()
 	if p.stmtCache == nil {
 		p.stmtCache = make(map[string]string)
+	}
+	if len(p.stmtCache) >= maxCacheSize {
+		// Evict an arbitrary entry to stay within bounds
+		for k := range p.stmtCache {
+			delete(p.stmtCache, k)
+			break
+		}
 	}
 	p.stmtCache[name] = sql
 	p.mu.Unlock()
@@ -314,6 +322,12 @@ func (p *PostgresParser) cachePortal(portal, stmt string) {
 	p.mu.Lock()
 	if p.portalCache == nil {
 		p.portalCache = make(map[string]string)
+	}
+	if len(p.portalCache) >= maxCacheSize {
+		for k := range p.portalCache {
+			delete(p.portalCache, k)
+			break
+		}
 	}
 	p.portalCache[portal] = stmt
 	p.mu.Unlock()

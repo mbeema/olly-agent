@@ -71,11 +71,17 @@ func (p *MongoDBParser) Parse(request, response []byte) (*SpanAttributes, error)
 		}
 	}
 
-	// Build span name
+	// Mark admin-only commands with no specific operation as handshake noise.
+	// These are typically topology monitoring, session management, etc.
+	if attrs.DBOperation == "command" {
+		attrs.Handshake = true
+	}
+
+	// Build span name (OTEL: low-cardinality, operation + collection)
 	if attrs.DBName != "" {
-		attrs.Name = fmt.Sprintf("MongoDB %s %s", attrs.DBOperation, attrs.DBName)
+		attrs.Name = fmt.Sprintf("%s %s", attrs.DBOperation, attrs.DBName)
 	} else {
-		attrs.Name = fmt.Sprintf("MongoDB %s", attrs.DBOperation)
+		attrs.Name = attrs.DBOperation
 	}
 
 	return attrs, nil
@@ -136,6 +142,7 @@ func (p *MongoDBParser) parseOpQuery(data []byte, attrs *SpanAttributes) {
 }
 
 // extractCommandFromBSON does a basic extraction of the command name from BSON.
+// It reads the first element key as the command name and scans for $db to set DBName.
 func (p *MongoDBParser) extractCommandFromBSON(data []byte, attrs *SpanAttributes) {
 	if len(data) < 5 {
 		return
@@ -149,39 +156,116 @@ func (p *MongoDBParser) extractCommandFromBSON(data []byte, attrs *SpanAttribute
 		return
 	}
 
-	elemType := data[offset]
-	offset++
+	firstKey := true
+	for offset < len(data) && data[offset] != 0 {
+		elemType := data[offset]
+		offset++
 
-	// Read element name (null-terminated)
-	nameEnd := offset
-	for nameEnd < len(data) && data[nameEnd] != 0 {
-		nameEnd++
-	}
+		// Read element name (null-terminated)
+		nameEnd := offset
+		for nameEnd < len(data) && data[nameEnd] != 0 {
+			nameEnd++
+		}
+		if nameEnd <= offset || nameEnd >= len(data) {
+			break
+		}
 
-	if nameEnd <= offset {
-		return
-	}
+		name := string(data[offset:nameEnd])
+		offset = nameEnd + 1
 
-	name := string(data[offset:nameEnd])
-	offset = nameEnd + 1
+		if firstKey {
+			firstKey = false
+			// The first key in the command document is the command name
+			cmd := strings.ToLower(name)
+			attrs.DBOperation = cmd
 
-	// The first key in the command document is the command name
-	cmd := strings.ToLower(name)
-	attrs.DBOperation = cmd
+			// Mark handshake/admin commands that don't represent user queries
+			switch cmd {
+			case "ismaster", "hello", "saslstart", "saslcontinue", "authenticate",
+				"getnonce", "buildinfo", "getlasterror", "ping", "endsessions",
+				"abortTransaction", "commitTransaction":
+				attrs.Handshake = true
+			}
 
-	// Try to get the collection name from the value
-	switch elemType {
-	case 0x02: // String
-		if offset+4 < len(data) {
-			strLen := binary.LittleEndian.Uint32(data[offset : offset+4])
-			if int(strLen) > 0 && offset+4+int(strLen) <= len(data) {
-				val := string(data[offset+4 : offset+4+int(strLen)-1]) // -1 for null terminator
-				if val != "" {
-					attrs.DBName = val
-					attrs.DBStatement = fmt.Sprintf("%s %s", cmd, val)
+			// Extract collection name from value (string type)
+			if elemType == 0x02 && offset+4 < len(data) {
+				strLen := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
+				if strLen > 0 && strLen < 256 && offset+4+strLen <= len(data) {
+					val := string(data[offset+4 : offset+4+strLen-1]) // -1 for null terminator
+					if val != "" && val != "1" && val != "admin" {
+						attrs.DBName = val
+						attrs.DBStatement = fmt.Sprintf("%s %s", cmd, val)
+					}
 				}
 			}
 		}
+
+		// Look for $db field (standard in OP_MSG commands)
+		if name == "$db" && elemType == 0x02 && offset+4 < len(data) {
+			strLen := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
+			if strLen > 0 && strLen < 256 && offset+4+strLen <= len(data) {
+				db := string(data[offset+4 : offset+4+strLen-1])
+				if db != "" && attrs.DBName == "" {
+					// Only use $db if we didn't get a collection name from the command value
+				}
+				// Mark admin database commands as handshake
+				if db == "admin" && attrs.DBName == "" {
+					attrs.Handshake = true
+				}
+			}
+		}
+
+		// Skip value based on type to advance to next element
+		offset = skipBSONValue(data, offset, elemType)
+		if offset < 0 || offset >= len(data) {
+			break
+		}
+	}
+}
+
+// skipBSONValue advances past a BSON value of the given type.
+// Returns the new offset, or -1 if the value can't be skipped.
+func skipBSONValue(data []byte, offset int, elemType byte) int {
+	switch elemType {
+	case 0x01: // double (8 bytes)
+		return offset + 8
+	case 0x02: // string (int32 length + string + \x00)
+		if offset+4 > len(data) {
+			return -1
+		}
+		strLen := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
+		return offset + 4 + strLen
+	case 0x03, 0x04: // document, array (int32 size + content)
+		if offset+4 > len(data) {
+			return -1
+		}
+		docLen := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
+		if docLen < 5 {
+			return -1
+		}
+		return offset + docLen
+	case 0x05: // binary (int32 length + subtype + data)
+		if offset+4 > len(data) {
+			return -1
+		}
+		binLen := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
+		return offset + 4 + 1 + binLen
+	case 0x07: // ObjectId (12 bytes)
+		return offset + 12
+	case 0x08: // boolean (1 byte)
+		return offset + 1
+	case 0x09: // datetime (8 bytes)
+		return offset + 8
+	case 0x0A: // null (0 bytes)
+		return offset
+	case 0x10: // int32 (4 bytes)
+		return offset + 4
+	case 0x11: // timestamp (8 bytes)
+		return offset + 8
+	case 0x12: // int64 (8 bytes)
+		return offset + 8
+	default:
+		return -1 // unknown type, can't skip
 	}
 }
 

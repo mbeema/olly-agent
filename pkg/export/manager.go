@@ -280,7 +280,18 @@ func (m *Manager) processSpans(ctx context.Context) {
 			}
 
 		case <-ctx.Done():
-			return
+			// Drain remaining spans before exit
+			for {
+				select {
+				case span := <-m.spanCh:
+					batch = append(batch, span)
+				default:
+					if len(batch) > 0 {
+						m.flushSpans(context.Background(), batch)
+					}
+					return
+				}
+			}
 		}
 	}
 }
@@ -321,7 +332,17 @@ func (m *Manager) processLogs(ctx context.Context) {
 			}
 
 		case <-ctx.Done():
-			return
+			for {
+				select {
+				case log := <-m.logCh:
+					batch = append(batch, log)
+				default:
+					if len(batch) > 0 {
+						m.flushLogs(context.Background(), batch)
+					}
+					return
+				}
+			}
 		}
 	}
 }
@@ -362,7 +383,17 @@ func (m *Manager) processMetrics(ctx context.Context) {
 			}
 
 		case <-ctx.Done():
-			return
+			for {
+				select {
+				case metric := <-m.metricCh:
+					batch = append(batch, metric)
+				default:
+					if len(batch) > 0 {
+						m.flushMetrics(context.Background(), batch)
+					}
+					return
+				}
+			}
 		}
 	}
 }
@@ -403,7 +434,17 @@ func (m *Manager) processProfiles(ctx context.Context) {
 			}
 
 		case <-ctx.Done():
-			return
+			for {
+				select {
+				case p := <-m.profileCh:
+					batch = append(batch, p)
+				default:
+					if len(batch) > 0 {
+						m.flushProfiles(context.Background(), batch)
+					}
+					return
+				}
+			}
 		}
 	}
 }

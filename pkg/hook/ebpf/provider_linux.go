@@ -38,6 +38,7 @@ type Provider struct {
 
 var _ hook.HookProvider = (*Provider)(nil)
 var _ hook.TraceInjector = (*Provider)(nil)
+var _ hook.EventTraceProvider = (*Provider)(nil)
 
 // NewProvider creates a new eBPF hook provider. It does not load or attach
 // BPF programs until Start() is called.
@@ -249,4 +250,19 @@ func (p *Provider) GetTraceContext(pid, tid uint32) (traceID, spanID string, ok 
 // SupportsInjection returns whether sockops + sk_msg injection is active.
 func (p *Provider) SupportsInjection() bool {
 	return p.injectionActive
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// EventTraceProvider interface implementation
+// ──────────────────────────────────────────────────────────────────────
+
+// GetEventTraceContext returns BPF-generated trace context from the most recent
+// ring buffer event for the given PID+TID. This is race-free because dispatch()
+// sets the context synchronously before calling OnDataIn, and both run in the
+// same goroutine (the ring buffer reader goroutine).
+func (p *Provider) GetEventTraceContext(pid, tid uint32) (traceID, spanID string, ok bool) {
+	if p.eventReader == nil {
+		return "", "", false
+	}
+	return p.eventReader.getEventTraceContext(pid, tid)
 }

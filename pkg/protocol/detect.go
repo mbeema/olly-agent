@@ -28,6 +28,7 @@ type SpanAttributes struct {
 	// HTTP
 	HTTPMethod     string
 	HTTPPath       string
+	HTTPQuery      string // query string without '?' prefix
 	HTTPStatusCode int
 	HTTPHost       string
 	HTTPUserAgent  string
@@ -58,6 +59,7 @@ type SpanAttributes struct {
 	// General
 	Error      bool
 	ErrorMsg   string
+	Handshake  bool // true for connection handshake/admin commands (skip span)
 }
 
 // ProtocolParser extracts span attributes from request/response byte buffers.

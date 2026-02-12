@@ -6,8 +6,7 @@ package logs
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/binary"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -170,10 +169,7 @@ func (c *Collector) emit(record *LogRecord) {
 }
 
 func (c *Collector) shouldSampleLog() bool {
-	var b [8]byte
-	rand.Read(b[:])
-	r := float64(binary.LittleEndian.Uint64(b[:])) / float64(^uint64(0))
-	return r < c.sampleRate
+	return rand.Float64() < c.sampleRate
 }
 
 func (c *Collector) tryConsumeToken() bool {

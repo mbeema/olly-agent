@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
@@ -33,7 +34,8 @@ const (
 // It matches the exact memory layout of the C struct.
 type ollyEvent struct {
 	EventType   uint8
-	_pad        [3]byte
+	HasTraceCtx uint8
+	_pad        [2]byte
 	PID         uint32
 	TID         uint32
 	FD          int32
@@ -44,16 +46,30 @@ type ollyEvent struct {
 	RemotePort  uint16
 	Direction   uint8
 	_pad2       uint8
+	TraceID     [32]byte
+	SpanID      [16]byte
 	Payload     [256]byte
 }
 
-const ollyEventSize = 4 + 4 + 4 + 4 + 4 + 4 + 8 + 4 + 2 + 1 + 1 + 256 // 296 bytes
+const ollyEventSize = 4 + 4 + 4 + 4 + 4 + 4 + 8 + 4 + 2 + 1 + 1 + 32 + 16 + 256 // 344 bytes
+
+// eventTraceCtx holds BPF-generated trace context extracted from a ring buffer event.
+type eventTraceCtx struct {
+	TraceID string
+	SpanID  string
+}
 
 // eventReader wraps a BPF ring buffer reader and dispatches events to Callbacks.
 type eventReader struct {
 	reader    *ringbuf.Reader
 	callbacks hook.Callbacks
 	logger    *zap.Logger
+
+	// lastTraceCtx stores BPF-generated trace context from ring buffer events,
+	// keyed by pid+tid. This is set synchronously in dispatch() before calling
+	// OnDataIn, so the agent can read it race-free in the same goroutine.
+	lastTraceCtx   map[uint64]*eventTraceCtx
+	lastTraceCtxMu sync.Mutex
 }
 
 // newEventReader creates a ring buffer reader for the given BPF map.
@@ -63,9 +79,10 @@ func newEventReader(eventsMap *ebpf.Map, callbacks hook.Callbacks, logger *zap.L
 		return nil, fmt.Errorf("create ring buffer reader: %w", err)
 	}
 	return &eventReader{
-		reader:    rd,
-		callbacks: callbacks,
-		logger:    logger,
+		reader:       rd,
+		callbacks:    callbacks,
+		logger:       logger,
+		lastTraceCtx: make(map[uint64]*eventTraceCtx),
 	}, nil
 }
 
@@ -105,6 +122,7 @@ func (er *eventReader) dispatch(raw []byte) {
 	}
 
 	eventType := raw[0]
+	hasTraceCtx := raw[1]
 	pid := binary.LittleEndian.Uint32(raw[4:8])
 	tid := binary.LittleEndian.Uint32(raw[8:12])
 	fd := int32(binary.LittleEndian.Uint32(raw[12:16]))
@@ -118,9 +136,22 @@ func (er *eventReader) dispatch(raw []byte) {
 		remotePort = binary.LittleEndian.Uint16(raw[36:38])
 	}
 
-	// Extract payload
+	// Parse BPF-embedded trace context (trace_id at offset 40, span_id at offset 72)
+	if hasTraceCtx == 1 && len(raw) >= 88 {
+		traceID := string(raw[40:72])
+		spanID := string(raw[72:88])
+		key := uint64(pid)<<32 | uint64(tid)
+		er.lastTraceCtxMu.Lock()
+		er.lastTraceCtx[key] = &eventTraceCtx{
+			TraceID: traceID,
+			SpanID:  spanID,
+		}
+		er.lastTraceCtxMu.Unlock()
+	}
+
+	// Extract payload (offset shifted by 48 bytes for trace_id[32] + span_id[16])
 	var payload []byte
-	const payloadOffset = 40 // after all header fields including direction + pad2
+	const payloadOffset = 88 // after all header fields including trace_id + span_id
 	if payloadLen > 0 && len(raw) >= int(payloadOffset+payloadLen) {
 		payload = make([]byte, payloadLen)
 		copy(payload, raw[payloadOffset:payloadOffset+payloadLen])
@@ -163,6 +194,23 @@ func (er *eventReader) dispatch(raw []byte) {
 			er.callbacks.OnLogWrite(pid, tid, fd, payload, ts)
 		}
 	}
+}
+
+// getEventTraceContext returns BPF-generated trace context from the most recent
+// ring buffer event for the given pid+tid. The context is consumed (deleted)
+// on read, ensuring each event's context is used exactly once.
+func (er *eventReader) getEventTraceContext(pid, tid uint32) (traceID, spanID string, ok bool) {
+	key := uint64(pid)<<32 | uint64(tid)
+	er.lastTraceCtxMu.Lock()
+	ctx, exists := er.lastTraceCtx[key]
+	if exists {
+		delete(er.lastTraceCtx, key)
+	}
+	er.lastTraceCtxMu.Unlock()
+	if !exists || ctx == nil {
+		return "", "", false
+	}
+	return ctx.TraceID, ctx.SpanID, true
 }
 
 // close closes the ring buffer reader.

@@ -50,8 +50,11 @@ func TestHTTPParse(t *testing.T) {
 	if attrs.HTTPMethod != "GET" {
 		t.Errorf("method = %q, want GET", attrs.HTTPMethod)
 	}
-	if attrs.HTTPPath != "/api/users?page=1" {
-		t.Errorf("path = %q, want /api/users?page=1", attrs.HTTPPath)
+	if attrs.HTTPPath != "/api/users" {
+		t.Errorf("path = %q, want /api/users", attrs.HTTPPath)
+	}
+	if attrs.HTTPQuery != "page=1" {
+		t.Errorf("query = %q, want page=1", attrs.HTTPQuery)
 	}
 	if attrs.HTTPStatusCode != 200 {
 		t.Errorf("status = %d, want 200", attrs.HTTPStatusCode)

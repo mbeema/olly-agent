@@ -84,6 +84,11 @@ func builtinRules() []Rule {
 			Pattern:     regexp.MustCompile(`(?i)(password\s*=\s*)'[^']*'`),
 			Replacement: "${1}'[REDACTED]'",
 		},
+		{
+			Name:        "url_sensitive_query_params",
+			Pattern:     regexp.MustCompile(`(?i)([?&](?:password|passwd|pwd|secret|token|api_key|apikey|access_token|auth|session_id|ssn|credit_card)=)[^&\s]+`),
+			Replacement: "${1}[REDACTED]",
+		},
 	}
 }
 

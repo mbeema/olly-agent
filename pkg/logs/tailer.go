@@ -125,6 +125,8 @@ func (t *Tailer) Run(ctx context.Context, stopCh chan struct{}) {
 
 // Stop cleans up the tailer.
 func (t *Tailer) Stop() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.watcher.Close()
 	for _, tf := range t.files {
 		tf.file.Close()

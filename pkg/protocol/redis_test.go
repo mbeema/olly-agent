@@ -49,8 +49,8 @@ func TestRedisParse(t *testing.T) {
 	if attrs.RedisCommand != "GET" {
 		t.Errorf("command = %q, want GET", attrs.RedisCommand)
 	}
-	if attrs.Name != "GET session" {
-		t.Errorf("name = %q, want 'GET session'", attrs.Name)
+	if attrs.Name != "GET" {
+		t.Errorf("name = %q, want 'GET'", attrs.Name)
 	}
 	if attrs.Error {
 		t.Error("unexpected error")

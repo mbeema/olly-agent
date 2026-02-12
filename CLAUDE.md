@@ -25,32 +25,45 @@ cd deploy/terraform && terraform apply  # Provision EC2
 deploy/deploy.sh           # SCP + install on EC2
 deploy/generate_traffic.sh # Generate demo traffic
 deploy/verify.sh           # Check OTEL output files
+deploy/analyze_traces.py   # Analyze trace linking quality (run on EC2)
 ```
 
 ## Architecture
 
+Two hook providers, selected at startup (eBPF → socket → stub):
+
 ```
-Target Process → libolly.so (LD_PRELOAD) → Unix DGRAM socket
-                                                ↓
-Olly Agent: Hook Listener → ConnTracker → StreamReassembler
+[eBPF mode — Linux kernel 5.8+]
+Target Process ──syscalls──→ kprobes/kretprobes → ring buffer → Olly Agent
+                 ──TCP──→ sockops/sk_msg (traceparent injection)
+
+[Socket mode — fallback]
+Target Process → libolly.so (LD_PRELOAD) → Unix DGRAM socket → Olly Agent
+
+Olly Agent: HookProvider → ConnTracker → StreamReassembler
                                                ↓
-                                       Protocol Parsers (HTTP/PG/MySQL/Redis/Mongo/gRPC/DNS)
+                                       Protocol Parsers (HTTP/PG/MySQL/Redis/Mongo)
                                                ↓
-            Log Collector → Correlation ← Span Generator
+            Log Collector → Correlation ← Span Generator → Stitcher
             Metrics Collector ──────────→ Export Manager → OTLP
             CPU Profiler ───────────────→
 ```
 
 ### Key Components (pkg/)
 
-- **hook/c/libolly.c** - LD_PRELOAD library: hooks connect/accept/accept4/send/recv/read/write/close + SSL_write/SSL_read
-- **hook/manager.go** - Unix DGRAM socket listener for hook events
-- **hook/injector.go** - Process injection helper (LD_PRELOAD / DYLD_INSERT_LIBRARIES)
+- **hook/ebpf/** - eBPF provider (Linux-only, build-tag gated): kprobes for syscalls, sockops/sk_msg for traceparent injection
+- **hook/ebpf/bpf/olly.bpf.c** - BPF C code: kprobes (accept4/connect/read/write/close), sockops (sockhash), sk_msg (traceparent inject)
+- **hook/ebpf/ringbuf.go** - Ring buffer reader, parses events including embedded trace context
+- **hook/ebpf/provider_linux.go** - eBPF provider: loads BPF, manages maps, implements HookProvider + TraceInjector + EventTraceProvider
+- **hook/provider.go** - HookProvider, TraceInjector, EventTraceProvider interfaces
+- **hook/c/libolly.c** - LD_PRELOAD library (fallback): hooks connect/accept/accept4/send/recv/read/write/close + SSL_write/SSL_read
+- **hook/manager.go** - Unix DGRAM socket listener for hook events (fallback provider)
 - **conntrack/tracker.go** - fd → connection metadata mapping (direction-aware: inbound vs outbound)
 - **reassembly/stream.go** - Per-connection byte buffer and message boundary detection
-- **reassembly/request.go** - Request/response pair matching with direction propagation
-- **protocol/*.go** - Protocol parsers (HTTP, PostgreSQL, MySQL, Redis, MongoDB, gRPC, DNS)
+- **reassembly/request.go** - Request/response pair matching with direction propagation; TID always from request direction
+- **protocol/*.go** - Protocol parsers (HTTP, PostgreSQL, MySQL, Redis, MongoDB)
 - **traces/processor.go** - RequestPair → OTEL Span conversion with parent-child linking
+- **traces/stitcher.go** - Bidirectional CLIENT↔SERVER matching for cross-service trace linking
 - **correlation/engine.go** - PID+TID+timestamp log-trace linking
 - **logs/collector.go** - Cross-platform file tailing via fsnotify
 - **metrics/collector.go** - Host+process metrics via gopsutil
@@ -85,6 +98,12 @@ Key config sections: hook, tracing, logs, correlation, metrics, exporters, disco
 - **Batching:** All exporters batch and buffer (channel capacity: 10,000)
 - **Inbound/outbound direction:** accept/accept4 → ConnInbound (SERVER spans), connect → ConnOutbound (CLIENT spans). Direction stored on streamState and propagated to RequestPair to survive connection close.
 - **Thread context propagation:** PID+TID → trace context map in agent. Inbound HTTP request generates traceID, outbound CLIENT spans on same thread inherit it as parent.
+- **TID from request direction:** Pair TID always comes from AppendSend (request read), never AppendRecv (response write) or close events. Go goroutines migrate between OS threads, so read() and write() on the same connection use different TIDs.
+- **Cross-service trace linking (4 mechanisms):**
+  1. sk_msg traceparent injection — BPF injects `traceparent:` header into outbound HTTP
+  2. Thread context propagation — PID+TID map, inbound→outbound on same thread
+  3. PID-only fallback — for Go goroutine TID mismatch (DB queries)
+  4. Bidirectional stitcher — matches CLIENT↔SERVER by method/path/time; CLIENT adopts SERVER's traceID
 - **Config auto-reload:** fsnotify watcher with 500ms debounce, `agent.Reload()` starts/stops subsystems based on config diff.
 
 ## libolly.c Hook Library Notes
@@ -98,6 +117,19 @@ Key config sections: hook, tracing, logs, correlation, metrics, exporters, disco
 - Struct `msg_header_t` needs explicit `_reserved` padding field for 32-byte alignment
 - `__attribute__((packed))` removes natural padding before uint64_t timestamp_ns
 - traceparent injection only on `CONN_DIR_OUTBOUND` connections
+
+## eBPF Hook Notes
+
+- Requires Linux kernel 5.8+ (BPF ring buffer support)
+- cilium/ebpf v0.20.0; bpf2go generates Go types from C
+- Build tags: `provider_linux.go` / `provider_other.go` for platform split
+- MAX_CAPTURE=256 bytes per ring buffer event — responses >256 bytes cause frameHTTP to fail boundary detection, triggering RemoveStream pair creation path
+- sk_msg injects traceparent AFTER BPF captures data → captured payload doesn't contain the injected header
+- BPF generates trace context in kretprobe_read (synchronous), Go agent processes asynchronously (~seconds delay)
+- IPv6: Go's net.Listen defaults to `::` (AF_INET6). BPF must handle AF_INET6 or connections are invisible
+- sock_key for IPv6: use `__u32[4]` for IP fields to hold both IPv4 and IPv6 in same sockhash
+- sk_msg ALWAYS returns SK_PASS (never drops traffic)
+- Stub provider on macOS: logs+metrics work, traces need Linux
 
 ## AWS Deploy Notes
 

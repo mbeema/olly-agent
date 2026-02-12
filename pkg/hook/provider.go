@@ -59,3 +59,21 @@ type TraceInjector interface {
 	// set up the sockops + sk_msg programs for traceparent injection.
 	SupportsInjection() bool
 }
+
+// EventTraceProvider is implemented by providers that embed BPF-generated
+// trace context directly in ring buffer events, eliminating the race condition
+// between BPF map writes and Go's asynchronous ring buffer processing.
+//
+// Use type assertion to check if a HookProvider supports this:
+//
+//	if etp, ok := provider.(EventTraceProvider); ok {
+//	    traceID, spanID, ok := etp.GetEventTraceContext(pid, tid)
+//	}
+type EventTraceProvider interface {
+	// GetEventTraceContext returns BPF-generated trace context from the most
+	// recent ring buffer event for the given PID+TID. The context is consumed
+	// on read (each event's context is used exactly once).
+	// This is race-free because dispatch() sets context synchronously before
+	// calling OnDataIn, and both run in the same goroutine.
+	GetEventTraceContext(pid, tid uint32) (traceID, spanID string, ok bool)
+}
