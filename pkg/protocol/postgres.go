@@ -285,6 +285,10 @@ func (p *PostgresParser) parseResponse(data []byte, attrs *SpanAttributes) {
 
 // Statement cache operations
 
+// maxCacheSize limits the prepared statement cache to prevent memory leaks
+// from long-running connections that prepare many unique statements.
+const maxCacheSize = 1000
+
 func (p *PostgresParser) cacheStatement(name, sql string) {
 	if name == "" {
 		return // unnamed statements are transient
@@ -292,6 +296,13 @@ func (p *PostgresParser) cacheStatement(name, sql string) {
 	p.mu.Lock()
 	if p.stmtCache == nil {
 		p.stmtCache = make(map[string]string)
+	}
+	if len(p.stmtCache) >= maxCacheSize {
+		// Evict an arbitrary entry to stay within bounds
+		for k := range p.stmtCache {
+			delete(p.stmtCache, k)
+			break
+		}
 	}
 	p.stmtCache[name] = sql
 	p.mu.Unlock()
@@ -314,6 +325,12 @@ func (p *PostgresParser) cachePortal(portal, stmt string) {
 	p.mu.Lock()
 	if p.portalCache == nil {
 		p.portalCache = make(map[string]string)
+	}
+	if len(p.portalCache) >= maxCacheSize {
+		for k := range p.portalCache {
+			delete(p.portalCache, k)
+			break
+		}
 	}
 	p.portalCache[portal] = stmt
 	p.mu.Unlock()

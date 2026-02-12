@@ -49,6 +49,10 @@ type pendingSpan struct {
 	createdAt time.Time
 }
 
+// maxPendingSpans caps the total number of pending spans to prevent unbounded
+// memory growth under sustained load with no matching counterparts.
+const maxPendingSpans = 10000
+
 // NewStitcher creates a cross-service trace stitcher.
 // window is the maximum time difference between a CLIENT span end and
 // SERVER span start to consider them part of the same request flow.
@@ -161,15 +165,17 @@ func (s *Stitcher) processClientSpan(span *Span) {
 		return
 	}
 
-	// No SERVER match found — store CLIENT for future matching
-	key := fmt.Sprintf("%s:%d", span.RemoteAddr, span.RemotePort)
-	ps := &pendingSpan{
-		span:      span,
-		method:    method,
-		path:      path,
-		createdAt: time.Now(),
+	// No SERVER match found — store CLIENT for future matching (with cap)
+	if s.pendingCount() < maxPendingSpans {
+		key := fmt.Sprintf("%s:%d", span.RemoteAddr, span.RemotePort)
+		ps := &pendingSpan{
+			span:      span,
+			method:    method,
+			path:      path,
+			createdAt: time.Now(),
+		}
+		s.pendingClients[key] = append(s.pendingClients[key], ps)
 	}
-	s.pendingClients[key] = append(s.pendingClients[key], ps)
 }
 
 // processServerSpan first tries to match against pending CLIENT spans,
@@ -250,15 +256,29 @@ func (s *Stitcher) processServerSpan(span *Span) {
 		return
 	}
 
-	// No CLIENT match found — store SERVER for future matching
-	key := fmt.Sprintf("server:%s:%s", serverMethod, serverPath)
-	ps := &pendingSpan{
-		span:      span,
-		method:    serverMethod,
-		path:      serverPath,
-		createdAt: time.Now(),
+	// No CLIENT match found — store SERVER for future matching (with cap)
+	if s.pendingCount() < maxPendingSpans {
+		key := fmt.Sprintf("server:%s:%s", serverMethod, serverPath)
+		ps := &pendingSpan{
+			span:      span,
+			method:    serverMethod,
+			path:      serverPath,
+			createdAt: time.Now(),
+		}
+		s.pendingServers[key] = append(s.pendingServers[key], ps)
 	}
-	s.pendingServers[key] = append(s.pendingServers[key], ps)
+}
+
+// pendingCount returns the total pending spans (must be called under s.mu).
+func (s *Stitcher) pendingCount() int {
+	count := 0
+	for _, spans := range s.pendingClients {
+		count += len(spans)
+	}
+	for _, spans := range s.pendingServers {
+		count += len(spans)
+	}
+	return count
 }
 
 // Cleanup removes stale pending spans older than the window.
