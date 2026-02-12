@@ -15,17 +15,17 @@ Scoring: 0-100 across 10 categories (10 pts each).
 
 | Category | Before | After | Datadog | Dynatrace | Google |
 |---|---|---|---|---|---|
-| Core Tracing | 8/10 | 8/10 | 9/10 | 10/10 | 7/10 |
+| Core Tracing | 8/10 | 9/10 | 9/10 | 10/10 | 7/10 |
 | Metrics | 8/10 | 8/10 | 9/10 | 9/10 | 8/10 |
 | Logs | 6/10 | 7/10 | 9/10 | 8/10 | 8/10 |
-| Profiling | 6/10 | 6/10 | 8/10 | 9/10 | 5/10 |
+| Profiling | 6/10 | 7/10 | 8/10 | 9/10 | 5/10 |
 | Production Safety | 3/10 | 8/10 | 9/10 | 10/10 | 8/10 |
-| Installation/Deploy | 2/10 | 7/10 | 10/10 | 9/10 | 8/10 |
-| Data Pipeline | 4/10 | 7/10 | 9/10 | 9/10 | 7/10 |
-| Security/Compliance | 5/10 | 7/10 | 9/10 | 10/10 | 8/10 |
+| Installation/Deploy | 2/10 | 8/10 | 10/10 | 9/10 | 8/10 |
+| Data Pipeline | 4/10 | 8/10 | 9/10 | 9/10 | 7/10 |
+| Security/Compliance | 5/10 | 8/10 | 9/10 | 10/10 | 8/10 |
 | Scalability | 6/10 | 6/10 | 9/10 | 9/10 | 7/10 |
-| Documentation | 7/10 | 7/10 | 10/10 | 9/10 | 8/10 |
-| **Total** | **55/100** | **71/100** | **91/100** | **92/100** | **74/100** |
+| Documentation | 7/10 | 9/10 | 10/10 | 9/10 | 8/10 |
+| **Total** | **55/100** | **80/100** | **91/100** | **92/100** | **74/100** |
 
 ---
 
