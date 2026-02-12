@@ -174,14 +174,21 @@ func classifyAuditEvent(auditType string, attrs map[string]interface{}) Security
 		return SecurityGroupChange
 	case "USER_CMD":
 		return SecuritySudo
-	case "EXECVE":
+	case "EXECVE", "SYSCALL":
 		return SecurityAuditGeneric
 	case "PATH", "OPENAT":
 		return SecurityFileAccess
 	case "SERVICE_START", "SERVICE_STOP":
 		return SecurityServiceChange
-	case "NETFILTER_CFG":
+	case "NETFILTER_CFG", "MAC_IPSEC_EVENT":
 		return SecurityNetworkChange
+	case "ANOM_PROMISCUOUS", "ANOM_LOGIN_FAILURES", "ANOM_LOGIN_LOCATION",
+		"ANOM_LOGIN_SESSIONS", "ANOM_LOGIN_TIME", "ANOM_ABEND":
+		return SecurityPrivEscalation
+	case "AVC", "SELINUX_ERR", "APPARMOR_DENIED":
+		return SecurityFileAccess
+	case "CRYPTO_KEY_USER", "CRYPTO_LOGIN", "CRYPTO_SESSION":
+		return SecurityLogin
 	default:
 		return SecurityAuditGeneric
 	}
@@ -279,6 +286,8 @@ func isSecurityAlert(eventType SecurityEventType) bool {
 }
 
 // parseSyslogTimestamp parses "Jan  2 15:04:05" format, assuming current year.
+// Handles year rollover: if the parsed date is in the future (e.g., Dec log
+// read in Jan), it uses the previous year.
 func parseSyslogTimestamp(s string) time.Time {
 	now := time.Now()
 	// Try standard syslog format
@@ -290,7 +299,13 @@ func parseSyslogTimestamp(s string) time.Time {
 		}
 	}
 	// Set year to current year
-	return time.Date(now.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.Local)
+	result := time.Date(now.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.Local)
+	// Handle year rollover: if the timestamp is more than 1 day in the future,
+	// it's likely from the previous year (e.g., Dec 31 log read on Jan 1).
+	if result.After(now.Add(24 * time.Hour)) {
+		result = result.AddDate(-1, 0, 0)
+	}
+	return result
 }
 
 // DefaultSecurityLogSources returns pre-configured log sources for security/audit logs.
