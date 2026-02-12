@@ -1,4 +1,4 @@
-// Copyright 2024-2026 Madhukar Beema. All rights reserved.
+// Copyright 2024-2026 Madhukar Beema, Distinguished Engineer. All rights reserved.
 // Use of this source code is governed by the Business Source License
 // included in the LICENSE file of this repository.
 

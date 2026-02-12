@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Madhukar Beema, Distinguished Engineer. All rights reserved.
+# Author: Madhukar Beema, Distinguished Engineer
+
 terraform {
   required_providers {
     aws = {

@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Madhukar Beema, Distinguished Engineer. All rights reserved.
+# Author: Madhukar Beema, Distinguished Engineer
+
 # Base configuration — common settings shared across all signals
 service_name: auto
 log_level: info

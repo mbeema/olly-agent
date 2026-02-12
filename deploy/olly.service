@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Madhukar Beema, Distinguished Engineer. All rights reserved.
+# Author: Madhukar Beema, Distinguished Engineer
 [Unit]
 Description=Olly Observability Agent
 Documentation=https://github.com/mbeema/olly

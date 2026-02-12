@@ -1,3 +1,5 @@
+# Copyright 2024-2026 Madhukar Beema, Distinguished Engineer. All rights reserved.
+# Author: Madhukar Beema, Distinguished Engineer
 # Stage 1: Build
 FROM golang:1.24-alpine AS builder
 
