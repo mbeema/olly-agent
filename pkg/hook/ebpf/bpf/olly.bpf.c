@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Madhukar Beema, Distinguished Engineer. All rights reserved.
+// Author: Madhukar Beema, Distinguished Engineer
+
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // olly.bpf.c — eBPF programs for syscall and SSL hooking.
 // Attached via kprobes/kretprobes to observe all network I/O.

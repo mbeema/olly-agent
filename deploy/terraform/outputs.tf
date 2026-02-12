@@ -1,3 +1,6 @@
+# Copyright 2024-2026 Madhukar Beema, Distinguished Engineer. All rights reserved.
+# Author: Madhukar Beema, Distinguished Engineer
+
 output "instance_id" {
   description = "EC2 instance ID"
   value       = aws_instance.olly_demo.id

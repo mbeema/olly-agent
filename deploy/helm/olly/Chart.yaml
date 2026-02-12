@@ -12,4 +12,5 @@ keywords:
   - ebpf
 home: https://github.com/mbeema/olly
 maintainers:
-  - name: mbeema
+  - name: Madhukar Beema
+    email: madhukar.beema@gmail.com
