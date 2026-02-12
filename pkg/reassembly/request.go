@@ -56,6 +56,11 @@ type streamState struct {
 	respFramer *httpFramer // framing state for response direction
 	lastTID    atomic.Uint32 // H2 fix: atomic to prevent data race
 	direction  atomic.Int32  // H2b fix: atomic to prevent data race; 0=outbound, 1=inbound
+
+	// PostgreSQL: true after auth handshake is consumed. Before this,
+	// all data (startup, SSL negotiation, auth) is discarded to prevent
+	// auth messages from contaminating query span pairing.
+	pgReady bool
 }
 
 // Reassembler manages streams and emits request/response pairs.
@@ -162,6 +167,31 @@ func (r *Reassembler) tryExtractPairs(ss *streamState) {
 			ss.stream.Protocol = ss.protocol
 		}
 
+		// PostgreSQL: consume auth handshake before query pairing.
+		// PG connections start with SSL negotiation + startup + auth exchange.
+		// This data doesn't represent queries and would create noise spans
+		// with wrong timestamps. Discard it until the first actual query (Q/P).
+		if ss.protocol == "postgres" && !ss.pgReady {
+			queryStart := findPgQueryStart(s.sendBuf)
+			if queryStart < 0 {
+				// No query found yet — discard all auth data
+				s.sendBuf = s.sendBuf[:0]
+				s.recvBuf = s.recvBuf[:0]
+				s.mu.Unlock()
+				return
+			}
+			// Discard auth messages before the query in both buffers
+			s.sendBuf = s.sendBuf[queryStart:]
+			skipLen := skipPgAuthRecv(s.recvBuf)
+			s.recvBuf = s.recvBuf[skipLen:]
+			ss.pgReady = true
+			// Fall through to normal pair extraction with clean buffers
+			if len(s.sendBuf) == 0 || len(s.recvBuf) == 0 {
+				s.mu.Unlock()
+				return
+			}
+		}
+
 		// Extract one complete request
 		reqLen := frameMessage(s.sendBuf, ss.protocol, true)
 		if reqLen <= 0 {
@@ -176,7 +206,14 @@ func (r *Reassembler) tryExtractPairs(ss *streamState) {
 			return // incomplete response
 		}
 
-		// Build pair from exactly one request + one response
+		// Build pair from exactly one request + one response.
+		// Duration fix: if lastRecv predates lastSend (stale timestamp from
+		// a previous message cycle, e.g., PG auth), use time.Now() as the
+		// response time instead of producing a zero-duration span.
+		duration := s.lastRecv.Sub(s.lastSend)
+		if duration <= 0 {
+			duration = time.Since(s.lastSend)
+		}
 		pair := &RequestPair{
 			PID:         s.PID,
 			TID:         ss.lastTID.Load(),
@@ -188,7 +225,7 @@ func (r *Reassembler) tryExtractPairs(ss *streamState) {
 			Request:     make([]byte, reqLen),
 			Response:    make([]byte, respLen),
 			RequestTime: s.lastSend,
-			Duration:    s.lastRecv.Sub(s.lastSend),
+			Duration:    duration,
 			Direction:   int(ss.direction.Load()),
 		}
 		copy(pair.Request, s.sendBuf[:reqLen])
@@ -227,6 +264,35 @@ func (r *Reassembler) RemoveStream(pid uint32, fd int32, tid uint32) {
 	s := ss.stream
 	if s.HasData() && r.onPair != nil {
 		s.mu.Lock()
+
+		// PG cleanup on close: skip noise spans from auth or admin messages.
+		if ss.protocol == "postgres" {
+			if !ss.pgReady {
+				// Auth never completed — discard if no query found
+				queryStart := findPgQueryStart(s.sendBuf)
+				if queryStart < 0 {
+					s.mu.Unlock()
+					return
+				}
+				s.sendBuf = s.sendBuf[queryStart:]
+				skipLen := skipPgAuthRecv(s.recvBuf)
+				s.recvBuf = s.recvBuf[skipLen:]
+				ss.pgReady = true
+				if len(s.sendBuf) == 0 {
+					s.mu.Unlock()
+					return
+				}
+			} else if len(s.sendBuf) > 0 && s.sendBuf[0] != 'Q' && s.sendBuf[0] != 'P' && s.sendBuf[0] != 'B' && s.sendBuf[0] != 'E' {
+				// Post-auth leftovers (Terminate 'X', etc.) — not query data
+				s.mu.Unlock()
+				return
+			}
+		}
+
+		duration := s.lastRecv.Sub(s.lastSend)
+		if duration <= 0 {
+			duration = time.Since(s.lastSend)
+		}
 		pair := &RequestPair{
 			PID:         s.PID,
 			TID:         tid,
@@ -238,7 +304,7 @@ func (r *Reassembler) RemoveStream(pid uint32, fd int32, tid uint32) {
 			Request:     make([]byte, len(s.sendBuf)),
 			Response:    make([]byte, len(s.recvBuf)),
 			RequestTime: s.lastSend,
-			Duration:    s.lastRecv.Sub(s.lastSend),
+			Duration:    duration,
 			Direction:   int(ss.direction.Load()),
 		}
 		copy(pair.Request, s.sendBuf)
@@ -287,7 +353,7 @@ func frameMessage(buf []byte, proto string, isRequest bool) int {
 	case "http", "grpc":
 		return frameHTTP(buf, isRequest)
 	case "postgres":
-		return framePostgres(buf)
+		return framePostgres(buf, isRequest)
 	case "mysql":
 		return frameMySQL(buf)
 	case "redis":
@@ -424,31 +490,238 @@ func frameChunked(buf []byte, bodyStart int) int {
 	return 0 // incomplete
 }
 
-// framePostgres finds the boundary of one PostgreSQL wire message.
-// C5 fix: uses binary.BigEndian.Uint32 to prevent integer overflow on 32-bit.
-func framePostgres(buf []byte) int {
+// framePostgres finds the boundary of a PostgreSQL message batch.
+// PG uses multi-message sequences: a request may be P+B+D+E+S (extended query)
+// and a response is all messages through ReadyForQuery ('Z').
+// Batch-aware framing prevents auth handshake messages from being mis-paired
+// with actual query data.
+func framePostgres(buf []byte, isRequest bool) int {
+	if len(buf) < 4 {
+		return 0
+	}
+
+	if isRequest {
+		return framePostgresRequest(buf)
+	}
+	return framePostgresResponse(buf)
+}
+
+// framePostgresRequest frames one client-side PG message batch.
+// - Startup message (buf[0]==0): consume the startup plus any subsequent
+//   non-query auth messages (e.g., PasswordMessage 'p'), so the entire
+//   auth handshake request side is one batch.
+// - Simple Query 'Q': standalone, one message.
+// - Extended Query (starts with 'P' or 'B'): consume through Sync 'S'.
+// - Other non-query messages: consume until next query-start or buffer end.
+func framePostgresRequest(buf []byte) int {
+	// Startup message: first byte is 0x00 (high byte of int32 length).
+	// Format: length(4) + version(4) + params... + \x00
+	if buf[0] == 0 {
+		if len(buf) < 8 {
+			return 0
+		}
+		msgLen := int(binary.BigEndian.Uint32(buf[0:4]))
+		if msgLen < 8 || msgLen > 1024 {
+			return len(buf) // malformed, consume all
+		}
+		if msgLen > len(buf) {
+			return 0 // incomplete
+		}
+		// Consume startup, then continue consuming non-query auth messages
+		// (PasswordMessage 'p', SASLInitialResponse, etc.)
+		offset := msgLen
+		for offset+5 <= len(buf) {
+			mt := buf[offset]
+			// Stop before query messages — they belong to the next batch
+			if mt == 'Q' || mt == 'P' {
+				break
+			}
+			ml := int(binary.BigEndian.Uint32(buf[offset+1 : offset+5]))
+			if ml < 4 || offset+1+ml > len(buf) {
+				break
+			}
+			offset += 1 + ml
+		}
+		return offset
+	}
+
 	if len(buf) < 5 {
 		return 0
 	}
 
-	// First byte is message type, next 4 are length (includes self)
-	msgType := buf[0]
+	// Query messages: consume through the batch boundary
+	isQueryStart := buf[0] == 'Q' || buf[0] == 'P' || buf[0] == 'B' || buf[0] == 'E'
 
-	// Startup message has no type byte (starts with length + version)
-	if msgType == 0 {
-		return len(buf) // consume all for startup
+	offset := 0
+	for offset+5 <= len(buf) {
+		mt := buf[offset]
+		ml := int(binary.BigEndian.Uint32(buf[offset+1 : offset+5]))
+		if ml < 4 || offset+1+ml > len(buf) {
+			if !isQueryStart && offset > 0 {
+				return offset // return auth messages consumed so far
+			}
+			return 0 // incomplete
+		}
+		offset += 1 + ml
+
+		if isQueryStart {
+			// Simple Query: standalone message, return immediately
+			if mt == 'Q' {
+				return offset
+			}
+			// Sync: end of extended query batch (S with length exactly 4)
+			if mt == 'S' && ml == 4 {
+				return offset
+			}
+		} else {
+			// Non-query messages (auth leftovers): stop before next query start
+			if offset < len(buf) && (buf[offset] == 'Q' || buf[offset] == 'P') {
+				return offset
+			}
+		}
 	}
 
-	msgLen := int(binary.BigEndian.Uint32(buf[1:5]))
-	if msgLen < 4 {
-		return len(buf) // malformed, consume all
+	// Consumed all complete messages but no boundary found
+	if !isQueryStart && offset > 0 {
+		return offset // return non-query messages consumed
 	}
-	totalLen := 1 + msgLen // type byte + payload (length includes itself)
+	return 0
+}
 
-	if totalLen > len(buf) {
-		return 0 // incomplete
+// framePostgresResponse frames one server-side PG message batch.
+// Ideal boundary is ReadyForQuery ('Z'), sent after auth and each query.
+// Fallbacks handle eBPF's MAX_CAPTURE=256 truncating long messages:
+//   - CommandComplete ('C') or ErrorResponse ('E'): query response done
+//   - All auth messages (R/S/K): auth batch with truncated Z
+func framePostgresResponse(buf []byte) int {
+	if len(buf) < 5 {
+		return 0
 	}
-	return totalLen
+
+	offset := 0
+	lastCmdOrErr := 0
+	allAuth := true
+
+	for offset+5 <= len(buf) {
+		mt := buf[offset]
+		ml := int(binary.BigEndian.Uint32(buf[offset+1 : offset+5]))
+		if ml < 4 || offset+1+ml > len(buf) {
+			break // incomplete message
+		}
+		offset += 1 + ml
+
+		// ReadyForQuery: ideal response boundary
+		if mt == 'Z' {
+			return offset
+		}
+		// Track CommandComplete/ErrorResponse as fallback boundary
+		if mt == 'C' || mt == 'E' {
+			lastCmdOrErr = offset
+		}
+		// Auth messages: R (Authentication*), S (ParameterStatus), K (BackendKeyData)
+		if mt != 'R' && mt != 'S' && mt != 'K' {
+			allAuth = false
+		}
+	}
+
+	// No Z found. Fallback 1: query response has C/E (Z truncated by eBPF)
+	if lastCmdOrErr > 0 {
+		return lastCmdOrErr
+	}
+	// Fallback 2: all auth messages (Z truncated during handshake)
+	if allAuth && offset > 0 {
+		return offset
+	}
+	return 0 // incomplete, wait for more data
+}
+
+// findPgQueryStart scans a PG send buffer for the first query message (Q or P),
+// skipping startup messages (length+version format) and auth messages (p, etc.).
+// Returns the byte offset where the query starts, or -1 if no query found yet.
+func findPgQueryStart(buf []byte) int {
+	offset := 0
+	for offset < len(buf) {
+		// Query message: Simple Query 'Q' or Parse 'P' (extended query start)
+		if buf[offset] == 'Q' || buf[offset] == 'P' {
+			if offset+5 <= len(buf) {
+				ml := int(binary.BigEndian.Uint32(buf[offset+1 : offset+5]))
+				if ml >= 4 && ml < 1<<20 {
+					return offset
+				}
+			}
+			return -1 // looks like a query but incomplete
+		}
+
+		// Startup/SSLRequest message: starts with 0x00 (high byte of int32 length)
+		if buf[offset] == 0 {
+			if offset+4 > len(buf) {
+				return -1 // incomplete
+			}
+			msgLen := int(binary.BigEndian.Uint32(buf[offset : offset+4]))
+			if msgLen < 8 || msgLen > 1024 {
+				offset++
+				continue // skip garbage byte
+			}
+			if offset+msgLen > len(buf) {
+				return -1 // incomplete
+			}
+			offset += msgLen
+			continue
+		}
+
+		// Standard PG message (password 'p', SASL, etc.): type + 4-byte length
+		if offset+5 > len(buf) {
+			return -1 // incomplete
+		}
+		ml := int(binary.BigEndian.Uint32(buf[offset+1 : offset+5]))
+		if ml < 4 || offset+1+ml > len(buf) {
+			return -1 // incomplete
+		}
+		offset += 1 + ml
+	}
+	return -1 // no query found
+}
+
+// skipPgAuthRecv consumes auth-phase response messages from the front of a PG
+// recv buffer: SSL negotiation byte ('N'/'S'), Authentication ('R'),
+// ParameterStatus ('S'), BackendKeyData ('K'), ReadyForQuery ('Z'),
+// NoticeResponse ('N').
+// Returns the number of bytes to skip.
+func skipPgAuthRecv(buf []byte) int {
+	offset := 0
+
+	// Handle potential single-byte SSL negotiation response ('N'=no SSL, 'S'=SSL).
+	// This only appears as the very first response byte before any PG messages.
+	// Distinguish from PG messages by checking if it has a valid length field.
+	if offset < len(buf) && (buf[offset] == 'N' || buf[offset] == 'S') {
+		isSSLByte := true
+		if offset+5 <= len(buf) {
+			ml := int(binary.BigEndian.Uint32(buf[offset+1 : offset+5]))
+			if ml >= 4 && offset+1+ml <= len(buf) {
+				isSSLByte = false // valid PG message, not a single SSL byte
+			}
+		}
+		if isSSLByte {
+			offset++ // consume single SSL negotiation byte
+		}
+	}
+
+	// Consume standard PG auth-phase messages (type + 4-byte length).
+	for offset+5 <= len(buf) {
+		b := buf[offset]
+		// Auth messages: R (Authentication*), S (ParameterStatus),
+		// K (BackendKeyData), Z (ReadyForQuery), N (NoticeResponse)
+		if b != 'R' && b != 'S' && b != 'K' && b != 'Z' && b != 'N' {
+			break // non-auth message — query response starts here
+		}
+		ml := int(binary.BigEndian.Uint32(buf[offset+1 : offset+5]))
+		if ml < 4 || offset+1+ml > len(buf) {
+			break // incomplete message
+		}
+		offset += 1 + ml
+	}
+
+	return offset
 }
 
 // frameMySQL finds the boundary of one MySQL packet.

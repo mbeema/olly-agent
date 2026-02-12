@@ -147,13 +147,19 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 		span.Status = StatusUnset
 	}
 
-	// Set connection info (R2.1: stable semantic conventions)
+	// Set connection info (R2.1: stable semantic conventions).
+	// Fallback to pair's RemoteAddr/RemotePort when connInfo is nil.
+	// This happens when OnClose removes the connection from the tracker
+	// before pairDispatchLoop processes the pair (race on connection close).
 	if connInfo != nil {
 		span.RemoteAddr = connInfo.RemoteAddrStr()
 		span.RemotePort = connInfo.RemotePort
 		span.IsSSL = connInfo.IsSSL
 		span.SetAttribute("network.peer.address", connInfo.RemoteAddrStr())
 		span.SetAttribute("network.peer.port", fmt.Sprintf("%d", connInfo.RemotePort))
+	} else if pair.RemoteAddr != "" {
+		span.SetAttribute("network.peer.address", pair.RemoteAddr)
+		span.SetAttribute("network.peer.port", fmt.Sprintf("%d", pair.RemotePort))
 	}
 
 	// Set protocol-specific attributes
@@ -223,10 +229,13 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		if attrs.DBName != "" {
 			span.SetAttribute("db.namespace", attrs.DBName)
 		}
-		// Add server address from connection info
+		// Add server address from connection info, fallback to span's remote info
 		if connInfo != nil {
 			span.SetAttribute("server.address", connInfo.RemoteAddrStr())
 			span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
+		} else if span.RemoteAddr != "" {
+			span.SetAttribute("server.address", span.RemoteAddr)
+			span.SetAttribute("server.port", fmt.Sprintf("%d", span.RemotePort))
 		}
 
 	case protocol.ProtoRedis:
@@ -240,6 +249,9 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		if connInfo != nil {
 			span.SetAttribute("server.address", connInfo.RemoteAddrStr())
 			span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
+		} else if span.RemoteAddr != "" {
+			span.SetAttribute("server.address", span.RemoteAddr)
+			span.SetAttribute("server.port", fmt.Sprintf("%d", span.RemotePort))
 		}
 
 	case protocol.ProtoMongoDB:
@@ -253,6 +265,9 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		if connInfo != nil {
 			span.SetAttribute("server.address", connInfo.RemoteAddrStr())
 			span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
+		} else if span.RemoteAddr != "" {
+			span.SetAttribute("server.address", span.RemoteAddr)
+			span.SetAttribute("server.port", fmt.Sprintf("%d", span.RemotePort))
 		}
 
 	case protocol.ProtoGRPC:
@@ -270,6 +285,9 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		if connInfo != nil {
 			span.SetAttribute("server.address", connInfo.RemoteAddrStr())
 			span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
+		} else if span.RemoteAddr != "" {
+			span.SetAttribute("server.address", span.RemoteAddr)
+			span.SetAttribute("server.port", fmt.Sprintf("%d", span.RemotePort))
 		}
 
 	case protocol.ProtoDNS:
