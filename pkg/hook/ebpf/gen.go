@@ -1,3 +1,7 @@
+// Copyright 2024-2026 Madhukar Beema. All rights reserved.
+// Use of this source code is governed by the Business Source License
+// included in the LICENSE file of this repository.
+
 package ebpf
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -target amd64 -cflags "-O2 -g -Wall -Werror -D__TARGET_ARCH_x86" olly bpf/olly.bpf.c -- -Ibpf/headers -Ibpf
