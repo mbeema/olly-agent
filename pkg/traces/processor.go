@@ -59,9 +59,16 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 	}
 
 	// Parse request/response
+	// Note: agent.go already swaps send/recv for inbound (SERVER) connections,
+	// so pair.Request always contains the request and pair.Response the response.
 	attrs, err := protocol.Parse(proto, pair.Request, pair.Response)
 	if err != nil {
 		p.logger.Debug("parse error", zap.String("protocol", proto), zap.Error(err))
+		return
+	}
+
+	// Skip handshake/admin commands (e.g., MongoDB isMaster/hello)
+	if attrs.Handshake {
 		return
 	}
 
@@ -115,6 +122,10 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 			span.TraceID = pair.ParentTraceID
 			if pair.InjectedSpanID != "" {
 				span.SpanID = pair.InjectedSpanID
+				// Mark as linked via traceparent injection so the stitcher
+				// knows this CLIENT→SERVER link is already established and
+				// doesn't defer this span waiting for a SERVER match.
+				span.SetAttribute("olly.trace_source", "injected")
 			} else {
 				span.SpanID = GenerateSpanID()
 			}

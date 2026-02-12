@@ -65,6 +65,12 @@ func (p *RedisParser) Parse(request, response []byte) (*SpanAttributes, error) {
 		}
 	}
 
+	// Mark handshake/admin commands that don't represent user operations
+	switch attrs.RedisCommand {
+	case "CLIENT", "AUTH", "SELECT", "PING", "COMMAND", "CONFIG", "HELLO":
+		attrs.Handshake = true
+	}
+
 	// Parse response for errors
 	if len(response) > 0 && response[0] == '-' {
 		attrs.Error = true

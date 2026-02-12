@@ -1,6 +1,7 @@
 # Build artifacts
 bin/
 dist/
+olly-linux
 *.o
 *.so
 

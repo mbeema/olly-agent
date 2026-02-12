@@ -61,6 +61,10 @@ type streamState struct {
 	// all data (startup, SSL negotiation, auth) is discarded to prevent
 	// auth messages from contaminating query span pairing.
 	pgReady bool
+
+	// MySQL: true after server greeting + auth handshake is consumed.
+	// MySQL's handshake is server-initiated (greeting → auth response → OK).
+	mysqlReady bool
 }
 
 // Reassembler manages streams and emits request/response pairs.
@@ -139,7 +143,13 @@ func (r *Reassembler) AppendRecv(pid, tid uint32, fd int32, data []byte, remoteA
 	ss := r.getOrCreate(pid, fd, remoteAddr, remotePort)
 	ss.stream.IsSSL = ss.stream.IsSSL || isSSL
 	ss.stream.AppendRecv(data)
-	ss.lastTID.Store(tid) // H2 fix: atomic store
+	// Do NOT update lastTID here. The pair's TID must come from AppendSend
+	// (the request direction) because trace context (threadCtx in agent.go)
+	// is stored under the request's TID. For Go servers, goroutines migrate
+	// between OS threads, so write() (response) often runs on a different
+	// TID than read() (request). Using the response TID would cause
+	// enrichPairContext to miss the exact match and fall back to PID-only,
+	// picking stale context from a previous request's thread.
 
 	r.tryExtractPairs(ss)
 }
@@ -163,6 +173,13 @@ func (r *Reassembler) tryExtractPairs(ss *streamState) {
 		// Detect protocol on first data
 		if !ss.detected {
 			ss.protocol = detectProtocol(s.sendBuf, ss.stream.RemotePort)
+			// Fallback: for inbound (SERVER) connections, sendBuf starts with the
+			// client's first message (e.g., MySQL auth response, seqID=1) which may
+			// not match content-based detection. Try recvBuf which has the server's
+			// response (e.g., MySQL handshake with protocol version 0x0a).
+			if ss.protocol == "unknown" && len(s.recvBuf) > 0 {
+				ss.protocol = detectProtocol(s.recvBuf, ss.stream.RemotePort)
+			}
 			ss.detected = true
 			ss.stream.Protocol = ss.protocol
 		}
@@ -186,6 +203,27 @@ func (r *Reassembler) tryExtractPairs(ss *streamState) {
 			s.recvBuf = s.recvBuf[skipLen:]
 			ss.pgReady = true
 			// Fall through to normal pair extraction with clean buffers
+			if len(s.sendBuf) == 0 || len(s.recvBuf) == 0 {
+				s.mu.Unlock()
+				return
+			}
+		}
+
+		// MySQL: consume server greeting + auth handshake before query pairing.
+		// MySQL handshake is server-initiated: greeting → client auth → OK/ERR.
+		// Discard until the first COM_* command (seq=0 + valid command byte).
+		if ss.protocol == "mysql" && !ss.mysqlReady {
+			queryStart := findMySQLQueryStart(s.sendBuf)
+			if queryStart < 0 {
+				s.sendBuf = s.sendBuf[:0]
+				s.recvBuf = s.recvBuf[:0]
+				s.mu.Unlock()
+				return
+			}
+			s.sendBuf = s.sendBuf[queryStart:]
+			skipLen := skipMySQLHandshake(s.recvBuf)
+			s.recvBuf = s.recvBuf[skipLen:]
+			ss.mysqlReady = true
 			if len(s.sendBuf) == 0 || len(s.recvBuf) == 0 {
 				s.mu.Unlock()
 				return
@@ -268,7 +306,6 @@ func (r *Reassembler) RemoveStream(pid uint32, fd int32, tid uint32) {
 		// PG cleanup on close: skip noise spans from auth or admin messages.
 		if ss.protocol == "postgres" {
 			if !ss.pgReady {
-				// Auth never completed — discard if no query found
 				queryStart := findPgQueryStart(s.sendBuf)
 				if queryStart < 0 {
 					s.mu.Unlock()
@@ -289,13 +326,47 @@ func (r *Reassembler) RemoveStream(pid uint32, fd int32, tid uint32) {
 			}
 		}
 
+		// MySQL cleanup on close: skip handshake or QUIT leftovers.
+		if ss.protocol == "mysql" {
+			if !ss.mysqlReady {
+				queryStart := findMySQLQueryStart(s.sendBuf)
+				if queryStart < 0 {
+					s.mu.Unlock()
+					return
+				}
+				s.sendBuf = s.sendBuf[queryStart:]
+				skipLen := skipMySQLHandshake(s.recvBuf)
+				s.recvBuf = s.recvBuf[skipLen:]
+				ss.mysqlReady = true
+				if len(s.sendBuf) == 0 {
+					s.mu.Unlock()
+					return
+				}
+			} else if len(s.sendBuf) >= 5 {
+				cmd := s.sendBuf[4]
+				if cmd == 0x01 { // COM_QUIT — not useful
+					s.mu.Unlock()
+					return
+				}
+			}
+		}
+
 		duration := s.lastRecv.Sub(s.lastSend)
 		if duration <= 0 {
 			duration = time.Since(s.lastSend)
 		}
+		// Use lastTID (set by AppendSend = request direction) instead of the
+		// close event's tid. The close() syscall may execute on a different OS
+		// thread than the read() syscall (goroutine migration in Go servers).
+		// threadCtx in agent.go is keyed by the read event's TID, so the pair
+		// must use that TID for enrichPairContext to find the correct context.
+		pairTID := ss.lastTID.Load()
+		if pairTID == 0 {
+			pairTID = tid // fallback if no data was sent
+		}
 		pair := &RequestPair{
 			PID:         s.PID,
-			TID:         tid,
+			TID:         pairTID,
 			FD:          s.FD,
 			RemoteAddr:  s.RemoteAddr,
 			RemotePort:  s.RemotePort,
@@ -724,6 +795,57 @@ func skipPgAuthRecv(buf []byte) int {
 	return offset
 }
 
+// findMySQLQueryStart scans a MySQL send buffer for the first COM_* command
+// packet (seq=0 + valid command byte), skipping auth handshake packets.
+// Returns the byte offset where the command starts, or -1 if not found.
+func findMySQLQueryStart(buf []byte) int {
+	offset := 0
+	for offset+5 <= len(buf) {
+		pktLen := int(buf[offset]) | int(buf[offset+1])<<8 | int(buf[offset+2])<<16
+		totalLen := 4 + pktLen
+		if pktLen <= 0 || totalLen > len(buf) {
+			return -1 // incomplete
+		}
+		seqID := buf[offset+3]
+		// COM_* commands always start a new sequence (seq=0)
+		if seqID == 0 && pktLen >= 1 {
+			cmd := buf[offset+4]
+			if cmd == 0x03 || cmd == 0x16 || cmd == 0x17 || cmd == 0x19 ||
+				cmd == 0x02 || cmd == 0x0e || cmd == 0x01 || cmd == 0x0a {
+				return offset
+			}
+		}
+		offset += totalLen
+	}
+	return -1
+}
+
+// skipMySQLHandshake consumes MySQL handshake response packets from recvBuf:
+// server greeting (0x0a), OK (0x00), ERR (0xff), EOF/AuthSwitch (0xfe).
+// Returns the number of bytes to skip.
+func skipMySQLHandshake(buf []byte) int {
+	offset := 0
+	for offset+4 < len(buf) {
+		pktLen := int(buf[offset]) | int(buf[offset+1])<<8 | int(buf[offset+2])<<16
+		totalLen := 4 + pktLen
+		if pktLen <= 0 || totalLen > len(buf) {
+			break
+		}
+		// Check payload first byte for handshake message types
+		payloadType := buf[offset+4]
+		switch payloadType {
+		case 0x0a: // Server greeting
+		case 0x00: // OK packet
+		case 0xff: // ERR packet
+		case 0xfe: // EOF / AuthSwitch
+		default:
+			return offset // non-handshake: result set or other data
+		}
+		offset += totalLen
+	}
+	return offset
+}
+
 // frameMySQL finds the boundary of one MySQL packet.
 func frameMySQL(buf []byte) int {
 	if len(buf) < 4 {
@@ -824,7 +946,13 @@ func frameRESPArrayWithDepth(buf []byte, depth int) int {
 	return offset
 }
 
+// ebpfMaxCapture is the maximum bytes captured per eBPF event (MAX_CAPTURE in olly.bpf.c).
+// MongoDB/MySQL messages larger than this are truncated in the ring buffer.
+const ebpfMaxCapture = 256
+
 // frameMongoDB finds the boundary of one MongoDB wire protocol message.
+// Handles eBPF truncation: when msgLen > buffer but the message was truncated
+// by MAX_CAPTURE, uses the available data rather than waiting forever.
 func frameMongoDB(buf []byte) int {
 	if len(buf) < 16 {
 		return 0
@@ -837,10 +965,46 @@ func frameMongoDB(buf []byte) int {
 		return len(buf) // malformed, consume all
 	}
 
-	if msgLen > len(buf) {
-		return 0
+	if msgLen <= len(buf) {
+		return msgLen // complete message
 	}
-	return msgLen
+
+	// msgLen > len(buf): message may be truncated by eBPF MAX_CAPTURE.
+	// Each sendto() sends one MongoDB message; eBPF captures up to 256 bytes.
+	// If msgLen exceeds MAX_CAPTURE, we'll never get the rest — use what we have.
+	// Verify with opCode check to avoid consuming garbage.
+	if msgLen > ebpfMaxCapture && len(buf) >= 21 {
+		opCode := int(buf[12]) | int(buf[13])<<8 | int(buf[14])<<16 | int(buf[15])<<24
+		if opCode == 2013 || opCode == 2004 || opCode == 1 {
+			// Truncated eBPF event. Consume up to MAX_CAPTURE bytes for this message.
+			// If buffer has more (from subsequent events), find the boundary.
+			if len(buf) <= ebpfMaxCapture {
+				return len(buf)
+			}
+			// Multiple events in buffer: scan for next valid MongoDB header
+			// starting near MAX_CAPTURE boundary.
+			for i := ebpfMaxCapture - 4; i <= ebpfMaxCapture+4 && i+16 <= len(buf); i++ {
+				if i < 16 {
+					continue
+				}
+				nl := int(buf[i]) | int(buf[i+1])<<8 | int(buf[i+2])<<16 | int(buf[i+3])<<24
+				if nl < 16 || nl > 48*1024*1024 {
+					continue
+				}
+				no := int(buf[i+12]) | int(buf[i+13])<<8 | int(buf[i+14])<<16 | int(buf[i+15])<<24
+				if no == 2013 || no == 2004 || no == 1 {
+					return i
+				}
+			}
+			// No next header found; use MAX_CAPTURE as boundary
+			if len(buf) >= ebpfMaxCapture {
+				return ebpfMaxCapture
+			}
+			return len(buf)
+		}
+	}
+
+	return 0 // wait for more data
 }
 
 // frameDNS finds the boundary of one DNS message.

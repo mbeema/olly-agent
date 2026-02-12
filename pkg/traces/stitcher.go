@@ -43,10 +43,13 @@ type Stitcher struct {
 
 // pendingSpan is a span waiting for its matching counterpart.
 type pendingSpan struct {
-	span      *Span
-	method    string // HTTP method for matching
-	path      string // URL path for matching
-	createdAt time.Time
+	span       *Span
+	method     string // HTTP method (or gRPC rpc.method) for matching
+	path       string // URL path (or gRPC rpc.service) for matching
+	query      string // URL query string for disambiguation at scale
+	statusCode string // HTTP response status code for disambiguation
+	pid        uint32 // Process ID for same-process filtering
+	createdAt  time.Time
 }
 
 // maxPendingSpans caps the total number of pending spans to prevent unbounded
@@ -102,24 +105,57 @@ func (s *Stitcher) ProcessSpan(span *Span) bool {
 // then stores for future SERVER matching if no match found.
 // Returns true if the span was stored (deferred) for future matching.
 func (s *Stitcher) processClientSpan(span *Span) bool {
+	// Only stitch HTTP/gRPC CLIENT spans. DB/Redis/MongoDB CLIENT spans
+	// connect to unmonitored services — no matching SERVER span will arrive.
+	if span.Protocol != "http" && span.Protocol != "grpc" {
+		return false
+	}
+
+	// Skip if the span already has proper cross-service linking via traceparent.
+	// Two cases: (a) "traceparent" — extracted from HTTP headers in the request data,
+	// (b) "injected" — CLIENT span whose spanID was set by sk_msg traceparent injection.
+	// In both cases, the CLIENT→SERVER link is already established and stitching
+	// would only cause false matches or unnecessary deferral.
+	traceSource := span.Attributes["olly.trace_source"]
+	if span.ParentSpanID != "" && (traceSource == "traceparent" || traceSource == "injected") {
+		return false
+	}
+
+	// PID=0 means unknown process — can't determine cross-process vs same-process.
+	if span.PID == 0 {
+		return false
+	}
+
 	if span.RemoteAddr == "" || span.RemotePort == 0 {
 		return false
 	}
 
-	method := span.Attributes["http.request.method"]
-	path := span.Attributes["url.path"]
+	mk := extractMatchKey(span)
+
+	// Require at least a method for matching — without it, matching
+	// degrades to timestamp-only which has high false-positive risk.
+	if mk.method == "" {
+		return false
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Try to match against pending SERVER spans
+	// Try to match against pending SERVER spans.
+	// Track match count to detect ambiguity at high volume.
 	var bestMatch *pendingSpan
 	var bestKey string
 	var bestIdx int
 	bestTimeDiff := s.window
+	matchCount := 0
 
 	for key, spans := range s.pendingServers {
 		for i, ps := range spans {
+			// Skip same-process spans — intra-process linking is
+			// handled by thread context in enrichPairContext.
+			if ps.pid == span.PID {
+				continue
+			}
 			timeDiff := span.StartTime.Sub(ps.span.StartTime)
 			if timeDiff < 0 {
 				timeDiff = -timeDiff
@@ -127,12 +163,22 @@ func (s *Stitcher) processClientSpan(span *Span) bool {
 			if timeDiff > s.window {
 				continue
 			}
-			if method != "" && ps.method != "" && method != ps.method {
+			// Method must match (both guaranteed non-empty by guards).
+			if mk.method != ps.method {
 				continue
 			}
-			if path != "" && ps.path != "" && path != ps.path {
+			if mk.path != "" && ps.path != "" && mk.path != ps.path {
 				continue
 			}
+			// Query string disambiguation: /orders?id=123 vs /orders?id=456
+			if mk.query != "" && ps.query != "" && mk.query != ps.query {
+				continue
+			}
+			// Response status code: 200 vs 404 for same endpoint
+			if mk.statusCode != "" && ps.statusCode != "" && mk.statusCode != ps.statusCode {
+				continue
+			}
+			matchCount++
 			if timeDiff < bestTimeDiff {
 				bestMatch = ps
 				bestKey = key
@@ -143,6 +189,21 @@ func (s *Stitcher) processClientSpan(span *Span) bool {
 	}
 
 	if bestMatch != nil {
+		// Ambiguity guard: if multiple candidates passed all filters,
+		// don't stitch — we can't confidently pick the right one.
+		// At millions of TPS, false negatives (unlinked traces) are
+		// acceptable; false positives (wrong trace links) are not.
+		// traceparent injection handles these cases deterministically.
+		if matchCount > 1 {
+			s.logger.Debug("skipping ambiguous stitch (client→server)",
+				zap.Int("candidates", matchCount),
+				zap.String("method", mk.method),
+				zap.String("path", mk.path),
+			)
+			// Still store for future single-candidate matching.
+			goto store
+		}
+
 		// Stitch: CLIENT adopts SERVER's traceID (preserving the SERVER's
 		// intra-process children which share that traceID), and SERVER
 		// gets CLIENT as parent for the cross-service hierarchy.
@@ -157,8 +218,8 @@ func (s *Stitcher) processClientSpan(span *Span) bool {
 			zap.String("trace_id", span.TraceID),
 			zap.String("client_span", span.SpanID),
 			zap.String("server_span", bestMatch.span.SpanID),
-			zap.String("method", method),
-			zap.String("path", path),
+			zap.String("method", mk.method),
+			zap.String("path", mk.path),
 		)
 
 		// Remove matched SERVER span
@@ -174,7 +235,8 @@ func (s *Stitcher) processClientSpan(span *Span) bool {
 		return false // matched in-place, caller should export
 	}
 
-	// No SERVER match found — store a clone for future matching (with cap).
+store:
+	// No unambiguous match — store a clone for future matching (with cap).
 	// H1 fix: clone prevents mutation of the original span in the export pipeline.
 	// Return true to tell caller NOT to export — the stitcher owns this span now.
 	// It will be re-exported via OnStitchedSpan callback when matched, or
@@ -182,10 +244,13 @@ func (s *Stitcher) processClientSpan(span *Span) bool {
 	if s.pendingCount() < maxPendingSpans {
 		key := fmt.Sprintf("%s:%d", span.RemoteAddr, span.RemotePort)
 		ps := &pendingSpan{
-			span:      cloneSpan(span),
-			method:    method,
-			path:      path,
-			createdAt: time.Now(),
+			span:       cloneSpan(span),
+			method:     mk.method,
+			path:       mk.path,
+			query:      mk.query,
+			statusCode: mk.statusCode,
+			pid:        span.PID,
+			createdAt:  time.Now(),
 		}
 		s.pendingClients[key] = append(s.pendingClients[key], ps)
 		return true // deferred — do NOT export
@@ -196,6 +261,16 @@ func (s *Stitcher) processClientSpan(span *Span) bool {
 // processServerSpan first tries to match against pending CLIENT spans,
 // then stores for future CLIENT matching if no match found.
 func (s *Stitcher) processServerSpan(span *Span) bool {
+	// Only stitch HTTP/gRPC SERVER spans (symmetric with client filter).
+	if span.Protocol != "http" && span.Protocol != "grpc" {
+		return false
+	}
+
+	// PID=0 means unknown process — can't determine cross-process vs same-process.
+	if span.PID == 0 {
+		return false
+	}
+
 	// Skip if the span already has a parent from traceparent header injection.
 	// Spans with parent from intra-process thread context (no olly.trace_source)
 	// should still be stitchable to unify trace IDs with upstream CLIENT spans.
@@ -206,17 +281,29 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	serverMethod := span.Attributes["http.request.method"]
-	serverPath := span.Attributes["url.path"]
+	mk := extractMatchKey(span)
 
-	// Try to match against pending CLIENT spans
+	// Require at least a method for matching — without it, matching
+	// degrades to timestamp-only which has high false-positive risk.
+	if mk.method == "" {
+		return false
+	}
+
+	// Try to match against pending CLIENT spans.
+	// Track match count to detect ambiguity at high volume.
 	var bestMatch *pendingSpan
 	var bestKey string
 	var bestIdx int
 	bestTimeDiff := s.window
+	matchCount := 0
 
 	for key, spans := range s.pendingClients {
 		for i, ps := range spans {
+			// Skip same-process spans — intra-process linking is
+			// handled by thread context in enrichPairContext.
+			if ps.pid == span.PID {
+				continue
+			}
 			timeDiff := span.StartTime.Sub(ps.span.StartTime)
 			if timeDiff < 0 {
 				timeDiff = -timeDiff
@@ -224,12 +311,22 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 			if timeDiff > s.window {
 				continue
 			}
-			if serverMethod != "" && ps.method != "" && serverMethod != ps.method {
+			// Method must match (both guaranteed non-empty by guards).
+			if mk.method != ps.method {
 				continue
 			}
-			if serverPath != "" && ps.path != "" && serverPath != ps.path {
+			if mk.path != "" && ps.path != "" && mk.path != ps.path {
 				continue
 			}
+			// Query string disambiguation: /orders?id=123 vs /orders?id=456
+			if mk.query != "" && ps.query != "" && mk.query != ps.query {
+				continue
+			}
+			// Response status code: 200 vs 404 for same endpoint
+			if mk.statusCode != "" && ps.statusCode != "" && mk.statusCode != ps.statusCode {
+				continue
+			}
+			matchCount++
 			if timeDiff < bestTimeDiff {
 				bestMatch = ps
 				bestKey = key
@@ -240,6 +337,18 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 	}
 
 	if bestMatch != nil {
+		// Ambiguity guard: if multiple candidates passed all filters,
+		// don't stitch — we can't confidently pick the right one.
+		if matchCount > 1 {
+			s.logger.Debug("skipping ambiguous stitch (server←client)",
+				zap.Int("candidates", matchCount),
+				zap.String("method", mk.method),
+				zap.String("path", mk.path),
+			)
+			// Store SERVER for future single-candidate matching.
+			goto storeServer
+		}
+
 		// Stitch: CLIENT adopts SERVER's traceID (preserving the SERVER's
 		// intra-process children which share that traceID), and SERVER
 		// gets CLIENT as parent for the cross-service hierarchy.
@@ -255,8 +364,8 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 			zap.String("trace_id", span.TraceID),
 			zap.String("client_span", bestMatch.span.SpanID),
 			zap.String("server_span", span.SpanID),
-			zap.String("method", serverMethod),
-			zap.String("path", serverPath),
+			zap.String("method", mk.method),
+			zap.String("path", mk.path),
 		)
 
 		// Remove the matched CLIENT span
@@ -273,22 +382,52 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 		return false // matched in-place, caller should export
 	}
 
-	// No CLIENT match found — store a clone for future matching (with cap).
+storeServer:
+	// No unambiguous match — store a clone for future matching (with cap).
 	// H1 fix: clone prevents mutation of the original span in the export pipeline.
 	// SERVER spans are NOT deferred — they're exported immediately because
 	// they carry intra-process children (DB queries, outbound calls) that
 	// share the same traceID. Deferring would delay the entire trace subtree.
 	if s.pendingCount() < maxPendingSpans {
-		key := fmt.Sprintf("server:%s:%s", serverMethod, serverPath)
+		key := fmt.Sprintf("server:%s:%s", mk.method, mk.path)
 		ps := &pendingSpan{
-			span:      cloneSpan(span),
-			method:    serverMethod,
-			path:      serverPath,
-			createdAt: time.Now(),
+			span:       cloneSpan(span),
+			method:     mk.method,
+			path:       mk.path,
+			query:      mk.query,
+			statusCode: mk.statusCode,
+			pid:        span.PID,
+			createdAt:  time.Now(),
 		}
 		s.pendingServers[key] = append(s.pendingServers[key], ps)
 	}
 	return false // SERVER is never deferred
+}
+
+// matchKey holds all fields used for span matching.
+type matchKey struct {
+	method     string
+	path       string
+	query      string
+	statusCode string
+}
+
+// extractMatchKey returns matching fields from a span's attributes.
+// For HTTP: uses method, path, query string, and response status code.
+// For gRPC: uses rpc.method and rpc.service.
+func extractMatchKey(span *Span) matchKey {
+	if span.Protocol == "grpc" {
+		return matchKey{
+			method: span.Attributes["rpc.method"],
+			path:   span.Attributes["rpc.service"],
+		}
+	}
+	return matchKey{
+		method:     span.Attributes["http.request.method"],
+		path:       span.Attributes["url.path"],
+		query:      span.Attributes["url.query"],
+		statusCode: span.Attributes["http.response.status_code"],
+	}
 }
 
 // cloneSpan creates a shallow copy of a span with a new Attributes map.

@@ -325,22 +325,36 @@ func (a *Agent) Start(ctx context.Context) error {
 							zap.Uint16("port", remotePort))
 					}
 
-					// Priority 2: Check BPF-generated trace context.
-					// BPF generates context synchronously in kretprobe_read,
-					// extracting traceID from incoming traceparent or generating random.
+					// Priority 2: Check event-embedded BPF trace context (race-free).
+					// BPF embeds trace context directly in the ring buffer event,
+					// eliminating the map read race where BPF overwrites before Go reads.
+					if tctx.TraceID == "" {
+						if etp, ok := a.hookProvider.(hook.EventTraceProvider); ok {
+							if evtTraceID, evtSpanID, evtOK := etp.GetEventTraceContext(pid, tid); evtOK {
+								tctx.TraceID = evtTraceID
+								tctx.SpanID = evtSpanID
+								a.logger.Debug("using event-embedded BPF trace context",
+									zap.Uint32("pid", pid), zap.Uint32("tid", tid),
+									zap.String("traceID", evtTraceID))
+							}
+						}
+					}
+
+					// Priority 3: Fall back to BPF map read (backward compat).
+					// Only used if event-embedded context is not available.
 					if tctx.TraceID == "" {
 						if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
 							if bpfTraceID, bpfSpanID, bpfOK := injector.GetTraceContext(pid, tid); bpfOK {
 								tctx.TraceID = bpfTraceID
 								tctx.SpanID = bpfSpanID
-								a.logger.Debug("using BPF-generated trace context",
+								a.logger.Debug("using BPF map trace context (fallback)",
 									zap.Uint32("pid", pid), zap.Uint32("tid", tid),
 									zap.String("traceID", bpfTraceID))
 							}
 						}
 					}
 
-					// Priority 3: Generate new trace ID
+					// Priority 4: Generate new trace ID
 					if tctx.TraceID == "" {
 						tctx.TraceID = traces.GenerateTraceID()
 					}
@@ -354,12 +368,12 @@ func (a *Agent) Start(ctx context.Context) error {
 					tctx.ServerSpanID = traces.GenerateSpanID()
 					a.threadCtx.Store(ctxKey, tctx)
 
-					// Populate BPF trace context for sk_msg injection.
-					// If BPF already generated it, this overwrites with the
-					// same trace ID (agent may have generated a different spanID).
-					if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
-						injector.SetTraceContext(pid, tid, tctx.TraceID, tctx.SpanID)
-					}
+					// NOTE: SetTraceContext removed to fix race condition #3.
+					// BPF generates trace context in kretprobe_read and stores it
+					// in thread_trace_ctx map. Go no longer writes back to BPF,
+					// eliminating the race where Go's SetTraceContext overwrites
+					// BPF's freshly-generated context for the NEXT request.
+					// sk_msg reads directly from BPF's thread_trace_ctx map.
 				}
 				a.reassembler.AppendSend(pid, tid, fd, data, remoteAddr, remotePort, false)
 				a.reassembler.SetDirection(pid, fd, 1) // 1=inbound; set after AppendSend creates the stream
@@ -681,8 +695,13 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 		}
 	} else {
 		// Outbound CLIENT span: pass the sk_msg-injected spanID so the
-		// CLIENT span uses it as its own spanID (matching what downstream sees)
-		pair.InjectedSpanID = tctx.SpanID
+		// CLIENT span uses it as its own spanID (matching what downstream sees).
+		// Only for HTTP/gRPC: sk_msg only injects traceparent into HTTP traffic.
+		// DB/Redis/MongoDB CLIENT spans should get unique generated spanIDs,
+		// not the injected spanID (which would cause duplicate spanIDs).
+		if pair.Protocol == "http" || pair.Protocol == "grpc" {
+			pair.InjectedSpanID = tctx.SpanID
+		}
 	}
 }
 

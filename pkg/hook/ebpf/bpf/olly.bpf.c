@@ -42,7 +42,8 @@
 
 struct olly_event {
     __u8  event_type;
-    __u8  _pad[3];
+    __u8  has_trace_ctx;  // 1 if trace_id/span_id are populated
+    __u8  _pad[2];
     __u32 pid;
     __u32 tid;
     __s32 fd;
@@ -54,6 +55,8 @@ struct olly_event {
     __u16 remote_port;    // port in host byte order
     __u8  direction;      // DIR_OUTBOUND or DIR_INBOUND
     __u8  _pad2;
+    __u8  trace_id[32];   // hex-encoded trace ID from BPF-generated context
+    __u8  span_id[16];    // hex-encoded span ID from BPF-generated context
     __u8  payload[MAX_CAPTURE]; // variable-length in ring buffer
 };
 
@@ -365,6 +368,15 @@ static __always_inline __s32 find_traceparent(const __u8 *payload, __u32 len) {
     return -1;
 }
 
+// trace_result carries BPF-generated trace context back to the caller
+// for embedding directly into the ring buffer event. This eliminates
+// the race where Go reads from the BPF map after it's been overwritten.
+struct trace_result {
+    __u8  generated;      // 1 if trace context was generated
+    __u8  trace_id[32];   // hex-encoded trace ID
+    __u8  span_id[16];    // hex-encoded span ID
+};
+
 // maybe_generate_trace_ctx checks if this is an HTTP request on an inbound
 // connection and generates/extracts a traceparent header for the BPF map.
 //
@@ -374,9 +386,13 @@ static __always_inline __s32 find_traceparent(const __u8 *payload, __u32 len) {
 //
 // If no traceparent is present, a fully random trace ID + span ID are generated.
 //
+// The generated trace context is returned via trace_result for embedding
+// directly in the ring buffer event, eliminating BPF map read races.
+//
 // Called from kretprobe_read/kretprobe_recvfrom after reading payload.
 static __always_inline void maybe_generate_trace_ctx(
-    __u32 pid, __u32 tid, __s32 fd, const __u8 payload[MAX_CAPTURE], __u32 len)
+    __u32 pid, __u32 tid, __s32 fd, const __u8 payload[MAX_CAPTURE], __u32 len,
+    struct trace_result *result)
 {
     // Only for inbound connections
     struct conn_key ckey = {.pid = pid, .fd = fd};
@@ -384,11 +400,10 @@ static __always_inline void maybe_generate_trace_ctx(
     if (!cval || cval->dir != DIR_INBOUND)
         return;
 
-    // Check if trace context already exists for this thread
+    // Always generate fresh context for each new HTTP request.
+    // The old validity guard (checking existing->valid) caused stale context
+    // reuse when Go's ClearTraceContext hadn't run yet.
     struct thread_key tkey = {.pid = pid, .tid = tid};
-    struct trace_ctx *existing = bpf_map_lookup_elem(&thread_trace_ctx, &tkey);
-    if (existing && existing->valid)
-        return;  // already have context for this thread
 
     // Need at least 4 bytes to check HTTP method
     if (len < 4)
@@ -464,12 +479,27 @@ static __always_inline void maybe_generate_trace_ctx(
     tctx.header_len = 70;
 
     bpf_map_update_elem(&thread_trace_ctx, &tkey, &tctx, BPF_ANY);
+
+    // Return trace context via result for embedding in ring buffer event.
+    // trace_id is at h[16..48], span_id is at h[49..65].
+    if (result) {
+        result->generated = 1;
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 32; j++)
+            result->trace_id[j] = (__u8)h[16 + j];
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 16; j++)
+            result->span_id[j] = (__u8)h[49 + j];
+    }
 }
 
-// emit_data_event sends a DATA_IN or DATA_OUT event to the ring buffer.
-static __always_inline int emit_data_event(__u8 event_type, __u32 pid,
-                                           __u32 tid, __s32 fd,
-                                           const void *buf, __u32 len) {
+// emit_data_event_ex sends a DATA_IN or DATA_OUT event to the ring buffer,
+// optionally embedding BPF-generated trace context directly in the event.
+// This eliminates the race where Go reads from the BPF map after overwrite.
+static __always_inline int emit_data_event_ex(__u8 event_type, __u32 pid,
+                                              __u32 tid, __s32 fd,
+                                              const void *buf, __u32 len,
+                                              struct trace_result *trace) {
     __u32 capture = len;
     if (capture > MAX_CAPTURE)
         capture = MAX_CAPTURE;
@@ -490,12 +520,30 @@ static __always_inline int emit_data_event(__u8 event_type, __u32 pid,
     e->remote_port = 0;
     e->direction = 0;
 
+    // Embed trace context if available
+    if (trace && trace->generated) {
+        e->has_trace_ctx = 1;
+        __builtin_memcpy(e->trace_id, trace->trace_id, 32);
+        __builtin_memcpy(e->span_id, trace->span_id, 16);
+    } else {
+        e->has_trace_ctx = 0;
+        __builtin_memset(e->trace_id, 0, 32);
+        __builtin_memset(e->span_id, 0, 16);
+    }
+
     if (capture > 0) {
         bpf_probe_read_user(e->payload, capture & (MAX_CAPTURE - 1 | MAX_CAPTURE), buf);
     }
 
     bpf_ringbuf_submit(e, 0);
     return 0;
+}
+
+// emit_data_event sends a DATA_IN or DATA_OUT event without trace context.
+static __always_inline int emit_data_event(__u8 event_type, __u32 pid,
+                                           __u32 tid, __s32 fd,
+                                           const void *buf, __u32 len) {
+    return emit_data_event_ex(event_type, pid, tid, fd, buf, len, NULL);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -562,6 +610,7 @@ int BPF_KRETPROBE(kretprobe_connect, int ret) {
     if (!e) return 0;
 
     e->event_type = EVENT_CONNECT;
+    e->has_trace_ctx = 0;
     e->pid = pid;
     e->tid = tid;
     e->fd = fd;
@@ -571,6 +620,8 @@ int BPF_KRETPROBE(kretprobe_connect, int ret) {
     e->remote_addr = ainfo.addr;
     e->remote_port = ainfo.port;
     e->direction = DIR_OUTBOUND;
+    __builtin_memset(e->trace_id, 0, 32);
+    __builtin_memset(e->span_id, 0, 16);
 
     bpf_ringbuf_submit(e, 0);
     return 0;
@@ -635,6 +686,7 @@ int BPF_KRETPROBE(kretprobe_accept4, int ret) {
     if (!e) return 0;
 
     e->event_type = EVENT_ACCEPT;
+    e->has_trace_ctx = 0;
     e->pid = pid;
     e->tid = tid;
     e->fd = new_fd;
@@ -644,6 +696,8 @@ int BPF_KRETPROBE(kretprobe_accept4, int ret) {
     e->remote_addr = ainfo.addr;
     e->remote_port = ainfo.port;
     e->direction = DIR_INBOUND;
+    __builtin_memset(e->trace_id, 0, 32);
+    __builtin_memset(e->span_id, 0, 16);
 
     bpf_ringbuf_submit(e, 0);
     return 0;
@@ -703,6 +757,7 @@ int BPF_KRETPROBE(kretprobe_accept, int ret) {
     if (!e) return 0;
 
     e->event_type = EVENT_ACCEPT;
+    e->has_trace_ctx = 0;
     e->pid = pid;
     e->tid = tid;
     e->fd = new_fd;
@@ -712,6 +767,8 @@ int BPF_KRETPROBE(kretprobe_accept, int ret) {
     e->remote_addr = ainfo.addr;
     e->remote_port = ainfo.port;
     e->direction = DIR_INBOUND;
+    __builtin_memset(e->trace_id, 0, 32);
+    __builtin_memset(e->span_id, 0, 16);
 
     bpf_ringbuf_submit(e, 0);
     return 0;
@@ -828,15 +885,18 @@ int BPF_KRETPROBE(kretprobe_read, ssize_t ret) {
 
     // BPF-side trace context generation: read first bytes to check for HTTP
     // on inbound connections, and generate traceparent immediately.
+    // The trace_result is embedded directly in the ring buffer event to
+    // eliminate the race between BPF map writes and Go's async reads.
+    struct trace_result trace = {};
     __u8 peek[MAX_CAPTURE];
     __u32 peek_len = (__u32)ret;
     if (peek_len > MAX_CAPTURE)
         peek_len = MAX_CAPTURE;
     if (bpf_probe_read_user(peek, peek_len & (MAX_CAPTURE - 1 | MAX_CAPTURE), buf) == 0) {
-        maybe_generate_trace_ctx(pid, tid, fd, peek, peek_len);
+        maybe_generate_trace_ctx(pid, tid, fd, peek, peek_len, &trace);
     }
 
-    return emit_data_event(EVENT_DATA_IN, pid, tid, fd, buf, (__u32)ret);
+    return emit_data_event_ex(EVENT_DATA_IN, pid, tid, fd, buf, (__u32)ret, &trace);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -887,15 +947,16 @@ int BPF_KRETPROBE(kretprobe_recvfrom, ssize_t ret) {
     __u32 tid = (__u32)pid_tgid;
 
     // BPF-side trace context generation for recvfrom
+    struct trace_result trace = {};
     __u8 peek[MAX_CAPTURE];
     __u32 peek_len = (__u32)ret;
     if (peek_len > MAX_CAPTURE)
         peek_len = MAX_CAPTURE;
     if (bpf_probe_read_user(peek, peek_len & (MAX_CAPTURE - 1 | MAX_CAPTURE), buf) == 0) {
-        maybe_generate_trace_ctx(pid, tid, fd, peek, peek_len);
+        maybe_generate_trace_ctx(pid, tid, fd, peek, peek_len, &trace);
     }
 
-    return emit_data_event(EVENT_DATA_IN, pid, tid, fd, buf, (__u32)ret);
+    return emit_data_event_ex(EVENT_DATA_IN, pid, tid, fd, buf, (__u32)ret, &trace);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -930,6 +991,7 @@ int BPF_KPROBE(kprobe_close, struct pt_regs *regs) {
     if (!e) return 0;
 
     e->event_type = EVENT_CLOSE;
+    e->has_trace_ctx = 0;
     e->pid = pid;
     e->tid = tid;
     e->fd = fd;
@@ -939,6 +1001,8 @@ int BPF_KPROBE(kprobe_close, struct pt_regs *regs) {
     e->remote_addr = 0;
     e->remote_port = 0;
     e->direction = 0;
+    __builtin_memset(e->trace_id, 0, 32);
+    __builtin_memset(e->span_id, 0, 16);
 
     bpf_ringbuf_submit(e, 0);
     return 0;
@@ -1064,6 +1128,7 @@ int tracepoint_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx
     if (!e) return 0;
 
     e->event_type = EVENT_CONNECT;
+    e->has_trace_ctx = 0;
     e->pid = pid;
     e->tid = tid;
     e->fd = -1; // sentinel: not a real fd
@@ -1073,6 +1138,8 @@ int tracepoint_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx
     e->remote_addr = 0;
     e->remote_port = 0;
     e->direction = 0;
+    __builtin_memset(e->trace_id, 0, 32);
+    __builtin_memset(e->span_id, 0, 16);
 
     bpf_ringbuf_submit(e, 0);
     return 0;
@@ -1123,7 +1190,7 @@ int olly_sockops(struct bpf_sock_ops *skops) {
         return 1; // unsupported family
     }
 
-    int ret = bpf_sock_hash_update(skops, &sock_ops_map, &key, BPF_NOEXIST);
+    bpf_sock_hash_update(skops, &sock_ops_map, &key, BPF_NOEXIST);
     return 1;
 }
 

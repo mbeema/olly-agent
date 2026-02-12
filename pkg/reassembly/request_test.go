@@ -500,6 +500,153 @@ func TestSkipPgAuthRecv_ParameterStatusS_NotSSLByte(t *testing.T) {
 	}
 }
 
+// buildMySQLPacket builds a MySQL wire protocol packet: 3-byte len + 1-byte seq + payload.
+func buildMySQLPacket(seqID byte, payload []byte) []byte {
+	pkt := make([]byte, 4+len(payload))
+	pkt[0] = byte(len(payload))
+	pkt[1] = byte(len(payload) >> 8)
+	pkt[2] = byte(len(payload) >> 16)
+	pkt[3] = seqID
+	copy(pkt[4:], payload)
+	return pkt
+}
+
+// buildMySQLGreeting builds a minimal MySQL server greeting packet.
+func buildMySQLGreeting() []byte {
+	payload := make([]byte, 0, 64)
+	payload = append(payload, 0x0a)                       // protocol version 10
+	payload = append(payload, []byte("5.7.42-log")...)    // server version
+	payload = append(payload, 0)                          // null terminator
+	payload = append(payload, 1, 0, 0, 0)                // thread id
+	payload = append(payload, []byte("abcdefgh")...)      // auth plugin data part 1
+	payload = append(payload, 0)                          // filler
+	payload = append(payload, 0xff, 0xf7)                // capabilities lower
+	payload = append(payload, 0x21)                       // charset
+	payload = append(payload, 0x02, 0x00)                // status flags
+	payload = append(payload, 0x7f, 0x80)                // capabilities upper
+	payload = append(payload, 0x15)                       // auth plugin data len
+	payload = append(payload, make([]byte, 10)...)        // reserved
+	payload = append(payload, []byte("ijklmnopqrst")...) // auth plugin data part 2
+	payload = append(payload, 0)                          // null terminator
+	return buildMySQLPacket(0, payload)
+}
+
+// buildMySQLOK builds a MySQL OK packet.
+func buildMySQLOK(seqID byte) []byte {
+	payload := []byte{0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00}
+	return buildMySQLPacket(seqID, payload)
+}
+
+// buildMySQLComQuery builds a MySQL COM_QUERY packet.
+func buildMySQLComQuery(sql string) []byte {
+	payload := append([]byte{0x03}, []byte(sql)...)
+	return buildMySQLPacket(0, payload)
+}
+
+func TestFindMySQLQueryStart_ComQuery(t *testing.T) {
+	pkt := buildMySQLComQuery("SELECT 1")
+	n := findMySQLQueryStart(pkt)
+	if n != 0 {
+		t.Errorf("findMySQLQueryStart for COM_QUERY = %d, want 0", n)
+	}
+}
+
+func TestFindMySQLQueryStart_AuthThenQuery(t *testing.T) {
+	// Auth response: seq=1, some capabilities payload
+	authResp := buildMySQLPacket(1, []byte{0x85, 0xa6, 0x3f, 0x20, 0x00, 0x00, 0x00, 0x01})
+	query := buildMySQLComQuery("SELECT 1")
+	buf := append(authResp, query...)
+
+	expected := len(authResp)
+	n := findMySQLQueryStart(buf)
+	if n != expected {
+		t.Errorf("findMySQLQueryStart auth+query = %d, want %d", n, expected)
+	}
+}
+
+func TestFindMySQLQueryStart_NoQuery(t *testing.T) {
+	authResp := buildMySQLPacket(1, []byte{0x85, 0xa6, 0x3f, 0x20})
+	n := findMySQLQueryStart(authResp)
+	if n != -1 {
+		t.Errorf("findMySQLQueryStart with no query = %d, want -1", n)
+	}
+}
+
+func TestSkipMySQLHandshake_GreetingAndOK(t *testing.T) {
+	greeting := buildMySQLGreeting()
+	ok := buildMySQLOK(2)
+	buf := append(greeting, ok...)
+
+	n := skipMySQLHandshake(buf)
+	if n != len(buf) {
+		t.Errorf("skipMySQLHandshake greeting+OK = %d, want %d", n, len(buf))
+	}
+}
+
+func TestSkipMySQLHandshake_StopsAtResultSet(t *testing.T) {
+	ok := buildMySQLOK(2)
+	// Result set column count: seq=1, payload=0x02 (2 columns) - not a handshake type
+	resultPkt := buildMySQLPacket(1, []byte{0x02})
+	buf := append(ok, resultPkt...)
+
+	n := skipMySQLHandshake(buf)
+	if n != len(ok) {
+		t.Errorf("skipMySQLHandshake should stop at result set: got %d, want %d", n, len(ok))
+	}
+}
+
+func TestMySQLReadyIntegration(t *testing.T) {
+	r := NewReassembler(zap.NewNop())
+
+	var pairs []*RequestPair
+	r.OnPair(func(p *RequestPair) {
+		pairs = append(pairs, p)
+	})
+
+	pid := uint32(100)
+	fd := int32(6)
+	tid := uint32(200)
+	addr := "127.0.0.1"
+	port := uint16(3306)
+
+	// Step 1: Server sends greeting
+	greeting := buildMySQLGreeting()
+	r.AppendRecv(pid, tid, fd, greeting, addr, port, false)
+
+	// Step 2: Client sends auth response
+	authResp := buildMySQLPacket(1, []byte{0x85, 0xa6, 0x3f, 0x20, 0x00, 0x00, 0x00, 0x01})
+	r.AppendSend(pid, tid, fd, authResp, addr, port, false)
+
+	// Step 3: Server sends OK
+	ok := buildMySQLOK(2)
+	r.AppendRecv(pid, tid, fd, ok, addr, port, false)
+
+	if len(pairs) != 0 {
+		t.Fatalf("expected 0 pairs during handshake, got %d", len(pairs))
+	}
+
+	// Step 4: Client sends COM_QUERY
+	query := buildMySQLComQuery("SELECT * FROM users")
+	r.AppendSend(pid, tid, fd, query, addr, port, false)
+
+	// Step 5: Server sends result (OK packet for simplicity)
+	result := buildMySQLOK(1)
+	r.AppendRecv(pid, tid, fd, result, addr, port, false)
+
+	if len(pairs) != 1 {
+		t.Fatalf("expected 1 pair after query, got %d", len(pairs))
+	}
+
+	pair := pairs[0]
+	if pair.Protocol != "mysql" {
+		t.Errorf("expected protocol mysql, got %s", pair.Protocol)
+	}
+	// Request should be the COM_QUERY packet
+	if len(pair.Request) < 5 || pair.Request[4] != 0x03 {
+		t.Errorf("expected COM_QUERY (0x03), got %v", pair.Request[:min(5, len(pair.Request))])
+	}
+}
+
 func TestPgReadyIntegration(t *testing.T) {
 	// Integration test: full PG lifecycle through reassembler
 	r := NewReassembler(zap.NewNop())
@@ -560,5 +707,45 @@ func TestPgReadyIntegration(t *testing.T) {
 	}
 	if len(pair.Request) == 0 || pair.Request[0] != 'Q' {
 		t.Errorf("expected request to start with 'Q', got %v", pair.Request[:min(5, len(pair.Request))])
+	}
+}
+
+func TestPairTID_UsesRequestNotResponseTID(t *testing.T) {
+	// Verify that pair.TID comes from AppendSend (request direction),
+	// not AppendRecv (response direction). This is critical for trace
+	// context matching: threadCtx is stored under the request's TID,
+	// so the pair must use that TID for enrichPairContext to find it.
+	// Go goroutines migrate between OS threads, so the response write
+	// often runs on a different TID than the request read.
+	r := NewReassembler(zap.NewNop())
+
+	var pairs []*RequestPair
+	r.OnPair(func(p *RequestPair) {
+		pairs = append(pairs, p)
+	})
+
+	pid := uint32(100)
+	sendTID := uint32(500) // request arrives on thread 500
+	recvTID := uint32(999) // response sent on thread 999 (goroutine migrated)
+	fd := int32(10)
+	addr := "10.0.0.1"
+	port := uint16(8080)
+
+	// Request arrives (AppendSend with sendTID)
+	req := []byte("GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	r.AppendSend(pid, sendTID, fd, req, addr, port, false)
+
+	// Response sent (AppendRecv with different recvTID — goroutine migrated)
+	resp := []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+	r.AppendRecv(pid, recvTID, fd, resp, addr, port, false)
+
+	if len(pairs) != 1 {
+		t.Fatalf("expected 1 pair, got %d", len(pairs))
+	}
+
+	// Pair must use sendTID (request direction), NOT recvTID
+	if pairs[0].TID != sendTID {
+		t.Errorf("pair.TID = %d, want %d (sendTID); got recvTID=%d instead",
+			pairs[0].TID, sendTID, recvTID)
 	}
 }

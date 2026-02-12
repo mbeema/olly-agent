@@ -111,10 +111,12 @@ func (p *MySQLParser) Parse(request, response []byte) (*SpanAttributes, error) {
 		case mysqlComPing:
 			attrs.DBOperation = "PING"
 			attrs.DBStatement = "PING"
+			attrs.Handshake = true
 
 		case mysqlComQuit:
 			attrs.DBOperation = "QUIT"
 			attrs.DBStatement = "QUIT"
+			attrs.Handshake = true
 		}
 	}
 
