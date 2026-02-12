@@ -80,24 +80,30 @@ func (s *Stitcher) OnStitchedSpan(fn func(*Span)) {
 // ProcessSpan examines a completed span for stitching opportunities.
 // Both CLIENT and SERVER spans are checked against stored counterparts,
 // and stored if no match is found.
-func (s *Stitcher) ProcessSpan(span *Span) {
+// Returns true if the span was deferred (stored for future matching).
+// Deferred spans should NOT be exported by the caller — the stitcher
+// will re-export them via the OnStitchedSpan callback when matched,
+// or via Cleanup when they expire unmatched.
+func (s *Stitcher) ProcessSpan(span *Span) bool {
 	if span == nil {
-		return
+		return false
 	}
 
 	switch span.Kind {
 	case SpanKindClient:
-		s.processClientSpan(span)
+		return s.processClientSpan(span)
 	case SpanKindServer:
-		s.processServerSpan(span)
+		return s.processServerSpan(span)
 	}
+	return false
 }
 
 // processClientSpan first tries to match against pending SERVER spans,
 // then stores for future SERVER matching if no match found.
-func (s *Stitcher) processClientSpan(span *Span) {
+// Returns true if the span was stored (deferred) for future matching.
+func (s *Stitcher) processClientSpan(span *Span) bool {
 	if span.RemoteAddr == "" || span.RemotePort == 0 {
-		return
+		return false
 	}
 
 	method := span.Attributes["http.request.method"]
@@ -165,11 +171,14 @@ func (s *Stitcher) processClientSpan(span *Span) {
 		for _, cb := range s.callbacks {
 			cb(bestMatch.span)
 		}
-		return
+		return false // matched in-place, caller should export
 	}
 
 	// No SERVER match found — store a clone for future matching (with cap).
 	// H1 fix: clone prevents mutation of the original span in the export pipeline.
+	// Return true to tell caller NOT to export — the stitcher owns this span now.
+	// It will be re-exported via OnStitchedSpan callback when matched, or
+	// via Cleanup when it expires unmatched.
 	if s.pendingCount() < maxPendingSpans {
 		key := fmt.Sprintf("%s:%d", span.RemoteAddr, span.RemotePort)
 		ps := &pendingSpan{
@@ -179,17 +188,19 @@ func (s *Stitcher) processClientSpan(span *Span) {
 			createdAt: time.Now(),
 		}
 		s.pendingClients[key] = append(s.pendingClients[key], ps)
+		return true // deferred — do NOT export
 	}
+	return false
 }
 
 // processServerSpan first tries to match against pending CLIENT spans,
 // then stores for future CLIENT matching if no match found.
-func (s *Stitcher) processServerSpan(span *Span) {
+func (s *Stitcher) processServerSpan(span *Span) bool {
 	// Skip if the span already has a parent from traceparent header injection.
 	// Spans with parent from intra-process thread context (no olly.trace_source)
 	// should still be stitchable to unify trace IDs with upstream CLIENT spans.
 	if span.ParentSpanID != "" && span.Attributes["olly.trace_source"] == "traceparent" {
-		return
+		return false
 	}
 
 	s.mu.Lock()
@@ -259,11 +270,14 @@ func (s *Stitcher) processServerSpan(span *Span) {
 		for _, cb := range s.callbacks {
 			cb(bestMatch.span)
 		}
-		return
+		return false // matched in-place, caller should export
 	}
 
 	// No CLIENT match found — store a clone for future matching (with cap).
 	// H1 fix: clone prevents mutation of the original span in the export pipeline.
+	// SERVER spans are NOT deferred — they're exported immediately because
+	// they carry intra-process children (DB queries, outbound calls) that
+	// share the same traceID. Deferring would delay the entire trace subtree.
 	if s.pendingCount() < maxPendingSpans {
 		key := fmt.Sprintf("server:%s:%s", serverMethod, serverPath)
 		ps := &pendingSpan{
@@ -274,6 +288,7 @@ func (s *Stitcher) processServerSpan(span *Span) {
 		}
 		s.pendingServers[key] = append(s.pendingServers[key], ps)
 	}
+	return false // SERVER is never deferred
 }
 
 // cloneSpan creates a shallow copy of a span with a new Attributes map.
@@ -304,12 +319,14 @@ func (s *Stitcher) pendingCount() int {
 }
 
 // Cleanup removes stale pending spans older than the window.
+// Expired CLIENT clones are exported via callbacks (they were deferred
+// from the normal export path to avoid orphaned duplicates).
 func (s *Stitcher) Cleanup() int {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	removed := 0
 	cutoff := time.Now().Add(-2 * s.window)
+	var expiredClients []*Span
 
 	for key, spans := range s.pendingClients {
 		kept := spans[:0]
@@ -317,6 +334,8 @@ func (s *Stitcher) Cleanup() int {
 			if ps.createdAt.After(cutoff) {
 				kept = append(kept, ps)
 			} else {
+				// CLIENT clones were deferred — export them now unmatched.
+				expiredClients = append(expiredClients, ps.span)
 				removed++
 			}
 		}
@@ -340,6 +359,18 @@ func (s *Stitcher) Cleanup() int {
 			delete(s.pendingServers, key)
 		} else {
 			s.pendingServers[key] = kept
+		}
+	}
+
+	// Must release lock before calling callbacks (they may call ExportSpan
+	// which eventually calls back into this stitcher on another goroutine).
+	cbs := s.callbacks
+	s.mu.Unlock()
+
+	// Export expired CLIENT clones so they don't get lost.
+	for _, span := range expiredClients {
+		for _, cb := range cbs {
+			cb(span)
 		}
 	}
 

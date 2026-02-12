@@ -411,6 +411,21 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	})
 
+	// Register stitcher callback to re-export counterpart spans.
+	// When the stitcher matches a CLIENT↔SERVER pair asynchronously (the
+	// counterpart arrived after the first span was already exported), the
+	// updated clone must be re-exported so Grafana sees both spans in the
+	// same trace with proper parent links.
+	if a.traceStitcher != nil {
+		a.traceStitcher.OnStitchedSpan(func(span *traces.Span) {
+			// Enrich with service name (clone may not have it yet)
+			if a.discoverer != nil && span.ServiceName == "" {
+				span.ServiceName = a.discoverer.GetServiceName(span.PID)
+			}
+			a.exporter.ExportSpan(span)
+		})
+	}
+
 	// C9 fix: LogCollector sends logs to channel.
 	if a.logCollector != nil {
 		a.logCollector.OnLog(func(record *logs.LogRecord) {
@@ -717,10 +732,15 @@ func (a *Agent) processSpan(span *traces.Span) {
 		span.Attributes["db.query.text"] = redact.NormalizeSQL(stmt)
 	}
 
-	// Cross-service trace stitching: CLIENT spans are stored,
-	// SERVER spans are matched against stored CLIENT spans.
+	// Cross-service trace stitching: CLIENT spans may be deferred (stored
+	// for future matching). Deferred spans are NOT exported here — the
+	// stitcher will re-export them via OnStitchedSpan when matched, or
+	// export them when they expire unmatched in Cleanup.
 	if a.traceStitcher != nil {
-		a.traceStitcher.ProcessSpan(span)
+		if a.traceStitcher.ProcessSpan(span) {
+			// Span was deferred by the stitcher — skip export.
+			return
+		}
 	}
 
 	// Register with correlation engine
