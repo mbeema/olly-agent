@@ -73,6 +73,36 @@ func TestAutoDetect(t *testing.T) {
 	}
 }
 
+func TestExtractPIDTID(t *testing.T) {
+	p := NewParser()
+
+	tests := []struct {
+		name      string
+		line      string
+		expectPID int
+		expectTID int
+	}{
+		{"pid=N", "2024-01-15 ERROR pid=1234 tid=5678 connection failed", 1234, 5678},
+		{"PID N", "PID 42 TID 99 starting worker", 42, 99},
+		{"process=N thread=N", "process=100 thread=200 handling request", 100, 200},
+		{"thread_id=N", "pid=55 thread_id=66 query complete", 55, 66},
+		{"syslog with tid in body", "Jan 15 10:30:00 host app[999]: thread=77 processing", 999, 77},
+		{"no pid/tid", "just a plain log message", 0, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			record := p.Parse(tt.line, "auto")
+			if record.PID != tt.expectPID {
+				t.Errorf("PID = %d, want %d", record.PID, tt.expectPID)
+			}
+			if record.TID != tt.expectTID {
+				t.Errorf("TID = %d, want %d", record.TID, tt.expectTID)
+			}
+		})
+	}
+}
+
 func TestDetectLevel(t *testing.T) {
 	tests := []struct {
 		msg    string

@@ -1,0 +1,30 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "olly.serviceAccountName" . }}
+  labels:
+    app.kubernetes.io/name: olly
+    app.kubernetes.io/instance: {{ .Release.Name }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes/stats"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "olly.serviceAccountName" . }}
+  labels:
+    app.kubernetes.io/name: olly
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "olly.serviceAccountName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "olly.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

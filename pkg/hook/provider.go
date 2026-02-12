@@ -24,3 +24,34 @@ type HookProvider interface {
 	// Name returns the provider name (e.g., "ebpf", "socket", "stub").
 	Name() string
 }
+
+// TraceInjector is an optional interface that HookProvider implementations
+// can support for injecting W3C traceparent headers into outbound HTTP
+// requests at the kernel/socket level. This enables cross-service distributed
+// tracing without any application instrumentation.
+//
+// Use type assertion to check if a HookProvider supports injection:
+//
+//	if injector, ok := provider.(TraceInjector); ok {
+//	    injector.SetTraceContext(pid, tid, traceID, spanID)
+//	}
+type TraceInjector interface {
+	// SetTraceContext stores trace context for a thread. When the thread
+	// makes an outbound HTTP request, the traceparent header will be
+	// injected automatically by the BPF sk_msg program.
+	SetTraceContext(pid, tid uint32, traceID, spanID string) error
+
+	// ClearTraceContext removes trace context for a thread after the
+	// inbound request has been fully processed.
+	ClearTraceContext(pid, tid uint32) error
+
+	// GetTraceContext reads the BPF-generated trace context for a thread.
+	// Returns traceID, spanID, ok. If BPF generated a trace context in
+	// the kretprobe (before userspace processing), the agent should use
+	// that trace ID to stay consistent with sk_msg injection.
+	GetTraceContext(pid, tid uint32) (traceID, spanID string, ok bool)
+
+	// SupportsInjection returns true if the provider has successfully
+	// set up the sockops + sk_msg programs for traceparent injection.
+	SupportsInjection() bool
+}

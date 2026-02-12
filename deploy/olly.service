@@ -1,0 +1,35 @@
+[Unit]
+Description=Olly Observability Agent
+Documentation=https://github.com/mbeema/olly
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/olly --config-dir /etc/olly/
+Restart=on-failure
+RestartSec=5
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=50%
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=full
+ProtectHome=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=olly
+
+# Runtime directory
+RuntimeDirectory=olly
+StateDirectory=olly
+LogsDirectory=olly
+
+[Install]
+WantedBy=multi-user.target

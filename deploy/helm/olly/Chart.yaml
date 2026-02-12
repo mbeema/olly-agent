@@ -1,0 +1,15 @@
+apiVersion: v2
+name: olly
+description: Olly - Zero-instrumentation observability agent
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - observability
+  - tracing
+  - metrics
+  - logs
+  - ebpf
+home: https://github.com/mbeema/olly
+maintainers:
+  - name: mbeema

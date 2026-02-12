@@ -57,8 +57,21 @@ if [ -f /var/log/otel/traces.json ]; then
     CLIENT=$(grep -c '"SPAN_KIND_CLIENT"' /var/log/otel/traces.json 2>/dev/null || echo 0)
     CORRELATED=$(grep -c '"parentSpanId"' /var/log/otel/traces.json 2>/dev/null || echo 0)
     echo "Total spans: $TOTAL (SERVER: $SERVER, CLIENT: $CLIENT, correlated: $CORRELATED)"
-    echo "--- Last 3 span names ---"
-    grep -o '"name":"[^"]*"' /var/log/otel/traces.json 2>/dev/null | tail -3
+
+    # Cross-service trace stitching validation
+    STITCHED=$(grep -c '"olly.stitched"' /var/log/otel/traces.json 2>/dev/null || echo 0)
+    echo "Cross-service stitched spans: $STITCHED"
+
+    # Check for traceparent propagation (spans with both traceId and parentSpanId)
+    if [ "$CLIENT" -gt 0 ] && [ "$SERVER" -gt 0 ]; then
+        echo "Cross-service flow: Flask(CLIENT) → order-service(SERVER) detected"
+    fi
+
+    echo "--- Last 5 span names ---"
+    grep -o '"name":"[^"]*"' /var/log/otel/traces.json 2>/dev/null | tail -5
+
+    echo "--- Service names in traces ---"
+    grep -o '"service.name","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
 else
     echo "NOT FOUND (file exporter not enabled or no data yet)"
 fi

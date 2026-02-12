@@ -23,16 +23,30 @@ for i in $(seq 1 "$ITERATIONS"); do
     # Health check
     curl -s "$BASE_URL/" > /dev/null
 
-    # List users
+    # List users (Flask → PostgreSQL)
     curl -s "$BASE_URL/users" > /dev/null
 
-    # Create user
+    # Create user (Flask → PostgreSQL)
     curl -s -X POST "$BASE_URL/users" \
         -H "Content-Type: application/json" \
         -d "{\"name\":\"User$i\",\"email\":\"user${i}@test.com\"}" > /dev/null
 
     # Get specific user
     curl -s "$BASE_URL/users/1" > /dev/null
+
+    # Cross-service: List orders (Flask → order-service → PostgreSQL)
+    curl -s "$BASE_URL/orders" > /dev/null || true
+
+    # Cross-service: Create order (Flask → order-service → PostgreSQL)
+    curl -s -X POST "$BASE_URL/orders" \
+        -H "Content-Type: application/json" \
+        -d "{\"user_id\":1,\"product\":\"Widget-$i\",\"amount\":$((i * 10))}" > /dev/null || true
+
+    # Cross-service with explicit traceparent (upstream-propagated)
+    TRACE_ID=$(openssl rand -hex 16 2>/dev/null || python3 -c 'import secrets; print(secrets.token_hex(16))')
+    SPAN_ID=$(openssl rand -hex 8 2>/dev/null || python3 -c 'import secrets; print(secrets.token_hex(8))')
+    curl -s "$BASE_URL/orders" \
+        -H "traceparent: 00-${TRACE_ID}-${SPAN_ID}-01" > /dev/null || true
 
     # Slow endpoint (short delay)
     curl -s "$BASE_URL/slow?delay=0.5" > /dev/null

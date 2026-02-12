@@ -27,8 +27,9 @@ type RequestPair struct {
 
 	// Inherited trace context from inbound request on same PID+TID.
 	// Used for intra-process parent-child linking (e.g., HTTP SERVER → DB CLIENT).
-	ParentTraceID string
-	ParentSpanID  string
+	ParentTraceID  string
+	ParentSpanID   string // SERVER span's own spanID (CLIENT uses as parent)
+	InjectedSpanID string // sk_msg-injected spanID (CLIENT uses as its own spanID)
 
 	// Direction: 0=outbound (connect), 1=inbound (accept)
 	Direction int

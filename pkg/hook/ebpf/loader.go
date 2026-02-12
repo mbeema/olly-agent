@@ -14,9 +14,10 @@ import (
 // loader manages BPF object lifecycle: loading programs, creating maps, and
 // attaching kprobes/kretprobes.
 type loader struct {
-	objs  *ollyObjects
-	links []link.Link
-	logger *zap.Logger
+	objs         *ollyObjects
+	links        []link.Link
+	skMsgAttached bool // true if sk_msg was attached via BPF_PROG_ATTACH
+	logger       *zap.Logger
 }
 
 // newLoader creates a loader but does not yet load anything.
@@ -27,11 +28,7 @@ func newLoader(logger *zap.Logger) *loader {
 // load loads the compiled eBPF objects (programs + maps) into the kernel.
 func (l *loader) load() error {
 	l.objs = &ollyObjects{}
-	if err := loadOllyObjects(l.objs, &ebpf.CollectionOptions{
-		Maps: ebpf.MapOptions{
-			// Pin maps to /sys/fs/bpf if needed in the future
-		},
-	}); err != nil {
+	if err := loadOllyObjects(l.objs, &ebpf.CollectionOptions{}); err != nil {
 		return fmt.Errorf("load BPF objects: %w", err)
 	}
 	return nil
@@ -110,7 +107,7 @@ func (l *loader) attachSyscallProbes() error {
 
 // attachTracepoints attaches to tracepoints (process exec).
 func (l *loader) attachTracepoints() error {
-	tp, err := link.Tracepoint("sched", "sched_process_exec", l.objs.TracepointSchedSchedProcessExec, nil)
+	tp, err := link.Tracepoint("sched", "sched_process_exec", l.objs.TracepointSchedProcessExec, nil)
 	if err != nil {
 		l.logger.Warn("failed to attach sched_process_exec tracepoint (SSL auto-discovery disabled)", zap.Error(err))
 		return nil // non-fatal
@@ -170,6 +167,16 @@ func (l *loader) lookupConn(pid uint32, fd int32) (*connVal, error) {
 
 // close releases all probes, links, and BPF objects.
 func (l *loader) close() {
+	// Detach sk_msg (attached via BPF_PROG_ATTACH, not link-based)
+	if l.skMsgAttached && l.objs != nil && l.objs.OllySkMsg != nil && l.objs.SockOpsMap != nil {
+		_ = link.RawDetachProgram(link.RawDetachProgramOptions{
+			Target:  l.objs.SockOpsMap.FD(),
+			Program: l.objs.OllySkMsg,
+			Attach:  ebpf.AttachSkMsgVerdict,
+		})
+		l.skMsgAttached = false
+	}
+
 	for _, lnk := range l.links {
 		lnk.Close()
 	}
@@ -257,6 +264,136 @@ func (l *loader) attachSSLUprobes(libPath string) error {
 // eventRingBuf returns the ring buffer map for the event reader.
 func (l *loader) eventRingBuf() *ebpf.Map {
 	return l.objs.Events
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Traceparent injection: sockops + sk_msg attachment
+// ──────────────────────────────────────────────────────────────────────
+
+// attachSockopsAndSkMsg attaches the sockops program to the root cgroup and
+// the sk_msg program to the sockhash map for traceparent injection.
+// This is non-fatal — if it fails, the agent falls back to trace stitching.
+func (l *loader) attachSockopsAndSkMsg(cgroupPath string) error {
+	if l.objs.OllySockops == nil || l.objs.OllySkMsg == nil {
+		return fmt.Errorf("sockops/sk_msg programs not loaded")
+	}
+	if l.objs.SockOpsMap == nil {
+		return fmt.Errorf("sock_ops_map not loaded")
+	}
+
+	// Attach sockops to cgroup
+	sockopsLink, err := link.AttachCgroup(link.CgroupOptions{
+		Path:    cgroupPath,
+		Attach:  ebpf.AttachCGroupSockOps,
+		Program: l.objs.OllySockops,
+	})
+	if err != nil {
+		return fmt.Errorf("attach sockops to cgroup %s: %w", cgroupPath, err)
+	}
+	l.links = append(l.links, sockopsLink)
+	l.logger.Debug("attached sockops to cgroup", zap.String("path", cgroupPath))
+
+	// Attach sk_msg to the sockhash map using BPF_PROG_ATTACH (legacy path).
+	// BPF_LINK_CREATE for sk_msg requires kernel 6.7+; kernel 6.1 only
+	// supports the legacy BPF_PROG_ATTACH via link.RawAttachProgram.
+	err = link.RawAttachProgram(link.RawAttachProgramOptions{
+		Target:  l.objs.SockOpsMap.FD(),
+		Program: l.objs.OllySkMsg,
+		Attach:  ebpf.AttachSkMsgVerdict,
+	})
+	if err != nil {
+		return fmt.Errorf("attach sk_msg to sockhash: %w", err)
+	}
+	l.skMsgAttached = true
+	l.logger.Debug("attached sk_msg to sockhash")
+
+	return nil
+}
+
+// threadKey mirrors the BPF struct thread_key for map operations.
+type threadKey struct {
+	PID uint32
+	TID uint32
+}
+
+// traceparentHeaderLen must match TRACEPARENT_HEADER_LEN in olly.bpf.c.
+const traceparentHeaderLen = 70
+
+// traceCtx mirrors the BPF struct trace_ctx for map operations.
+// Must match generated ollyTraceCtx exactly (including padding).
+// Fields must be exported for encoding/binary to marshal/unmarshal.
+type traceCtx struct {
+	Valid     uint8
+	Pad       [3]byte
+	HeaderLen uint32
+	Header    [traceparentHeaderLen + 1]byte
+	Pad2      [1]byte // alignment padding to match BPF struct
+}
+
+// setTraceContext writes a pre-formatted traceparent header to the BPF map
+// for the given PID+TID. The sk_msg program reads this when the thread
+// makes an outbound HTTP request.
+func (l *loader) setTraceContext(pid, tid uint32, traceparentHeader string) error {
+	if l.objs.ThreadTraceCtx == nil {
+		return fmt.Errorf("thread_trace_ctx map not loaded")
+	}
+
+	key := threadKey{PID: pid, TID: tid}
+	val := traceCtx{
+		Valid:     1,
+		HeaderLen: uint32(len(traceparentHeader)),
+	}
+
+	// Copy header string into fixed-size array
+	headerBytes := []byte(traceparentHeader)
+	n := len(headerBytes)
+	if n > traceparentHeaderLen {
+		n = traceparentHeaderLen
+	}
+	copy(val.Header[:n], headerBytes[:n])
+
+	return l.objs.ThreadTraceCtx.Put(key, val)
+}
+
+// clearTraceContext removes the trace context for a PID+TID from the BPF map.
+func (l *loader) clearTraceContext(pid, tid uint32) error {
+	if l.objs.ThreadTraceCtx == nil {
+		return nil
+	}
+	key := threadKey{PID: pid, TID: tid}
+	return l.objs.ThreadTraceCtx.Delete(key)
+}
+
+// getTraceContext reads the BPF-generated trace context for a PID+TID.
+// Returns traceID, spanID, ok. The header format from BPF is:
+// "traceparent: 00-{traceID}-{spanID}-01\r\n"
+func (l *loader) getTraceContext(pid, tid uint32) (string, string, bool) {
+	if l.objs.ThreadTraceCtx == nil {
+		return "", "", false
+	}
+	key := threadKey{PID: pid, TID: tid}
+	var val traceCtx
+	if err := l.objs.ThreadTraceCtx.Lookup(key, &val); err != nil {
+		return "", "", false
+	}
+	if val.Valid == 0 || val.HeaderLen == 0 {
+		return "", "", false
+	}
+
+	// Parse "traceparent: 00-{32hex}-{16hex}-01\r\n"
+	header := string(val.Header[:val.HeaderLen])
+	// Expected prefix: "traceparent: 00-" (16 chars)
+	if len(header) < 52 { // 16 + 32 + 1 + 16 + 1 + 2 = 68 minimum + \r\n
+		return "", "", false
+	}
+	// Find the trace ID and span ID
+	const prefix = "traceparent: 00-"
+	if len(header) < len(prefix)+32+1+16 {
+		return "", "", false
+	}
+	traceID := header[len(prefix) : len(prefix)+32]
+	spanID := header[len(prefix)+32+1 : len(prefix)+32+1+16]
+	return traceID, spanID, true
 }
 
 // Helper to convert IP uint32 to byte order.

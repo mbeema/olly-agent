@@ -87,7 +87,8 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 		Attributes:  make(map[string]string),
 	}
 
-	// Try to extract trace context from HTTP headers (R1.2: include tracestate)
+	// Try to extract trace context from HTTP headers (R1.2: include tracestate).
+	// This covers: (a) traceparent injected by upstream sk_msg, (b) app-level headers.
 	if proto == protocol.ProtoHTTP || proto == protocol.ProtoGRPC {
 		traceCtx := protocol.ExtractTraceContext(pair.Request)
 		if traceCtx.TraceID != "" {
@@ -95,23 +96,28 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 			span.ParentSpanID = traceCtx.SpanID
 			span.SpanID = GenerateSpanID()
 			span.TraceState = traceCtx.TraceState
+			span.SetAttribute("olly.trace_source", "traceparent")
 		}
 	}
 
 	// Intra-process parent-child linking: if a parent context was set from
 	// the inbound request on this PID+TID, use it for trace correlation.
-	// For CLIENT spans, thread context ALWAYS takes precedence over
-	// extracted traceparent — the traceparent was injected by libolly.c for
-	// the downstream service, not from an upstream parent.
-	// For SERVER spans, extracted traceparent takes precedence (from upstream).
+	// Creates a proper chain: SERVER(ParentSpanID) → CLIENT(InjectedSpanID) → downstream
 	if pair.ParentTraceID != "" {
 		if kind == SpanKindClient {
-			// CLIENT span: thread context overrides injected traceparent
+			// CLIENT span: use thread context for parent linkage.
+			// InjectedSpanID is what sk_msg injected into the outbound HTTP,
+			// so the downstream service's parentSpanID matches this CLIENT span.
 			span.TraceID = pair.ParentTraceID
-			span.SpanID = GenerateSpanID()
+			if pair.InjectedSpanID != "" {
+				span.SpanID = pair.InjectedSpanID
+			} else {
+				span.SpanID = GenerateSpanID()
+			}
 			span.ParentSpanID = pair.ParentSpanID
-		} else if span.TraceID == "" {
-			// SERVER span without upstream traceparent: use thread context
+		} else {
+			// SERVER span: always use the thread context trace ID and
+			// set SpanID so child CLIENT spans can reference it as parent.
 			span.TraceID = pair.ParentTraceID
 			span.SpanID = pair.ParentSpanID
 		}

@@ -4,7 +4,7 @@ COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LDFLAGS := -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)"
 
-.PHONY: all build build-linux generate clean test lint run
+.PHONY: all build build-linux generate clean test lint run docker helm-package install
 
 all: build
 
@@ -44,3 +44,18 @@ fmt:
 deps:
 	go mod tidy
 	go mod download
+
+# Docker
+docker:
+	docker build -t $(BINARY):$(VERSION) .
+
+# Helm
+helm-package:
+	helm package deploy/helm/olly/
+
+helm-template:
+	helm template olly deploy/helm/olly/
+
+# Install (Linux only)
+install: build-linux
+	sudo deploy/install.sh
