@@ -41,9 +41,33 @@ echo "Installing on EC2..."
 $SSH_CMD <<'REMOTE_SCRIPT'
 set -ex
 
+# Ensure MySQL/MariaDB is installed (may not be on existing instances)
+if ! command -v mysql &> /dev/null; then
+    echo "Installing MariaDB..."
+    sudo dnf install -y mariadb105-server
+    sudo systemctl enable mariadb
+    sudo systemctl start mariadb
+    mysql -u root <<MYSQL_SETUP
+    CREATE DATABASE IF NOT EXISTS inventory;
+    CREATE USER IF NOT EXISTS 'demo'@'localhost' IDENTIFIED BY 'demo123';
+    GRANT ALL PRIVILEGES ON inventory.* TO 'demo'@'localhost';
+    FLUSH PRIVILEGES;
+MYSQL_SETUP
+fi
+
 # Unpack
 cd /tmp
 tar xzf olly-deploy.tar.gz
+# Stop existing processes
+sudo pkill -9 -x olly 2>/dev/null || true
+sudo pkill -9 -f 'python3.*app.py' 2>/dev/null || true
+sudo pkill -9 -x order-service 2>/dev/null || true
+sudo pkill -9 -x mcp-server 2>/dev/null || true
+sleep 3
+
+# Clear old trace data for clean analysis
+sudo rm -f /var/log/otel/traces.json /var/log/otel/metrics.json /var/log/otel/logs.json
+
 sudo mkdir -p /opt/olly/configs /opt/olly/demo-app /var/run/olly /var/log/demo-app /var/log/otel
 sudo chmod 777 /var/log/otel
 
@@ -65,6 +89,10 @@ sudo systemctl reload postgresql
 
 # Initialize demo database with schema + grants
 sudo -u postgres psql -d demo -f olly-deploy/demo-app/init_db.sql || true
+
+# Initialize MySQL inventory database
+sudo mysql -u root -e "CREATE DATABASE IF NOT EXISTS inventory; CREATE USER IF NOT EXISTS 'demo'@'localhost' IDENTIFIED BY 'demo123'; GRANT ALL PRIVILEGES ON inventory.* TO 'demo'@'localhost'; FLUSH PRIVILEGES;" || true
+sudo mysql -u root inventory < olly-deploy/demo-app/init_mysql.sql || true
 
 # Install Python deps (as root — app runs as root)
 sudo pip3 install -r olly-deploy/demo-app/requirements.txt

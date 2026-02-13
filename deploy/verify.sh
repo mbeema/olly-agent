@@ -70,27 +70,33 @@ if [ -f /var/log/otel/traces.json ]; then
     fi
 
     # MCP span detection
-    MCP_SPANS=$(grep -c '"mcp.method"' /var/log/otel/traces.json 2>/dev/null || echo 0)
+    MCP_SPANS=$(grep -c '"mcp.method.name"' /var/log/otel/traces.json 2>/dev/null || echo 0)
     echo "MCP spans: $MCP_SPANS"
     if [ "$MCP_SPANS" -gt 0 ]; then
         echo "--- MCP methods detected ---"
-        grep -o '"mcp.method","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort | uniq -c | sort -rn || true
+        grep -o '"mcp.method.name","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort | uniq -c | sort -rn || true
         echo "--- MCP tool names ---"
-        grep -o '"mcp.tool.name","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
+        grep -o '"gen_ai.tool.name","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
         echo "--- MCP session IDs (first 3) ---"
         grep -o '"mcp.session.id","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | head -3 || true
         echo "--- MCP transports ---"
         grep -o '"mcp.transport","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
+        echo "--- MCP server info ---"
+        grep -o '"mcp.server.name","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
+        echo "--- MCP protocol version ---"
+        grep -o '"mcp.protocol.version","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
+        echo "--- MCP tools count ---"
+        grep -o '"mcp.tools.count","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
         echo "--- MCP errors ---"
-        grep -o '"mcp.error.code","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null || echo "  (no MCP errors)"
+        grep -o '"rpc.jsonrpc.error_code","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null || echo "  (no MCP errors)"
     fi
 
     # GenAI span detection
-    GENAI_SPANS=$(grep -c '"gen_ai.system"' /var/log/otel/traces.json 2>/dev/null || echo 0)
+    GENAI_SPANS=$(grep -c '"gen_ai.provider.name"' /var/log/otel/traces.json 2>/dev/null || echo 0)
     echo "GenAI spans: $GENAI_SPANS"
     if [ "$GENAI_SPANS" -gt 0 ]; then
         echo "--- GenAI providers detected ---"
-        grep -o '"gen_ai.system","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
+        grep -o '"gen_ai.provider.name","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
         echo "--- GenAI models ---"
         grep -o '"gen_ai.response.model","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
         echo "--- GenAI token usage (first 3) ---"
@@ -136,7 +142,7 @@ if [ -f /var/log/otel/metrics.json ]; then
     grep -c '"gen_ai.client.operation.duration"' /var/log/otel/metrics.json 2>/dev/null && echo "  gen_ai.client.operation.duration: FOUND" || echo "  gen_ai.client.operation.duration: not yet"
     echo "--- MCP metrics ---"
     grep -c '"mcp.client.request.count"' /var/log/otel/metrics.json 2>/dev/null && echo "  mcp.client.request.count: FOUND" || echo "  mcp.client.request.count: not yet"
-    grep -c '"mcp.client.duration"' /var/log/otel/metrics.json 2>/dev/null && echo "  mcp.client.duration: FOUND" || echo "  mcp.client.duration: not yet"
+    grep -c '"mcp.client.operation.duration"' /var/log/otel/metrics.json 2>/dev/null && echo "  mcp.client.operation.duration: FOUND" || echo "  mcp.client.operation.duration: not yet"
     grep -c '"mcp.client.error.count"' /var/log/otel/metrics.json 2>/dev/null && echo "  mcp.client.error.count: FOUND" || echo "  mcp.client.error.count: not yet"
 else
     echo "NOT FOUND (file exporter not enabled or no data yet)"

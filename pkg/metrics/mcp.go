@@ -56,7 +56,7 @@ func (m *MCPMetrics) RecordSpan(span *traces.Span) {
 		return
 	}
 
-	method := span.Attributes["mcp.method"]
+	method := span.Attributes["mcp.method.name"]
 	if method == "" {
 		return
 	}
@@ -65,11 +65,11 @@ func (m *MCPMetrics) RecordSpan(span *traces.Span) {
 	name := ""
 	switch {
 	case method == "tools/call":
-		name = span.Attributes["mcp.tool.name"]
+		name = span.Attributes["gen_ai.tool.name"]
 	case method == "resources/read":
 		name = span.Attributes["mcp.resource.uri"]
 	case method == "prompts/get":
-		name = span.Attributes["mcp.prompt.name"]
+		name = span.Attributes["gen_ai.prompt.name"]
 	}
 
 	key := mcpToolKey{
@@ -138,7 +138,7 @@ func (m *MCPMetrics) Collect(now time.Time) []*Metric {
 		}
 
 		baseLabels := map[string]string{
-			"mcp.method": key.Method,
+			"mcp.method.name": key.Method,
 		}
 		if key.Name != "" {
 			baseLabels["mcp.name"] = key.Name
@@ -185,7 +185,7 @@ func (m *MCPMetrics) Collect(now time.Time) []*Metric {
 		}
 
 		metrics = append(metrics, &Metric{
-			Name:        "mcp.client.duration",
+			Name:        "mcp.client.operation.duration",
 			Description: "MCP request duration",
 			Unit:        "s",
 			Type:        Histogram,

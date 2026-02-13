@@ -99,7 +99,7 @@ resource "aws_instance" "olly_demo" {
 
     # Install dependencies
     dnf update -y
-    dnf install -y gcc make git postgresql16-server postgresql16
+    dnf install -y gcc make git postgresql16-server postgresql16 mariadb105-server
 
     # Install Go 1.23
     curl -Lo /tmp/go.tar.gz https://go.dev/dl/go1.23.4.linux-amd64.tar.gz
@@ -127,6 +127,16 @@ resource "aws_instance" "olly_demo" {
     PG_HBA=$(sudo -u postgres psql -t -c "SHOW hba_file;" | tr -d ' ')
     sed -i '/^host.*all.*all.*127.0.0.1\/32.*ident/i host    all    all    127.0.0.1/32    md5' "$PG_HBA"
     systemctl reload postgresql
+
+    # Setup MySQL (MariaDB)
+    systemctl enable mariadb
+    systemctl start mariadb
+    mysql -u root <<MYSQL_INIT
+    CREATE DATABASE IF NOT EXISTS inventory;
+    CREATE USER IF NOT EXISTS 'demo'@'localhost' IDENTIFIED BY 'demo123';
+    GRANT ALL PRIVILEGES ON inventory.* TO 'demo'@'localhost';
+    FLUSH PRIVILEGES;
+MYSQL_INIT
 
     # Create directories
     mkdir -p /var/run/olly /var/log/demo-app /var/log/otel /opt/olly/configs

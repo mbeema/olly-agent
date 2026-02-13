@@ -44,6 +44,17 @@ for i in $(seq 1 "$ITERATIONS"); do
         -H "Content-Type: application/json" \
         -d "{\"user_id\":1,\"product\":\"Widget-$i\",\"amount\":$((i * 10))}" > /dev/null || true
 
+    # Cross-service: List inventory (Flask → order-service → MySQL)
+    curl -s "$BASE_URL/inventory" > /dev/null || true
+
+    # Cross-service: Checkout (Flask → order-service → MySQL inventory + PostgreSQL order)
+    # This creates the full multi-DB trace: check stock (MySQL) → place order (PostgreSQL)
+    SKUS=("WDG-001" "GDG-001" "SPR-001" "GZM-001" "DHK-001")
+    SKU=${SKUS[$((i % 5))]}
+    curl -s -X POST "$BASE_URL/checkout" \
+        -H "Content-Type: application/json" \
+        -d "{\"user_id\":1,\"sku\":\"$SKU\",\"qty\":1}" > /dev/null || true
+
     # Cross-service with explicit traceparent (upstream-propagated)
     TRACE_ID=$(openssl rand -hex 16 2>/dev/null || python3 -c 'import secrets; print(secrets.token_hex(16))')
     SPAN_ID=$(openssl rand -hex 8 2>/dev/null || python3 -c 'import secrets; print(secrets.token_hex(8))')

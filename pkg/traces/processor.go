@@ -327,7 +327,7 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 	case protocol.ProtoGenAI:
 		// OTEL GenAI semantic conventions (gen_ai.* namespace)
 		if attrs.GenAIProvider != "" {
-			span.SetAttribute("gen_ai.system", attrs.GenAIProvider)
+			span.SetAttribute("gen_ai.provider.name", attrs.GenAIProvider)
 		}
 		if attrs.GenAIOperation != "" {
 			span.SetAttribute("gen_ai.operation.name", attrs.GenAIOperation)
@@ -386,20 +386,21 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 
 	case protocol.ProtoMCP:
 		// MCP (Model Context Protocol) - JSON-RPC 2.0 over HTTP
+		// Attribute names follow OTEL semantic conventions (January 2026)
 		if attrs.MCPMethod != "" {
-			span.SetAttribute("mcp.method", attrs.MCPMethod)
+			span.SetAttribute("mcp.method.name", attrs.MCPMethod)
 		}
 		if attrs.MCPRequestID != "" {
-			span.SetAttribute("mcp.request.id", attrs.MCPRequestID)
+			span.SetAttribute("jsonrpc.request.id", attrs.MCPRequestID)
 		}
 		if attrs.MCPToolName != "" {
-			span.SetAttribute("mcp.tool.name", attrs.MCPToolName)
+			span.SetAttribute("gen_ai.tool.name", attrs.MCPToolName)
 		}
 		if attrs.MCPResourceURI != "" {
 			span.SetAttribute("mcp.resource.uri", attrs.MCPResourceURI)
 		}
 		if attrs.MCPPromptName != "" {
-			span.SetAttribute("mcp.prompt.name", attrs.MCPPromptName)
+			span.SetAttribute("gen_ai.prompt.name", attrs.MCPPromptName)
 		}
 		if attrs.MCPSessionID != "" {
 			span.SetAttribute("mcp.session.id", attrs.MCPSessionID)
@@ -408,10 +409,32 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 			span.SetAttribute("mcp.transport", attrs.MCPTransport)
 		}
 		if attrs.MCPErrorCode != 0 {
-			span.SetAttribute("mcp.error.code", fmt.Sprintf("%d", attrs.MCPErrorCode))
+			span.SetAttribute("rpc.jsonrpc.error_code", fmt.Sprintf("%d", attrs.MCPErrorCode))
 		}
 		if attrs.MCPErrorMsg != "" {
-			span.SetAttribute("mcp.error.message", attrs.MCPErrorMsg)
+			span.SetAttribute("rpc.jsonrpc.error_message", attrs.MCPErrorMsg)
+		}
+		// New MCP response attributes
+		if attrs.MCPProtocolVersion != "" {
+			span.SetAttribute("mcp.protocol.version", attrs.MCPProtocolVersion)
+		}
+		if attrs.MCPServerName != "" {
+			span.SetAttribute("mcp.server.name", attrs.MCPServerName)
+		}
+		if attrs.MCPServerVersion != "" {
+			span.SetAttribute("mcp.server.version", attrs.MCPServerVersion)
+		}
+		if attrs.MCPToolsCount > 0 {
+			span.SetAttribute("mcp.tools.count", fmt.Sprintf("%d", attrs.MCPToolsCount))
+		}
+		if attrs.MCPToolIsError {
+			span.SetAttribute("mcp.tool.is_error", "true")
+		}
+		if attrs.MCPToolContentType != "" {
+			span.SetAttribute("mcp.tool.content_type", attrs.MCPToolContentType)
+		}
+		if attrs.MCPResourceMimeType != "" {
+			span.SetAttribute("mcp.resource.mime_type", attrs.MCPResourceMimeType)
 		}
 		// Underlying HTTP attributes
 		if attrs.HTTPMethod != "" {

@@ -19,7 +19,7 @@ func TestGenAIMetricsRecordAndCollect(t *testing.T) {
 		ServiceName: "my-app",
 		Duration:    2 * time.Second,
 		Attributes: map[string]string{
-			"gen_ai.system":              "openai",
+			"gen_ai.provider.name":              "openai",
 			"gen_ai.request.model":       "gpt-4o",
 			"gen_ai.response.model":      "gpt-4o-2024-08-06",
 			"gen_ai.usage.input_tokens":  "25",
@@ -46,8 +46,8 @@ func TestGenAIMetricsRecordAndCollect(t *testing.T) {
 				if m.Value != 25 {
 					t.Errorf("input token value = %f, want 25", m.Value)
 				}
-				if m.Labels["gen_ai.system"] != "openai" {
-					t.Errorf("provider label = %q, want openai", m.Labels["gen_ai.system"])
+				if m.Labels["gen_ai.provider.name"] != "openai" {
+					t.Errorf("provider label = %q, want openai", m.Labels["gen_ai.provider.name"])
 				}
 				if m.Labels["gen_ai.response.model"] != "gpt-4o-2024-08-06" {
 					t.Errorf("model label = %q, want gpt-4o-2024-08-06", m.Labels["gen_ai.response.model"])
@@ -112,7 +112,7 @@ func TestGenAIMetricsMultipleModels(t *testing.T) {
 		ServiceName: "app",
 		Duration:    time.Second,
 		Attributes: map[string]string{
-			"gen_ai.system":              "openai",
+			"gen_ai.provider.name":              "openai",
 			"gen_ai.response.model":      "gpt-4o",
 			"gen_ai.usage.input_tokens":  "10",
 			"gen_ai.usage.output_tokens": "20",
@@ -124,7 +124,7 @@ func TestGenAIMetricsMultipleModels(t *testing.T) {
 		ServiceName: "app",
 		Duration:    3 * time.Second,
 		Attributes: map[string]string{
-			"gen_ai.system":              "anthropic",
+			"gen_ai.provider.name":              "anthropic",
 			"gen_ai.response.model":      "claude-3-5-sonnet",
 			"gen_ai.usage.input_tokens":  "50",
 			"gen_ai.usage.output_tokens": "200",
@@ -160,7 +160,7 @@ func TestGenAIMetricsNoTokens(t *testing.T) {
 		Protocol: "genai",
 		Duration: 5 * time.Second,
 		Attributes: map[string]string{
-			"gen_ai.system":         "openai",
+			"gen_ai.provider.name":         "openai",
 			"gen_ai.response.model": "gpt-4o",
 		},
 	})
@@ -201,7 +201,7 @@ func TestGenAIMetricsDurationBuckets(t *testing.T) {
 			Protocol: "genai",
 			Duration: d,
 			Attributes: map[string]string{
-				"gen_ai.system":         "openai",
+				"gen_ai.provider.name":         "openai",
 				"gen_ai.response.model": "gpt-4o",
 			},
 		})
@@ -239,7 +239,7 @@ func TestGenAIMetricsFallbackToRequestModel(t *testing.T) {
 		Protocol: "genai",
 		Duration: time.Second,
 		Attributes: map[string]string{
-			"gen_ai.system":              "openai",
+			"gen_ai.provider.name":              "openai",
 			"gen_ai.request.model":       "gpt-4o",
 			"gen_ai.usage.input_tokens":  "10",
 		},

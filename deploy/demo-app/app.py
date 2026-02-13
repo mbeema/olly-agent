@@ -140,6 +140,55 @@ def create_order():
         return jsonify({"error": "order-service unavailable"}), 502
 
 
+### Checkout + Inventory Endpoints ###
+# These demonstrate cross-service, multi-database tracing:
+# Flask → order-service → MySQL (inventory check) + PostgreSQL (order creation)
+
+
+@app.route("/inventory", methods=["GET"])
+def list_inventory():
+    """List inventory (calls order-service → MySQL)."""
+    app.logger.info("Listing inventory (calling order-service)")
+    try:
+        resp = urllib.request.urlopen(f"{ORDER_SERVICE_URL}/api/inventory")
+        data = json.loads(resp.read())
+        return jsonify(data)
+    except urllib.error.URLError as e:
+        app.logger.error(f"order-service inventory call failed: {e}")
+        return jsonify({"error": "order-service unavailable"}), 502
+
+
+@app.route("/checkout", methods=["POST"])
+def checkout():
+    """Checkout flow: Flask → order-service/checkout → MySQL (inventory) + PostgreSQL (order).
+    Creates a cross-service trace spanning two databases:
+    SERVER(Flask) → CLIENT(checkout) → SERVER(order-service) → CLIENT(MySQL) + CLIENT(PostgreSQL)
+    """
+    data = request.get_json(force=True)
+    user_id = data.get("user_id", 1)
+    sku = data.get("sku", "WDG-001")
+    qty = data.get("qty", 1)
+    app.logger.info(f"Checkout: user={user_id}, sku={sku}, qty={qty}")
+    try:
+        req = urllib.request.Request(
+            f"{ORDER_SERVICE_URL}/api/checkout",
+            data=json.dumps({"user_id": user_id, "sku": sku, "qty": qty}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req)
+        result = json.loads(resp.read())
+        app.logger.info(f"Checkout success: order_id={result.get('order_id')}")
+        return jsonify(result), 201
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.fp else ""
+        app.logger.error(f"Checkout failed: {e.code} {body[:200]}")
+        return jsonify(json.loads(body) if body else {"error": f"HTTP {e.code}"}), e.code
+    except urllib.error.URLError as e:
+        app.logger.error(f"order-service checkout call failed: {e}")
+        return jsonify({"error": "order-service unavailable"}), 502
+
+
 ### GenAI Endpoints ###
 # These make real OpenAI API calls — Olly intercepts the HTTP traffic via eBPF
 # and produces gen_ai.* spans with zero instrumentation.

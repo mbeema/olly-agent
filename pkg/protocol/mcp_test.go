@@ -158,6 +158,9 @@ func TestMCPParseToolsCall(t *testing.T) {
 	if attrs.Error {
 		t.Error("Error should be false for 200 response")
 	}
+	if attrs.MCPToolContentType != "text" {
+		t.Errorf("MCPToolContentType = %q, want %q", attrs.MCPToolContentType, "text")
+	}
 }
 
 func TestMCPParseResourcesRead(t *testing.T) {
@@ -224,7 +227,7 @@ func TestMCPParseInitialize(t *testing.T) {
 		"Content-Type: application/json\r\n" +
 		"Mcp-Session-Id: sess-new-456\r\n" +
 		"\r\n" +
-		`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}}}}`
+		`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","serverInfo":{"name":"my-mcp-server","version":"1.2.3"},"capabilities":{"tools":{}}}}`
 
 	parser := &MCPParser{}
 	attrs, err := parser.Parse([]byte(request), []byte(response))
@@ -240,6 +243,15 @@ func TestMCPParseInitialize(t *testing.T) {
 	}
 	if attrs.Name != "initialize" {
 		t.Errorf("Name = %q, want %q", attrs.Name, "initialize")
+	}
+	if attrs.MCPProtocolVersion != "2025-03-26" {
+		t.Errorf("MCPProtocolVersion = %q, want %q", attrs.MCPProtocolVersion, "2025-03-26")
+	}
+	if attrs.MCPServerName != "my-mcp-server" {
+		t.Errorf("MCPServerName = %q, want %q", attrs.MCPServerName, "my-mcp-server")
+	}
+	if attrs.MCPServerVersion != "1.2.3" {
+		t.Errorf("MCPServerVersion = %q, want %q", attrs.MCPServerVersion, "1.2.3")
 	}
 }
 
@@ -591,6 +603,269 @@ func TestExtractNestedJSONNumber(t *testing.T) {
 			got := extractNestedJSONNumber([]byte(tt.data), tt.outer, tt.inner)
 			if got != tt.expect {
 				t.Errorf("extractNestedJSONNumber(%q, %q) = %q, want %q", tt.outer, tt.inner, got, tt.expect)
+			}
+		})
+	}
+}
+
+func TestMCPParseToolsList(t *testing.T) {
+	request := "POST /mcp HTTP/1.1\r\n" +
+		"Host: localhost:3000\r\n" +
+		"Content-Type: application/json\r\n" +
+		"\r\n" +
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`
+
+	response := "HTTP/1.1 200 OK\r\n" +
+		"Content-Type: application/json\r\n" +
+		"\r\n" +
+		`{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"get_weather"},{"name":"search"},{"name":"calculate"}]}}`
+
+	parser := &MCPParser{}
+	attrs, err := parser.Parse([]byte(request), []byte(response))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if attrs.MCPMethod != "tools/list" {
+		t.Errorf("MCPMethod = %q, want %q", attrs.MCPMethod, "tools/list")
+	}
+	if attrs.MCPToolsCount != 3 {
+		t.Errorf("MCPToolsCount = %d, want 3", attrs.MCPToolsCount)
+	}
+}
+
+func TestMCPParseToolsCallError(t *testing.T) {
+	request := "POST /mcp HTTP/1.1\r\n" +
+		"Host: localhost:3000\r\n" +
+		"Content-Type: application/json\r\n" +
+		"\r\n" +
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"flaky_tool"}}`
+
+	response := "HTTP/1.1 200 OK\r\n" +
+		"Content-Type: application/json\r\n" +
+		"\r\n" +
+		`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"error occurred"}],"isError":true}}`
+
+	parser := &MCPParser{}
+	attrs, err := parser.Parse([]byte(request), []byte(response))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !attrs.MCPToolIsError {
+		t.Error("MCPToolIsError should be true")
+	}
+	if attrs.MCPToolContentType != "text" {
+		t.Errorf("MCPToolContentType = %q, want %q", attrs.MCPToolContentType, "text")
+	}
+}
+
+func TestMCPParseResourcesReadMimeType(t *testing.T) {
+	request := "POST /mcp HTTP/1.1\r\n" +
+		"Host: localhost:3000\r\n" +
+		"Content-Type: application/json\r\n" +
+		"\r\n" +
+		`{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"file:///report.csv"}}`
+
+	response := "HTTP/1.1 200 OK\r\n" +
+		"Content-Type: application/json\r\n" +
+		"\r\n" +
+		`{"jsonrpc":"2.0","id":3,"result":{"contents":[{"uri":"file:///report.csv","mimeType":"text/csv","text":"a,b\n1,2"}]}}`
+
+	parser := &MCPParser{}
+	attrs, err := parser.Parse([]byte(request), []byte(response))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if attrs.MCPResourceMimeType != "text/csv" {
+		t.Errorf("MCPResourceMimeType = %q, want %q", attrs.MCPResourceMimeType, "text/csv")
+	}
+}
+
+func TestExtractDeepJSONString(t *testing.T) {
+	tests := []struct {
+		name   string
+		data   string
+		l1, l2, l3 string
+		expect string
+	}{
+		{
+			name:   "server info name",
+			data:   `{"result":{"serverInfo":{"name":"my-server","version":"1.0"}}}`,
+			l1: "result", l2: "serverInfo", l3: "name",
+			expect: "my-server",
+		},
+		{
+			name:   "server info version",
+			data:   `{"result":{"serverInfo":{"name":"srv","version":"2.1.0"}}}`,
+			l1: "result", l2: "serverInfo", l3: "version",
+			expect: "2.1.0",
+		},
+		{
+			name:   "missing middle level",
+			data:   `{"result":{"protocolVersion":"2025-03-26"}}`,
+			l1: "result", l2: "serverInfo", l3: "name",
+			expect: "",
+		},
+		{
+			name:   "missing inner key",
+			data:   `{"result":{"serverInfo":{"name":"srv"}}}`,
+			l1: "result", l2: "serverInfo", l3: "version",
+			expect: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractDeepJSONString([]byte(tt.data), tt.l1, tt.l2, tt.l3)
+			if got != tt.expect {
+				t.Errorf("extractDeepJSONString(%q, %q, %q) = %q, want %q", tt.l1, tt.l2, tt.l3, got, tt.expect)
+			}
+		})
+	}
+}
+
+func TestCountJSONArrayElements(t *testing.T) {
+	tests := []struct {
+		name   string
+		data   string
+		key    string
+		expect int
+	}{
+		{
+			name:   "three tools",
+			data:   `{"tools":[{"name":"a"},{"name":"b"},{"name":"c"}]}`,
+			key:    "tools",
+			expect: 3,
+		},
+		{
+			name:   "one tool",
+			data:   `{"tools":[{"name":"only"}]}`,
+			key:    "tools",
+			expect: 1,
+		},
+		{
+			name:   "empty array",
+			data:   `{"tools":[]}`,
+			key:    "tools",
+			expect: 0,
+		},
+		{
+			name:   "missing key",
+			data:   `{"result":{}}`,
+			key:    "tools",
+			expect: 0,
+		},
+		{
+			name:   "nested arrays in elements",
+			data:   `{"tools":[{"name":"a","args":["x","y"]},{"name":"b"}]}`,
+			key:    "tools",
+			expect: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := countJSONArrayElements([]byte(tt.data), tt.key)
+			if got != tt.expect {
+				t.Errorf("countJSONArrayElements(%q) = %d, want %d", tt.key, got, tt.expect)
+			}
+		})
+	}
+}
+
+func TestExtractNestedJSONBool(t *testing.T) {
+	tests := []struct {
+		name   string
+		data   string
+		outer  string
+		inner  string
+		expect string
+	}{
+		{
+			name:   "isError true",
+			data:   `{"result":{"content":[],"isError":true}}`,
+			outer:  "result",
+			inner:  "isError",
+			expect: "true",
+		},
+		{
+			name:   "isError false",
+			data:   `{"result":{"content":[],"isError":false}}`,
+			outer:  "result",
+			inner:  "isError",
+			expect: "false",
+		},
+		{
+			name:   "missing",
+			data:   `{"result":{"content":[]}}`,
+			outer:  "result",
+			inner:  "isError",
+			expect: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractNestedJSONBool([]byte(tt.data), tt.outer, tt.inner)
+			if got != tt.expect {
+				t.Errorf("extractNestedJSONBool(%q, %q) = %q, want %q", tt.outer, tt.inner, got, tt.expect)
+			}
+		})
+	}
+}
+
+func TestExtractNestedArrayFirstString(t *testing.T) {
+	tests := []struct {
+		name     string
+		data     string
+		arrayKey string
+		fieldKey string
+		expect   string
+	}{
+		{
+			name:     "content type text",
+			data:     `{"content":[{"type":"text","text":"hello"}]}`,
+			arrayKey: "content",
+			fieldKey: "type",
+			expect:   "text",
+		},
+		{
+			name:     "content type image",
+			data:     `{"content":[{"type":"image","data":"base64..."},{"type":"text","text":"cap"}]}`,
+			arrayKey: "content",
+			fieldKey: "type",
+			expect:   "image",
+		},
+		{
+			name:     "contents mimeType",
+			data:     `{"contents":[{"uri":"file:///a.csv","mimeType":"text/csv","text":"data"}]}`,
+			arrayKey: "contents",
+			fieldKey: "mimeType",
+			expect:   "text/csv",
+		},
+		{
+			name:     "empty array",
+			data:     `{"content":[]}`,
+			arrayKey: "content",
+			fieldKey: "type",
+			expect:   "",
+		},
+		{
+			name:     "missing key",
+			data:     `{"other":[{"type":"text"}]}`,
+			arrayKey: "content",
+			fieldKey: "type",
+			expect:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractNestedArrayFirstString([]byte(tt.data), tt.arrayKey, tt.fieldKey)
+			if got != tt.expect {
+				t.Errorf("extractNestedArrayFirstString(%q, %q) = %q, want %q", tt.arrayKey, tt.fieldKey, got, tt.expect)
 			}
 		})
 	}

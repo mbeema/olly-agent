@@ -26,9 +26,10 @@ type GenAIMetrics struct {
 
 // genaiModelKey identifies a unique model for metric aggregation.
 type genaiModelKey struct {
-	Service  string
-	Provider string
-	Model    string
+	Service   string
+	Provider  string
+	Model     string
+	Operation string
 }
 
 type genaiModelMetrics struct {
@@ -57,16 +58,19 @@ func (g *GenAIMetrics) RecordSpan(span *traces.Span) {
 		return
 	}
 
-	provider := span.Attributes["gen_ai.system"]
+	provider := span.Attributes["gen_ai.provider.name"]
 	model := span.Attributes["gen_ai.response.model"]
 	if model == "" {
 		model = span.Attributes["gen_ai.request.model"]
 	}
 
+	operation := span.Attributes["gen_ai.operation.name"]
+
 	key := genaiModelKey{
-		Service:  span.ServiceName,
-		Provider: provider,
-		Model:    model,
+		Service:   span.ServiceName,
+		Provider:  provider,
+		Model:     model,
+		Operation: operation,
 	}
 
 	mm := g.getOrCreate(key)
@@ -136,8 +140,11 @@ func (g *GenAIMetrics) Collect(now time.Time) []*Metric {
 		}
 
 		baseLabels := map[string]string{
-			"gen_ai.system": key.Provider,
-			"gen_ai.response.model":  key.Model,
+			"gen_ai.provider.name":  key.Provider,
+			"gen_ai.response.model": key.Model,
+		}
+		if key.Operation != "" {
+			baseLabels["gen_ai.operation.name"] = key.Operation
 		}
 		if key.Service != "" {
 			baseLabels["service"] = key.Service
@@ -188,10 +195,6 @@ func (g *GenAIMetrics) Collect(now time.Time) []*Metric {
 		}
 
 		durationLabels := copyLabels(baseLabels)
-		if op := key.Model; op != "" {
-			// operation.name would come from span but we don't track it in the key
-			// to keep cardinality low — model is the primary dimension
-		}
 
 		metrics = append(metrics, &Metric{
 			Name:        "gen_ai.client.operation.duration",

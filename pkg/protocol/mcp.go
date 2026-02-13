@@ -196,6 +196,43 @@ func parseMCPResponse(response []byte, attrs *SpanAttributes) {
 			attrs.MCPErrorMsg = v
 		}
 	}
+
+	// Extract method-specific response data from result object
+	switch attrs.MCPMethod {
+	case "initialize":
+		// result.protocolVersion, result.serverInfo.name, result.serverInfo.version
+		if v := extractNestedJSONString(body, "result", "protocolVersion"); v != "" {
+			attrs.MCPProtocolVersion = v
+		}
+		if v := extractDeepJSONString(body, "result", "serverInfo", "name"); v != "" {
+			attrs.MCPServerName = v
+		}
+		if v := extractDeepJSONString(body, "result", "serverInfo", "version"); v != "" {
+			attrs.MCPServerVersion = v
+		}
+
+	case "tools/list":
+		// Count tools in result.tools array
+		if n := countJSONArrayElements(body, "tools"); n > 0 {
+			attrs.MCPToolsCount = n
+		}
+
+	case "tools/call":
+		// result.isError boolean
+		if v := extractNestedJSONBool(body, "result", "isError"); v == "true" {
+			attrs.MCPToolIsError = true
+		}
+		// First result.content[].type
+		if v := extractNestedArrayFirstString(body, "content", "type"); v != "" {
+			attrs.MCPToolContentType = v
+		}
+
+	case "resources/read":
+		// First result.contents[].mimeType
+		if v := extractNestedArrayFirstString(body, "contents", "mimeType"); v != "" {
+			attrs.MCPResourceMimeType = v
+		}
+	}
 }
 
 // buildMCPSpanName creates a descriptive span name from MCP attributes.
@@ -248,6 +285,155 @@ func extractNestedJSONString(data []byte, outer, inner string) string {
 
 	// Extract the inner value from the nested object
 	return extractJSONString(rest, inner)
+}
+
+// extractDeepJSONString extracts a string at 3 levels of nesting.
+// Looks for pattern: "l1":{..."l2":{..."l3":"value"...}...}
+func extractDeepJSONString(data []byte, l1, l2, l3 string) string {
+	// Find l1 key and its nested object
+	l1Needle := []byte(`"` + l1 + `"`)
+	idx := bytes.Index(data, l1Needle)
+	if idx < 0 {
+		return ""
+	}
+
+	rest := data[idx+len(l1Needle):]
+	rest = bytes.TrimLeft(rest, " \t\n\r")
+	if len(rest) == 0 || rest[0] != ':' {
+		return ""
+	}
+	rest = rest[1:]
+	rest = bytes.TrimLeft(rest, " \t\n\r")
+
+	if len(rest) == 0 || rest[0] != '{' {
+		return ""
+	}
+
+	// Now extract l2.l3 from within the l1 object
+	return extractNestedJSONString(rest, l2, l3)
+}
+
+// extractNestedJSONBool extracts a boolean value from a nested JSON object.
+// Looks for pattern: "outer":{..."inner":true...}
+func extractNestedJSONBool(data []byte, outer, inner string) string {
+	outerNeedle := []byte(`"` + outer + `"`)
+	idx := bytes.Index(data, outerNeedle)
+	if idx < 0 {
+		return ""
+	}
+
+	rest := data[idx+len(outerNeedle):]
+	rest = bytes.TrimLeft(rest, " \t\n\r")
+	if len(rest) == 0 || rest[0] != ':' {
+		return ""
+	}
+	rest = rest[1:]
+	rest = bytes.TrimLeft(rest, " \t\n\r")
+
+	if len(rest) == 0 || rest[0] != '{' {
+		return ""
+	}
+
+	return extractJSONBool(rest, inner)
+}
+
+// countJSONArrayElements counts elements in a JSON array for a given key.
+// Searches for "key":[...] and counts top-level elements by tracking commas
+// at bracket depth 1. Returns 0 if the array is not found or empty.
+func countJSONArrayElements(data []byte, key string) int {
+	needle := []byte(`"` + key + `"`)
+	idx := bytes.Index(data, needle)
+	if idx < 0 {
+		return 0
+	}
+
+	rest := data[idx+len(needle):]
+	rest = bytes.TrimLeft(rest, " \t\n\r")
+	if len(rest) == 0 || rest[0] != ':' {
+		return 0
+	}
+	rest = rest[1:]
+	rest = bytes.TrimLeft(rest, " \t\n\r")
+
+	if len(rest) == 0 || rest[0] != '[' {
+		return 0
+	}
+	rest = rest[1:]
+	rest = bytes.TrimLeft(rest, " \t\n\r")
+
+	// Empty array
+	if len(rest) > 0 && rest[0] == ']' {
+		return 0
+	}
+
+	// Count elements by tracking commas at depth 0 (within the array)
+	count := 1 // At least one element if we got here
+	depth := 0
+	inString := false
+	for i := 0; i < len(rest); i++ {
+		c := rest[i]
+		if inString {
+			if c == '\\' && i+1 < len(rest) {
+				i++ // skip escaped character
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{', '[':
+			depth++
+		case '}', ']':
+			if depth == 0 {
+				// Closing bracket of the array — done
+				return count
+			}
+			depth--
+		case ',':
+			if depth == 0 {
+				count++
+			}
+		}
+	}
+
+	// Truncated data — return what we counted
+	return count
+}
+
+// extractNestedArrayFirstString finds an array within the data by key name,
+// then extracts the given field from the first element of that array.
+// Used for patterns like: "content":[{"type":"text",...},...] → "text"
+func extractNestedArrayFirstString(data []byte, arrayKey, fieldKey string) string {
+	needle := []byte(`"` + arrayKey + `"`)
+	idx := bytes.Index(data, needle)
+	if idx < 0 {
+		return ""
+	}
+
+	rest := data[idx+len(needle):]
+	rest = bytes.TrimLeft(rest, " \t\n\r")
+	if len(rest) == 0 || rest[0] != ':' {
+		return ""
+	}
+	rest = rest[1:]
+	rest = bytes.TrimLeft(rest, " \t\n\r")
+
+	if len(rest) == 0 || rest[0] != '[' {
+		return ""
+	}
+	rest = rest[1:]
+	rest = bytes.TrimLeft(rest, " \t\n\r")
+
+	// First element should be an object
+	if len(rest) == 0 || rest[0] != '{' {
+		return ""
+	}
+
+	return extractJSONString(rest, fieldKey)
 }
 
 // extractNestedJSONNumber extracts a number value from a nested JSON object.

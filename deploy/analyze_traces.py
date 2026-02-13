@@ -70,16 +70,16 @@ def load_spans(path="/var/log/otel/traces.json"):
                             "olly.stitched": get_attr(span_attrs, "olly.stitched"),
                             "olly.trace_source": get_attr(span_attrs, "olly.trace_source"),
                             "olly.stitched.client_service": get_attr(span_attrs, "olly.stitched.client_service"),
-                            # MCP attributes
-                            "mcp.method": get_attr(span_attrs, "mcp.method"),
-                            "mcp.tool.name": get_attr(span_attrs, "mcp.tool.name"),
-                            "mcp.request.id": get_attr(span_attrs, "mcp.request.id"),
+                            # MCP attributes (OTEL semantic conventions Jan 2026)
+                            "mcp.method": get_attr(span_attrs, "mcp.method.name"),
+                            "mcp.tool.name": get_attr(span_attrs, "gen_ai.tool.name"),
+                            "mcp.request.id": get_attr(span_attrs, "jsonrpc.request.id"),
                             "mcp.resource.uri": get_attr(span_attrs, "mcp.resource.uri"),
-                            "mcp.prompt.name": get_attr(span_attrs, "mcp.prompt.name"),
+                            "mcp.prompt.name": get_attr(span_attrs, "gen_ai.prompt.name"),
                             "mcp.session.id": get_attr(span_attrs, "mcp.session.id"),
                             "mcp.transport": get_attr(span_attrs, "mcp.transport"),
-                            "mcp.error.code": get_attr(span_attrs, "mcp.error.code"),
-                            "mcp.error.message": get_attr(span_attrs, "mcp.error.message"),
+                            "mcp.error.code": get_attr(span_attrs, "rpc.jsonrpc.error_code"),
+                            "mcp.error.message": get_attr(span_attrs, "rpc.jsonrpc.error_message"),
                             # HTTP attributes
                             "http.request.method": get_attr(span_attrs, "http.request.method"),
                             "url.path": get_attr(span_attrs, "url.path"),
@@ -88,7 +88,7 @@ def load_spans(path="/var/log/otel/traces.json"):
                             # Protocol
                             "network.protocol": get_attr(span_attrs, "network.protocol.name"),
                             # GenAI
-                            "gen_ai.system": get_attr(span_attrs, "gen_ai.system"),
+                            "gen_ai.system": get_attr(span_attrs, "gen_ai.provider.name"),
                             "gen_ai.operation.name": get_attr(span_attrs, "gen_ai.operation.name"),
                             # DB
                             "db.system": get_attr(span_attrs, "db.system"),

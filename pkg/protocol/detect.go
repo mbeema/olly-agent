@@ -86,7 +86,14 @@ type SpanAttributes struct {
 	MCPSessionID   string // Mcp-Session-Id header
 	MCPErrorCode   int    // JSON-RPC error code
 	MCPErrorMsg    string // JSON-RPC error message
-	MCPTransport   string // "streamable-http" or "sse"
+	MCPTransport        string // "streamable-http" or "sse"
+	MCPProtocolVersion  string // From initialize response result.protocolVersion
+	MCPServerName       string // From initialize response result.serverInfo.name
+	MCPServerVersion    string // From initialize response result.serverInfo.version
+	MCPToolsCount       int    // Count of tools in tools/list response result.tools[]
+	MCPToolIsError      bool   // From tools/call response result.isError
+	MCPToolContentType  string // First content[].type from tools/call response
+	MCPResourceMimeType string // First contents[].mimeType from resources/read response
 
 	// General
 	Error      bool
