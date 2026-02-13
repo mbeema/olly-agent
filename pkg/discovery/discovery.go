@@ -247,6 +247,52 @@ func isInterpreter(name string) bool {
 	return interpreters[name]
 }
 
+// ScanProcesses scans running processes and returns PIDs matching the given regex patterns.
+func (d *Discoverer) ScanProcesses(patterns []string) []uint32 {
+	if len(patterns) == 0 {
+		return nil
+	}
+
+	// Compile patterns
+	compiled := make([]*regexp.Regexp, 0, len(patterns))
+	for _, p := range patterns {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			d.logger.Warn("invalid process pattern", zap.String("pattern", p), zap.Error(err))
+			continue
+		}
+		compiled = append(compiled, re)
+	}
+	if len(compiled) == 0 {
+		return nil
+	}
+
+	procs, err := process.Processes()
+	if err != nil {
+		d.logger.Warn("failed to list processes", zap.Error(err))
+		return nil
+	}
+
+	var matched []uint32
+	for _, p := range procs {
+		name, err := p.Name()
+		if err != nil {
+			continue
+		}
+
+		cmdline, _ := p.Cmdline()
+
+		for _, re := range compiled {
+			if re.MatchString(name) || re.MatchString(cmdline) {
+				matched = append(matched, uint32(p.Pid))
+				break
+			}
+		}
+	}
+
+	return matched
+}
+
 // InvalidateCache removes a PID from the cache.
 func (d *Discoverer) InvalidateCache(pid uint32) {
 	d.mu.Lock()

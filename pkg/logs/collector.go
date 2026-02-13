@@ -106,6 +106,7 @@ type Collector struct {
 	logger      *zap.Logger
 	parser      *Parser
 	auditParser *AuditParser
+	multiline   *MultilineAssembler
 
 	// Sampling and rate limiting
 	sampleRate    float64 // 0.0-1.0, 0 = unset (keep all)
@@ -136,6 +137,12 @@ func NewCollector(cfg *config.LogsConfig, logger *zap.Logger) *Collector {
 		c.tokenCount.Store(int64(c.rateLimit))
 		c.lastRefill.Store(time.Now().UnixNano())
 	}
+	// Initialize multiline assembler if configured
+	if cfg.Multiline.Enabled {
+		c.multiline = NewMultilineAssembler(&cfg.Multiline, func(record *LogRecord) {
+			c.emitDirect(record)
+		})
+	}
 	return c
 }
 
@@ -159,6 +166,17 @@ func (c *Collector) emit(record *LogRecord) {
 		return
 	}
 
+	// Route through multiline assembler if enabled
+	if c.multiline != nil {
+		c.multiline.Process(record)
+		return
+	}
+
+	c.emitDirect(record)
+}
+
+// emitDirect sends a record directly to callbacks (bypasses multiline/sampling).
+func (c *Collector) emitDirect(record *LogRecord) {
 	c.mu.RLock()
 	cbs := c.callbacks
 	c.mu.RUnlock()
@@ -282,5 +300,9 @@ func (c *Collector) Stop() error {
 		t.Stop()
 	}
 	c.wg.Wait()
+	// Flush any remaining multiline buffer
+	if c.multiline != nil {
+		c.multiline.Flush()
+	}
 	return nil
 }

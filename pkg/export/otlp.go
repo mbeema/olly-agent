@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
+	_ "google.golang.org/grpc/encoding/gzip" // Register gzip compressor
 
 	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	colmetricspb "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -33,10 +34,12 @@ import (
 
 // OTLPExporter sends telemetry via OTLP gRPC with automatic reconnection.
 type OTLPExporter struct {
-	logger      *zap.Logger
-	serviceName string
-	endpoint    string
-	opts        []grpc.DialOption
+	logger         *zap.Logger
+	serviceName    string
+	serviceVersion string
+	deploymentEnv  string
+	endpoint       string
+	opts           []grpc.DialOption
 
 	mu        sync.RWMutex
 	conn      *grpc.ClientConn
@@ -46,7 +49,7 @@ type OTLPExporter struct {
 }
 
 // NewOTLPExporter creates a new OTLP gRPC exporter.
-func NewOTLPExporter(cfg *config.OTLPConfig, serviceName string, logger *zap.Logger) (*OTLPExporter, error) {
+func NewOTLPExporter(cfg *config.OTLPConfig, serviceName, serviceVersion, deploymentEnv string, logger *zap.Logger) (*OTLPExporter, error) {
 	opts := []grpc.DialOption{
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(4 * 1024 * 1024)),
 	}
@@ -55,11 +58,18 @@ func NewOTLPExporter(cfg *config.OTLPConfig, serviceName string, logger *zap.Log
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
+	// Enable gzip compression for gRPC (default: gzip)
+	if cfg.Compression == "" || cfg.Compression == "gzip" {
+		opts = append(opts, grpc.WithDefaultCallOptions(grpc.UseCompressor("gzip")))
+	}
+
 	e := &OTLPExporter{
-		logger:      logger,
-		serviceName: serviceName,
-		endpoint:    cfg.Endpoint,
-		opts:        opts,
+		logger:         logger,
+		serviceName:    serviceName,
+		serviceVersion: serviceVersion,
+		deploymentEnv:  deploymentEnv,
+		endpoint:       cfg.Endpoint,
+		opts:           opts,
 	}
 
 	if err := e.connect(); err != nil {
@@ -158,6 +168,13 @@ func (e *OTLPExporter) resourceForService(serviceName string, pid uint32) *resou
 		strAttr("host.arch", runtime.GOARCH),
 		strAttr("process.executable.name", serviceName),
 		intAttr("process.pid", int64(pid)),
+	}
+
+	if e.serviceVersion != "" {
+		attrs = append(attrs, strAttr("service.version", e.serviceVersion))
+	}
+	if e.deploymentEnv != "" {
+		attrs = append(attrs, strAttr("deployment.environment", e.deploymentEnv))
 	}
 
 	return &resourcepb.Resource{Attributes: attrs}
@@ -300,7 +317,56 @@ func (e *OTLPExporter) convertSpan(s *traces.Span) (*tracepb.Span, error) {
 	return ps, nil
 }
 
-// ExportLogs sends log records via OTLP gRPC.
+// convertLogRecord converts a single LogRecord to its protobuf representation.
+func (e *OTLPExporter) convertLogRecord(l *LogRecord) *logspb.LogRecord {
+	pl := &logspb.LogRecord{
+		TimeUnixNano: uint64(l.Timestamp.UnixNano()),
+		Body: &commonpb.AnyValue{
+			Value: &commonpb.AnyValue_StringValue{StringValue: l.Body},
+		},
+		SeverityText:   l.Level,
+		SeverityNumber: logspb.SeverityNumber(l.SeverityNumber), // R3.1
+	}
+
+	// R3.2: Set ObservedTimestamp (when collector received the log)
+	if !l.ObservedTime.IsZero() {
+		pl.ObservedTimeUnixNano = uint64(l.ObservedTime.UnixNano())
+	}
+
+	if l.TraceID != "" {
+		if tid, err := hexToBytes(l.TraceID, 16); err == nil {
+			pl.TraceId = tid
+			// R3.3: Set TraceFlags when correlated
+			pl.Flags = 0x01 // sampled
+		}
+	}
+	if l.SpanID != "" {
+		if sid, err := hexToBytes(l.SpanID, 8); err == nil {
+			pl.SpanId = sid
+		}
+	}
+
+	// R3.4: Add log source attributes
+	if l.FilePath != "" {
+		l.Attributes["log.file.path"] = l.FilePath
+		l.Attributes["log.file.name"] = filepath.Base(l.FilePath)
+	}
+	if l.Source != "" {
+		l.Attributes["source"] = l.Source
+	}
+
+	for k, v := range l.Attributes {
+		pl.Attributes = append(pl.Attributes, &commonpb.KeyValue{
+			Key:   k,
+			Value: toAnyValue(v),
+		})
+	}
+
+	return pl
+}
+
+// ExportLogs sends log records via OTLP gRPC, grouping by service name
+// so each service gets its own ResourceLogs with accurate resource attributes.
 func (e *OTLPExporter) ExportLogs(ctx context.Context, logs []*LogRecord) error {
 	if len(logs) == 0 {
 		return nil
@@ -310,69 +376,38 @@ func (e *OTLPExporter) ExportLogs(ctx context.Context, logs []*LogRecord) error 
 		return fmt.Errorf("connection not ready: %w", err)
 	}
 
-	protoLogs := make([]*logspb.LogRecord, 0, len(logs))
+	// Group logs by service name for per-service ResourceLogs.
+	type svcKey struct {
+		name string
+		pid  int
+	}
+	grouped := make(map[svcKey][]*logspb.LogRecord)
 	for _, l := range logs {
-		pl := &logspb.LogRecord{
-			TimeUnixNano: uint64(l.Timestamp.UnixNano()),
-			Body: &commonpb.AnyValue{
-				Value: &commonpb.AnyValue_StringValue{StringValue: l.Body},
+		pl := e.convertLogRecord(l)
+		key := svcKey{name: l.ServiceName, pid: l.PID}
+		grouped[key] = append(grouped[key], pl)
+	}
+
+	scope := &commonpb.InstrumentationScope{
+		Name:    "olly",
+		Version: "0.1.0",
+	}
+
+	resourceLogs := make([]*logspb.ResourceLogs, 0, len(grouped))
+	for key, protoLogs := range grouped {
+		resourceLogs = append(resourceLogs, &logspb.ResourceLogs{
+			Resource: e.resourceForService(key.name, uint32(key.pid)),
+			ScopeLogs: []*logspb.ScopeLogs{
+				{
+					Scope:      scope,
+					LogRecords: protoLogs,
+				},
 			},
-			SeverityText:   l.Level,
-			SeverityNumber: logspb.SeverityNumber(l.SeverityNumber), // R3.1
-		}
-
-		// R3.2: Set ObservedTimestamp (when collector received the log)
-		if !l.ObservedTime.IsZero() {
-			pl.ObservedTimeUnixNano = uint64(l.ObservedTime.UnixNano())
-		}
-
-		if l.TraceID != "" {
-			if tid, err := hexToBytes(l.TraceID, 16); err == nil {
-				pl.TraceId = tid
-				// R3.3: Set TraceFlags when correlated
-				pl.Flags = 0x01 // sampled
-			}
-		}
-		if l.SpanID != "" {
-			if sid, err := hexToBytes(l.SpanID, 8); err == nil {
-				pl.SpanId = sid
-			}
-		}
-
-		// R3.4: Add log source attributes
-		if l.FilePath != "" {
-			l.Attributes["log.file.path"] = l.FilePath
-			l.Attributes["log.file.name"] = filepath.Base(l.FilePath)
-		}
-		if l.Source != "" {
-			l.Attributes["source"] = l.Source
-		}
-
-		for k, v := range l.Attributes {
-			pl.Attributes = append(pl.Attributes, &commonpb.KeyValue{
-				Key:   k,
-				Value: toAnyValue(v),
-			})
-		}
-
-		protoLogs = append(protoLogs, pl)
+		})
 	}
 
 	req := &collogspb.ExportLogsServiceRequest{
-		ResourceLogs: []*logspb.ResourceLogs{
-			{
-				Resource: e.resource(),
-				ScopeLogs: []*logspb.ScopeLogs{
-					{
-						Scope: &commonpb.InstrumentationScope{
-							Name:    "olly",
-							Version: "0.1.0",
-						},
-						LogRecords: protoLogs,
-					},
-				},
-			},
-		},
+		ResourceLogs: resourceLogs,
 	}
 
 	e.mu.RLock()
@@ -383,7 +418,8 @@ func (e *OTLPExporter) ExportLogs(ctx context.Context, logs []*LogRecord) error 
 	return err
 }
 
-// ExportMetrics sends metrics via OTLP gRPC.
+// ExportMetrics sends metrics via OTLP gRPC, grouping by service name
+// so each service gets its own ResourceMetrics with accurate resource attributes.
 func (e *OTLPExporter) ExportMetrics(ctx context.Context, metrics []*Metric) error {
 	if len(metrics) == 0 {
 		return nil
@@ -393,29 +429,35 @@ func (e *OTLPExporter) ExportMetrics(ctx context.Context, metrics []*Metric) err
 		return fmt.Errorf("connection not ready: %w", err)
 	}
 
-	protoMetrics := make([]*metricspb.Metric, 0, len(metrics))
+	// Group metrics by service name for per-service ResourceMetrics.
+	grouped := make(map[string][]*metricspb.Metric)
 	for _, m := range metrics {
 		pm := e.convertMetric(m)
 		if pm != nil {
-			protoMetrics = append(protoMetrics, pm)
+			grouped[m.ServiceName] = append(grouped[m.ServiceName], pm)
 		}
 	}
 
-	req := &colmetricspb.ExportMetricsServiceRequest{
-		ResourceMetrics: []*metricspb.ResourceMetrics{
-			{
-				Resource: e.resource(),
-				ScopeMetrics: []*metricspb.ScopeMetrics{
-					{
-						Scope: &commonpb.InstrumentationScope{
-							Name:    "olly",
-							Version: "0.1.0",
-						},
-						Metrics: protoMetrics,
-					},
+	scope := &commonpb.InstrumentationScope{
+		Name:    "olly",
+		Version: "0.1.0",
+	}
+
+	resourceMetrics := make([]*metricspb.ResourceMetrics, 0, len(grouped))
+	for svcName, protoMetrics := range grouped {
+		resourceMetrics = append(resourceMetrics, &metricspb.ResourceMetrics{
+			Resource: e.resourceForService(svcName, uint32(os.Getpid())),
+			ScopeMetrics: []*metricspb.ScopeMetrics{
+				{
+					Scope:   scope,
+					Metrics: protoMetrics,
 				},
 			},
-		},
+		})
+	}
+
+	req := &colmetricspb.ExportMetricsServiceRequest{
+		ResourceMetrics: resourceMetrics,
 	}
 
 	e.mu.RLock()

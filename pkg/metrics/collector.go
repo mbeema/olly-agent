@@ -29,6 +29,7 @@ type Metric struct {
 	Timestamp   time.Time
 	Labels      map[string]string
 	Histogram   *HistogramData // populated for Histogram type
+	ServiceName string         // Service that produced this metric
 }
 
 // HistogramData holds histogram bucket data for export.

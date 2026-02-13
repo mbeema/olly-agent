@@ -149,7 +149,13 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 		serviceName = "olly-agent"
 	}
 
-	exporter, err := export.NewManager(&cfg.Exporters, serviceName, logger, &cfg.Profiling.Pyroscope)
+	exporter, err := export.NewManagerFromConfig(&export.ManagerConfig{
+		Exporters:      &cfg.Exporters,
+		ServiceName:    serviceName,
+		ServiceVersion: cfg.ServiceVersion,
+		DeploymentEnv:  cfg.DeploymentEnv,
+		PyroscopeCfg:   &cfg.Profiling.Pyroscope,
+	}, logger)
 	if err != nil {
 		return nil, fmt.Errorf("create exporter: %w", err)
 	}
@@ -831,6 +837,22 @@ func (a *Agent) processSpan(span *traces.Span) {
 		a.mcpMetrics.RecordSpan(span)
 	}
 
+	// Feed CLIENT spans to service map for enrichment
+	if a.serviceMap != nil && span.Kind == traces.SpanKindClient {
+		srcService := span.ServiceName
+		dstService := span.RemoteAddr
+		if a.discoverer != nil {
+			if portName := a.discoverer.GetServiceNameByPort(span.RemotePort); portName != "" {
+				dstService = portName
+			}
+		}
+		a.serviceMap.RecordSpan(
+			srcService, dstService, span.RemotePort,
+			span.Protocol, span.Status == traces.StatusError,
+			span.Duration,
+		)
+	}
+
 	// Export
 	a.exporter.ExportSpan(span)
 	a.healthStats.SpansExported.Add(1)
@@ -1194,6 +1216,15 @@ func (a *Agent) cleanupLoop(ctx context.Context) {
 				}
 				return true
 			})
+
+			// Process auto-discovery: scan for matching processes
+			cfg := a.cfg.Load()
+			if a.discoverer != nil && len(cfg.Discovery.ProcessNames) > 0 && a.processColl != nil {
+				discovered := a.discoverer.ScanProcesses(cfg.Discovery.ProcessNames)
+				for _, pid := range discovered {
+					a.processColl.AddPID(pid)
+				}
+			}
 
 			if staleConns > 0 || staleStreams > 0 || staleStitched > 0 || staleThreadCtx > 0 {
 				a.logger.Debug("cleanup",

@@ -17,8 +17,10 @@ import (
 
 // Config is the top-level configuration for the olly agent.
 type Config struct {
-	ServiceName string          `yaml:"service_name" env:"OLLY_SERVICE_NAME"`
-	LogLevel    string          `yaml:"log_level" env:"OLLY_LOG_LEVEL"`
+	ServiceName    string          `yaml:"service_name" env:"OLLY_SERVICE_NAME"`
+	ServiceVersion string          `yaml:"service_version" env:"OLLY_SERVICE_VERSION"`
+	DeploymentEnv  string          `yaml:"deployment_environment" env:"OLLY_DEPLOYMENT_ENV"`
+	LogLevel       string          `yaml:"log_level" env:"OLLY_LOG_LEVEL"`
 	Hook        HookConfig      `yaml:"hook"`
 	Tracing     TracingConfig   `yaml:"tracing"`
 	Logs        LogsConfig      `yaml:"logs"`
@@ -79,6 +81,14 @@ type LogsConfig struct {
 	Security  SecurityLogConfig `yaml:"security"`
 	Sampling  LogSamplingConfig `yaml:"sampling"`
 	RateLimit int               `yaml:"rate_limit"` // Max logs per second (0 = unlimited)
+	Multiline MultilineConfig   `yaml:"multiline"`
+}
+
+// MultilineConfig configures multiline log assembly.
+type MultilineConfig struct {
+	Enabled      bool          `yaml:"enabled"`
+	MaxLines     int           `yaml:"max_lines"`     // Max lines to buffer (default: 100)
+	FlushTimeout time.Duration `yaml:"flush_timeout"` // Flush timeout (default: 100ms)
 }
 
 type SecurityLogConfig struct {
@@ -142,11 +152,12 @@ type ExportersConfig struct {
 }
 
 type OTLPConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	Endpoint string `yaml:"endpoint"`
-	Protocol string `yaml:"protocol"` // "grpc" or "http"
-	Insecure bool   `yaml:"insecure"`
-	Headers  map[string]string `yaml:"headers"`
+	Enabled     bool              `yaml:"enabled"`
+	Endpoint    string            `yaml:"endpoint"`
+	Protocol    string            `yaml:"protocol"`    // "grpc" or "http"
+	Compression string            `yaml:"compression"` // "gzip" or "none" (default: "gzip")
+	Insecure    bool              `yaml:"insecure"`
+	Headers     map[string]string `yaml:"headers"`
 }
 
 type StdoutConfig struct {
@@ -158,6 +169,7 @@ type DiscoveryConfig struct {
 	Enabled      bool           `yaml:"enabled"`
 	EnvVars      []string       `yaml:"env_vars"`
 	PortMappings map[int]string `yaml:"port_mappings"`
+	ProcessNames []string       `yaml:"process_names"` // Regex patterns to auto-discover processes
 }
 
 type ProfilingConfig struct {
@@ -286,10 +298,11 @@ func DefaultConfig() *Config {
 		},
 		Exporters: ExportersConfig{
 			OTLP: OTLPConfig{
-				Enabled:  true,
-				Endpoint: "localhost:4317",
-				Protocol: "grpc",
-				Insecure: true,
+				Enabled:     true,
+				Endpoint:    "localhost:4317",
+				Protocol:    "grpc",
+				Compression: "gzip",
+				Insecure:    true,
 			},
 			Stdout: StdoutConfig{
 				Enabled: false,
@@ -385,6 +398,8 @@ func loadFileInto(path string, cfg *Config) error {
 func (c *Config) ApplyEnvOverrides() {
 	envOverrides := map[string]func(string){
 		"OLLY_SERVICE_NAME":            func(v string) { c.ServiceName = v },
+		"OLLY_SERVICE_VERSION":         func(v string) { c.ServiceVersion = v },
+		"OLLY_DEPLOYMENT_ENV":          func(v string) { c.DeploymentEnv = v },
 		"OLLY_LOG_LEVEL":               func(v string) { c.LogLevel = v },
 		"OLLY_HEALTH_PORT":             func(v string) { c.Health.Port = v },
 		"OLLY_EXPORTERS_OTLP_ENDPOINT": func(v string) { c.Exporters.OTLP.Endpoint = v },
@@ -456,6 +471,9 @@ func (c *Config) Validate() error {
 		}
 		if c.Exporters.OTLP.Protocol != "grpc" && c.Exporters.OTLP.Protocol != "http" {
 			return fmt.Errorf("exporters.otlp.protocol must be 'grpc' or 'http'")
+		}
+		if c.Exporters.OTLP.Compression != "" && c.Exporters.OTLP.Compression != "gzip" && c.Exporters.OTLP.Compression != "none" {
+			return fmt.Errorf("exporters.otlp.compression must be 'gzip' or 'none'")
 		}
 	}
 

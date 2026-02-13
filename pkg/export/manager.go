@@ -45,6 +45,7 @@ type Metric struct {
 	Timestamp   time.Time
 	Labels      map[string]string
 	Histogram   *HistogramValue
+	ServiceName string // Service that produced this metric
 }
 
 // MetricType identifies the kind of metric.
@@ -108,32 +109,63 @@ type Manager struct {
 	batchSize     int
 	flushInterval time.Duration
 
-	pyroscope *PyroscopeExporter
+	pyroscope      *PyroscopeExporter
+	circuitBreaker *CircuitBreaker
 
 	wg     sync.WaitGroup
 	stopCh chan struct{}
 }
 
+// ManagerConfig holds the configuration needed to create a Manager.
+type ManagerConfig struct {
+	Exporters      *config.ExportersConfig
+	ServiceName    string
+	ServiceVersion string
+	DeploymentEnv  string
+	PyroscopeCfg   *config.PyroscopeConfig
+}
+
 // NewManager creates a new export manager from configuration.
 func NewManager(cfg *config.ExportersConfig, serviceName string, logger *zap.Logger, pyroscopeCfg ...*config.PyroscopeConfig) (*Manager, error) {
-	m := &Manager{
-		logger:        logger,
-		spanCh:        make(chan *traces.Span, defaultChannelSize),
-		logCh:         make(chan *LogRecord, defaultChannelSize),
-		metricCh:      make(chan *Metric, defaultChannelSize),
-		profileCh:     make(chan *profiling.Profile, defaultChannelSize),
-		batchSize:     defaultBatchSize,
-		flushInterval: defaultFlushInterval,
-		stopCh:        make(chan struct{}),
+	mc := &ManagerConfig{
+		Exporters:   cfg,
+		ServiceName: serviceName,
 	}
+	if len(pyroscopeCfg) > 0 {
+		mc.PyroscopeCfg = pyroscopeCfg[0]
+	}
+	return NewManagerFromConfig(mc, logger)
+}
+
+// NewManagerFromConfig creates a new export manager with full config support.
+func NewManagerFromConfig(mc *ManagerConfig, logger *zap.Logger) (*Manager, error) {
+	m := &Manager{
+		logger:         logger,
+		spanCh:         make(chan *traces.Span, defaultChannelSize),
+		logCh:          make(chan *LogRecord, defaultChannelSize),
+		metricCh:       make(chan *Metric, defaultChannelSize),
+		profileCh:      make(chan *profiling.Profile, defaultChannelSize),
+		batchSize:      defaultBatchSize,
+		flushInterval:  defaultFlushInterval,
+		circuitBreaker: NewCircuitBreaker(5, 30*time.Second),
+		stopCh:         make(chan struct{}),
+	}
+
+	cfg := mc.Exporters
 
 	// Initialize exporters
 	if cfg.OTLP.Enabled {
-		otlp, err := NewOTLPExporter(&cfg.OTLP, serviceName, logger)
+		var exp Exporter
+		var err error
+		if cfg.OTLP.Protocol == "http" {
+			exp, err = NewHTTPOTLPExporter(&cfg.OTLP, mc.ServiceName, mc.ServiceVersion, mc.DeploymentEnv, logger)
+		} else {
+			exp, err = NewOTLPExporter(&cfg.OTLP, mc.ServiceName, mc.ServiceVersion, mc.DeploymentEnv, logger)
+		}
 		if err != nil {
 			logger.Warn("failed to create OTLP exporter", zap.Error(err))
 		} else {
-			m.exporters = append(m.exporters, otlp)
+			m.exporters = append(m.exporters, exp)
 		}
 	}
 
@@ -142,9 +174,9 @@ func NewManager(cfg *config.ExportersConfig, serviceName string, logger *zap.Log
 	}
 
 	// Initialize Pyroscope exporter if configured
-	if len(pyroscopeCfg) > 0 && pyroscopeCfg[0] != nil && pyroscopeCfg[0].Enabled {
-		m.pyroscope = NewPyroscopeExporter(pyroscopeCfg[0], logger)
-		logger.Info("pyroscope exporter enabled", zap.String("endpoint", pyroscopeCfg[0].Endpoint))
+	if mc.PyroscopeCfg != nil && mc.PyroscopeCfg.Enabled {
+		m.pyroscope = NewPyroscopeExporter(mc.PyroscopeCfg, logger)
+		logger.Info("pyroscope exporter enabled", zap.String("endpoint", mc.PyroscopeCfg.Endpoint))
 	}
 
 	return m, nil
@@ -492,8 +524,16 @@ func (m *Manager) flushMetrics(ctx context.Context, metrics []*Metric) {
 	m.metricCount.Add(int64(len(metrics)))
 }
 
-// retryExport attempts an export with exponential backoff.
+// retryExport attempts an export with exponential backoff and circuit breaker.
 func (m *Manager) retryExport(ctx context.Context, signal string, exportFn func(context.Context) error) {
+	if !m.circuitBreaker.Allow() {
+		m.dropCount.Add(1)
+		m.logger.Debug("circuit breaker open, dropping export",
+			zap.String("signal", signal),
+		)
+		return
+	}
+
 	backoff := initialBackoff
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -502,8 +542,11 @@ func (m *Manager) retryExport(ctx context.Context, signal string, exportFn func(
 		cancel()
 
 		if err == nil {
+			m.circuitBreaker.RecordSuccess()
 			return
 		}
+
+		m.circuitBreaker.RecordFailure()
 
 		if attempt == maxRetries {
 			m.logger.Error("export failed after retries",

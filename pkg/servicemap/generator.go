@@ -18,8 +18,27 @@ type Edge struct {
 	Source      string
 	Destination string
 	Port        uint16
+	Protocol    string
 	Count       uint64
+	ErrorCount  uint64
+	LatencySum  time.Duration
 	LastSeen    time.Time
+}
+
+// AvgLatency returns the average latency for this edge.
+func (e *Edge) AvgLatency() time.Duration {
+	if e.Count == 0 {
+		return 0
+	}
+	return e.LatencySum / time.Duration(e.Count)
+}
+
+// ErrorRate returns the error rate (0.0-1.0) for this edge.
+func (e *Edge) ErrorRate() float64 {
+	if e.Count == 0 {
+		return 0
+	}
+	return float64(e.ErrorCount) / float64(e.Count)
 }
 
 // Generator builds a service dependency graph from observed connections.
@@ -57,6 +76,30 @@ func (g *Generator) RecordConnection(source, destination string, port uint16) {
 	g.mu.Unlock()
 }
 
+// RecordSpan records span data for service map enrichment.
+func (g *Generator) RecordSpan(source, destination string, port uint16, protocol string, isError bool, latency time.Duration) {
+	key := fmt.Sprintf("%s->%s:%d", source, destination, port)
+
+	g.mu.Lock()
+	edge, ok := g.edges[key]
+	if !ok {
+		edge = &Edge{
+			Source:      source,
+			Destination: destination,
+			Port:        port,
+		}
+		g.edges[key] = edge
+	}
+	edge.Protocol = protocol
+	edge.Count++
+	edge.LatencySum += latency
+	if isError {
+		edge.ErrorCount++
+	}
+	edge.LastSeen = time.Now()
+	g.mu.Unlock()
+}
+
 // GetEdges returns all edges in the service map.
 func (g *Generator) GetEdges() []*Edge {
 	g.mu.RLock()
@@ -68,7 +111,10 @@ func (g *Generator) GetEdges() []*Edge {
 			Source:      e.Source,
 			Destination: e.Destination,
 			Port:        e.Port,
+			Protocol:    e.Protocol,
 			Count:       e.Count,
+			ErrorCount:  e.ErrorCount,
+			LatencySum:  e.LatencySum,
 			LastSeen:    e.LastSeen,
 		})
 	}
