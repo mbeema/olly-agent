@@ -14,7 +14,6 @@ data:
     log_level: {{ .Values.config.logLevel }}
     hook:
       enabled: true
-      socket_path: /var/run/olly/hook.sock
     exporters:
       otlp:
         enabled: true

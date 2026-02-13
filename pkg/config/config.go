@@ -35,13 +35,11 @@ type Config struct {
 }
 
 type HookConfig struct {
-	Enabled     bool   `yaml:"enabled"`
-	SocketPath  string `yaml:"socket_path"`
-	LibraryPath string `yaml:"library_path"`
-	HTTPPorts   []int  `yaml:"http_ports"`
-	Debug       bool   `yaml:"debug"`
-	OnDemand    bool   `yaml:"on_demand"`    // Start dormant; activate via 'olly trace start'
-	LogCapture  *bool  `yaml:"log_capture"`  // Capture log writes via write() hook (default: true)
+	Enabled    bool  `yaml:"enabled"`
+	HTTPPorts  []int `yaml:"http_ports"`
+	Debug      bool  `yaml:"debug"`
+	OnDemand   bool  `yaml:"on_demand"`   // Start dormant; activate via BPF map toggle
+	LogCapture *bool `yaml:"log_capture"` // Capture log writes via write() hook (default: true)
 }
 
 // LogCaptureEnabled returns whether log capture via write() hook is enabled.
@@ -249,9 +247,8 @@ func DefaultConfig() *Config {
 		ServiceName: "auto",
 		LogLevel:    "info",
 		Hook: HookConfig{
-			Enabled:    true,
-			SocketPath: "/var/run/olly/hook.sock",
-			HTTPPorts:  []int{80, 443, 8080, 8443, 3000, 5000, 8000},
+			Enabled:   true,
+			HTTPPorts: []int{80, 443, 8080, 8443, 3000, 5000, 8000},
 		},
 		Tracing: TracingConfig{
 			Enabled: true,
@@ -404,7 +401,6 @@ func (c *Config) ApplyEnvOverrides() {
 		"OLLY_HEALTH_PORT":             func(v string) { c.Health.Port = v },
 		"OLLY_EXPORTERS_OTLP_ENDPOINT": func(v string) { c.Exporters.OTLP.Endpoint = v },
 		"OLLY_EXPORTERS_OTLP_PROTOCOL": func(v string) { c.Exporters.OTLP.Protocol = v },
-		"OLLY_HOOK_SOCKET_PATH":        func(v string) { c.Hook.SocketPath = v },
 	}
 
 	// Also handle boolean overrides
@@ -461,10 +457,6 @@ func parseFloat(s string) (float64, bool) {
 
 // Validate checks the configuration for errors.
 func (c *Config) Validate() error {
-	if c.Hook.Enabled && c.Hook.SocketPath == "" {
-		return fmt.Errorf("hook.socket_path is required when hook is enabled")
-	}
-
 	if c.Exporters.OTLP.Enabled {
 		if c.Exporters.OTLP.Endpoint == "" {
 			return fmt.Errorf("exporters.otlp.endpoint is required when OTLP is enabled")

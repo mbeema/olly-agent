@@ -219,7 +219,7 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 	// Initialize service map
 	a.serviceMap = servicemap.NewGenerator(logger)
 
-	// Select hook provider: prefer eBPF, fall back to socket manager, stub if unsupported
+	// Select hook provider: eBPF on Linux 5.8+, stub otherwise
 	if cfg.Hook.Enabled {
 		a.hookProvider = selectHookProvider(cfg, logger)
 	}
@@ -229,7 +229,7 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 
 // selectHookProvider picks the best available hook provider for the platform.
 func selectHookProvider(cfg *config.Config, logger *zap.Logger) hook.HookProvider {
-	// Try eBPF first (Linux 5.8+ with BTF)
+	// Try eBPF (Linux 5.8+ with BTF)
 	support := hookebpf.Detect()
 	if support.Available {
 		logger.Info("eBPF support detected",
@@ -239,19 +239,11 @@ func selectHookProvider(cfg *config.Config, logger *zap.Logger) hook.HookProvide
 		return hookebpf.NewProvider(cfg, logger)
 	}
 
-	logger.Info("eBPF not available, checking fallback options",
+	logger.Info("eBPF not available, using stub provider",
 		zap.String("reason", support.Reason),
 	)
 
-	// Fall back to legacy socket-based manager if socket_path is configured
-	if cfg.Hook.SocketPath != "" {
-		logger.Info("using legacy socket hook provider",
-			zap.String("socket", cfg.Hook.SocketPath),
-		)
-		return hook.NewManager(cfg.Hook.SocketPath, logger)
-	}
-
-	// Stub provider — agent runs without hook tracing
+	// Stub provider — agent runs without hook tracing (logs+metrics still work)
 	return hookebpf.NewStubProvider(support.Reason, logger)
 }
 
@@ -916,7 +908,7 @@ func (a *Agent) processLog(record *logs.LogRecord) {
 	})
 }
 
-// processHookLog handles log data captured by the write() hook in libolly.c.
+// processHookLog handles log data captured by the write() kprobe in eBPF.
 // The key advantage: PID and TID come from the syscall context, enabling
 // automatic correlation with active traces via the correlation engine.
 func (a *Agent) processHookLog(pid, tid uint32, fd int32, data []byte, ts uint64) {

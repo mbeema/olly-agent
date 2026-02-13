@@ -4,11 +4,9 @@
 service_name: auto
 log_level: info
 
-# Library hooking configuration
+# eBPF hook configuration
 hook:
   enabled: true
-  socket_path: /var/run/olly/hook.sock
-  # library_path: /usr/lib/libolly.so
   http_ports: [80, 443, 8080, 8443, 3000, 5000, 8000]
   debug: false
 

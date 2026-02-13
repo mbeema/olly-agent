@@ -6,9 +6,17 @@ package hook
 
 import "context"
 
+// Callbacks for hook events.
+type Callbacks struct {
+	OnConnect func(pid, tid uint32, fd int32, remoteAddr uint32, remotePort uint16, ts uint64)
+	OnAccept  func(pid, tid uint32, fd int32, remoteAddr uint32, remotePort uint16, ts uint64)
+	OnDataOut func(pid, tid uint32, fd int32, data []byte, ts uint64)
+	OnDataIn  func(pid, tid uint32, fd int32, data []byte, ts uint64)
+	OnClose    func(pid, tid uint32, fd int32, ts uint64)
+	OnLogWrite func(pid, tid uint32, fd int32, data []byte, ts uint64)
+}
+
 // HookProvider is the interface for hook event sources.
-// Implementations include the eBPF provider (Linux 5.8+) and the legacy
-// Unix DGRAM socket manager (LD_PRELOAD-based).
 type HookProvider interface {
 	// Start begins capturing hook events and dispatching to callbacks.
 	Start(ctx context.Context, callbacks Callbacks) error
@@ -25,7 +33,7 @@ type HookProvider interface {
 	// IsTracingEnabled returns the current tracing state.
 	IsTracingEnabled() bool
 
-	// Name returns the provider name (e.g., "ebpf", "socket", "stub").
+	// Name returns the provider name (e.g., "ebpf", "stub").
 	Name() string
 }
 

@@ -66,7 +66,7 @@ sudo systemctl reload postgresql
 # Initialize demo database with schema + grants
 sudo -u postgres psql -d demo -f olly-deploy/demo-app/init_db.sql || true
 
-# Install Python deps (as root — app runs as root with LD_PRELOAD)
+# Install Python deps (as root — app runs as root)
 sudo pip3 install -r olly-deploy/demo-app/requirements.txt
 sudo cp -r olly-deploy/demo-app /opt/olly/demo-app
 
@@ -100,12 +100,6 @@ else
     sudo bash -c 'nohup python3 /opt/olly/demo-app/app.py > /var/log/demo-app/stdout.log 2>&1 &'
 fi
 sleep 3
-
-# Activate tracing if on-demand mode is configured
-# (base.yaml has on_demand: true — agent starts dormant, must be explicitly activated)
-if [ -f /var/run/olly/control ]; then
-    sudo /opt/olly/olly trace start 2>/dev/null && echo "Tracing activated (on-demand mode)" || true
-fi
 
 echo "=== Deployment complete ==="
 echo "Demo app: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):5000"
