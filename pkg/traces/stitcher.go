@@ -105,21 +105,34 @@ func (s *Stitcher) ProcessSpan(span *Span) bool {
 // then stores for future SERVER matching if no match found.
 // Returns true if the span was stored (deferred) for future matching.
 func (s *Stitcher) processClientSpan(span *Span) bool {
-	// Only stitch HTTP/gRPC CLIENT spans. DB/Redis/MongoDB/GenAI CLIENT spans
-	// connect to unmonitored services — no matching SERVER span will arrive.
-	// GenAI CLIENT spans go to external APIs (OpenAI, Anthropic, etc.) which
-	// are not monitored by this agent.
-	if span.Protocol != "http" && span.Protocol != "grpc" {
+	// Skip already-stitched spans — re-exported clones from the stitch callback
+	// re-enter via spanCh and must not be processed again.
+	if span.Attributes["olly.stitched"] == "true" {
 		return false
 	}
 
-	// Skip if the span already has proper cross-service linking via traceparent.
-	// Two cases: (a) "traceparent" — extracted from HTTP headers in the request data,
-	// (b) "injected" — CLIENT span whose spanID was set by sk_msg traceparent injection.
-	// In both cases, the CLIENT→SERVER link is already established and stitching
-	// would only cause false matches or unnecessary deferral.
+	// Only stitch HTTP/gRPC/MCP CLIENT spans. DB/Redis/MongoDB/GenAI CLIENT
+	// spans connect to unmonitored services — no matching SERVER span will
+	// arrive. GenAI CLIENT spans go to external APIs (OpenAI, Anthropic, etc.)
+	// which are not monitored by this agent. MCP CLIENT spans connect to
+	// local MCP servers which ARE monitored.
+	if span.Protocol != "http" && span.Protocol != "grpc" && span.Protocol != "mcp" {
+		return false
+	}
+
+	// Skip if the span already has confirmed cross-service linking via traceparent.
+	// "traceparent" means the span extracted a traceparent header from the request data,
+	// confirming both sender and receiver have the same trace context.
 	traceSource := span.Attributes["olly.trace_source"]
-	if span.ParentSpanID != "" && (traceSource == "traceparent" || traceSource == "injected") {
+	if span.ParentSpanID != "" && traceSource == "traceparent" {
+		return false
+	}
+	// For HTTP/gRPC, sk_msg injection is reliable: the traceparent header fits within
+	// the 256-byte eBPF capture window, so the receiver will extract it. Skip these.
+	// For MCP, Python's requests library adds many headers (~200 bytes), pushing the
+	// traceparent beyond 256 bytes. The receiver often fails to extract it, so MCP
+	// "injected" CLIENT spans must go through the stitcher for cross-service linking.
+	if span.ParentSpanID != "" && traceSource == "injected" && span.Protocol != "mcp" {
 		return false
 	}
 
@@ -209,6 +222,11 @@ func (s *Stitcher) processClientSpan(span *Span) bool {
 		// Stitch: CLIENT adopts SERVER's traceID (preserving the SERVER's
 		// intra-process children which share that traceID), and SERVER
 		// gets CLIENT as parent for the cross-service hierarchy.
+		// Clear CLIENT's ParentSpanID if traceID changes — the original
+		// parent is in a different trace and would be an orphaned reference.
+		if span.TraceID != bestMatch.span.TraceID {
+			span.ParentSpanID = ""
+		}
 		span.TraceID = bestMatch.span.TraceID
 		bestMatch.span.ParentSpanID = span.SpanID
 
@@ -263,9 +281,15 @@ store:
 // processServerSpan first tries to match against pending CLIENT spans,
 // then stores for future CLIENT matching if no match found.
 func (s *Stitcher) processServerSpan(span *Span) bool {
-	// Only stitch HTTP/gRPC SERVER spans (symmetric with client filter).
+	// Skip already-stitched spans — re-exported clones from the stitch callback
+	// re-enter via spanCh and must not be processed again.
+	if span.Attributes["olly.stitched"] == "true" {
+		return false
+	}
+
+	// Only stitch HTTP/gRPC/MCP SERVER spans (symmetric with client filter).
 	// GenAI spans are CLIENT-only (to external LLM APIs), so no SERVER filter needed.
-	if span.Protocol != "http" && span.Protocol != "grpc" {
+	if span.Protocol != "http" && span.Protocol != "grpc" && span.Protocol != "mcp" {
 		return false
 	}
 
@@ -356,6 +380,11 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 		// intra-process children which share that traceID), and SERVER
 		// gets CLIENT as parent for the cross-service hierarchy.
 		// H1 fix: bestMatch.span is already a clone (safe to mutate).
+		// Clear CLIENT's ParentSpanID if traceID changes — the original
+		// parent is in a different trace and would be an orphaned reference.
+		if bestMatch.span.TraceID != span.TraceID {
+			bestMatch.span.ParentSpanID = ""
+		}
 		bestMatch.span.TraceID = span.TraceID
 		span.ParentSpanID = bestMatch.span.SpanID
 

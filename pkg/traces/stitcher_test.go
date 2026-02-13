@@ -1047,39 +1047,161 @@ func TestStitcherSkipsClientWithTraceparent(t *testing.T) {
 	}
 }
 
-func TestStitcherSkipsClientWithInjectedSpanID(t *testing.T) {
+func TestStitcherSkipsHTTPInjectedClientButDefersMCP(t *testing.T) {
+	logger := zap.NewNop()
+
+	t.Run("http_injected_skipped", func(t *testing.T) {
+		s := NewStitcher(500*time.Millisecond, logger)
+		now := time.Now()
+		// HTTP CLIENT span with trace_source=injected: sk_msg injection is reliable
+		// for HTTP (traceparent fits in 256-byte eBPF window), so the stitcher should
+		// skip it — the downstream SERVER will extract the traceparent.
+		clientSpan := &Span{
+			TraceID:      "aaaa0000aaaa0000aaaa0000aaaa0000",
+			SpanID:       "bbbb0000bbbb0000",
+			ParentSpanID: "cccc0000cccc0000",
+			Kind:         SpanKindClient,
+			StartTime:    now,
+			RemoteAddr:   "10.0.0.2",
+			RemotePort:   3001,
+			Protocol:     "http",
+			PID:          1000,
+			Attributes: map[string]string{
+				"http.request.method": "GET",
+				"url.path":            "/api/orders",
+				"olly.trace_source":   "injected",
+			},
+			ServiceName: "app",
+		}
+		deferred := s.ProcessSpan(clientSpan)
+		if deferred {
+			t.Error("HTTP CLIENT with injected spanID should NOT be deferred (injection is reliable for HTTP)")
+		}
+		if s.PendingCount() != 0 {
+			t.Errorf("expected 0 pending for HTTP injected CLIENT, got %d", s.PendingCount())
+		}
+	})
+
+	t.Run("mcp_injected_deferred", func(t *testing.T) {
+		s := NewStitcher(500*time.Millisecond, logger)
+		now := time.Now()
+		// MCP CLIENT span with trace_source=injected: Python's requests library adds
+		// many headers (~200 bytes), pushing the traceparent beyond the 256-byte eBPF
+		// capture window. The receiver often fails to extract it. The stitcher should
+		// defer MCP injected CLIENT spans for matching against SERVER spans.
+		clientSpan := &Span{
+			TraceID:      "aaaa0000aaaa0000aaaa0000aaaa0000",
+			SpanID:       "bbbb0000bbbb0000",
+			ParentSpanID: "cccc0000cccc0000",
+			Kind:         SpanKindClient,
+			StartTime:    now,
+			RemoteAddr:   "10.0.0.3",
+			RemotePort:   3003,
+			Protocol:     "mcp",
+			PID:          1000,
+			Attributes: map[string]string{
+				"http.request.method": "POST",
+				"url.path":            "/mcp",
+				"olly.trace_source":   "injected",
+			},
+			ServiceName: "app",
+		}
+		deferred := s.ProcessSpan(clientSpan)
+		if !deferred {
+			t.Error("MCP CLIENT with injected spanID should be deferred (injection unreliable for MCP)")
+		}
+		if s.PendingCount() != 1 {
+			t.Errorf("expected 1 pending for MCP injected CLIENT, got %d", s.PendingCount())
+		}
+	})
+}
+
+func TestStitcherMCPClientServerMatching(t *testing.T) {
 	logger := zap.NewNop()
 	s := NewStitcher(500*time.Millisecond, logger)
 
+	var stitchedSpans []*Span
+	s.OnStitchedSpan(func(span *Span) {
+		stitchedSpans = append(stitchedSpans, span)
+	})
+
 	now := time.Now()
-	// CLIENT span whose spanID was set by sk_msg traceparent injection.
-	// It has olly.trace_source="injected" (set by processor.go when InjectedSpanID is used).
-	// The stitcher should not defer this span — it's already linked to the
-	// downstream SERVER via the injected traceparent header.
+	// MCP CLIENT span from Flask (has injected trace_source + parent from Flask SERVER)
 	clientSpan := &Span{
 		TraceID:      "aaaa0000aaaa0000aaaa0000aaaa0000",
 		SpanID:       "bbbb0000bbbb0000",
-		ParentSpanID: "cccc0000cccc0000",
+		ParentSpanID: "cccc0000cccc0000", // Flask SERVER's spanID
 		Kind:         SpanKindClient,
 		StartTime:    now,
-		RemoteAddr:   "10.0.0.2",
-		RemotePort:   3001,
-		Protocol:     "http",
+		RemoteAddr:   "127.0.0.1",
+		RemotePort:   8765,
+		Protocol:     "mcp",
 		PID:          1000,
 		Attributes: map[string]string{
-			"http.request.method": "GET",
-			"url.path":            "/api/orders",
+			"http.request.method": "POST",
+			"url.path":            "/mcp",
 			"olly.trace_source":   "injected",
 		},
 		ServiceName: "app",
 	}
 
-	deferred := s.ProcessSpan(clientSpan)
-	if deferred {
-		t.Error("CLIENT with injected spanID should not be deferred (already linked via sk_msg)")
+	// MCP SERVER span from mcp-server (no traceparent extracted — beyond 256-byte limit)
+	serverSpan := &Span{
+		TraceID:   "dddd0000dddd0000dddd0000dddd0000",
+		SpanID:    "eeee0000eeee0000",
+		Kind:      SpanKindServer,
+		StartTime: now.Add(1 * time.Millisecond),
+		RemoteAddr: "127.0.0.1",
+		RemotePort: 8765,
+		Protocol:   "mcp",
+		PID:        2000,
+		Attributes: map[string]string{
+			"http.request.method": "POST",
+			"url.path":            "/mcp",
+		},
+		ServiceName: "mcp-server",
 	}
-	if s.PendingCount() != 0 {
-		t.Errorf("expected 0 pending for injected CLIENT, got %d", s.PendingCount())
+
+	// CLIENT deferred (injected, but stitcher processes it now)
+	deferred := s.ProcessSpan(clientSpan)
+	if !deferred {
+		t.Fatal("MCP CLIENT should be deferred for stitching")
+	}
+
+	// SERVER matches the pending CLIENT
+	deferred = s.ProcessSpan(serverSpan)
+	if deferred {
+		t.Fatal("SERVER spans should never be deferred")
+	}
+
+	// Verify cross-service stitching
+	if serverSpan.ParentSpanID != clientSpan.SpanID {
+		t.Errorf("SERVER.ParentSpanID should be CLIENT.SpanID: got %q, want %q",
+			serverSpan.ParentSpanID, clientSpan.SpanID)
+	}
+
+	// CLIENT should adopt SERVER's traceID
+	if len(stitchedSpans) != 1 {
+		t.Fatalf("expected 1 stitched span (CLIENT clone), got %d", len(stitchedSpans))
+	}
+	stitchedClient := stitchedSpans[0]
+	if stitchedClient.TraceID != serverSpan.TraceID {
+		t.Errorf("stitched CLIENT should adopt SERVER's traceID: got %q, want %q",
+			stitchedClient.TraceID, serverSpan.TraceID)
+	}
+
+	// CLIENT's ParentSpanID should be cleared (parent is in a different trace now)
+	if stitchedClient.ParentSpanID != "" {
+		t.Errorf("stitched CLIENT's ParentSpanID should be cleared (cross-trace ref): got %q",
+			stitchedClient.ParentSpanID)
+	}
+
+	// Both should have stitched attribute
+	if serverSpan.Attributes["olly.stitched"] != "true" {
+		t.Error("SERVER should have olly.stitched=true")
+	}
+	if stitchedClient.Attributes["olly.stitched"] != "true" {
+		t.Error("CLIENT should have olly.stitched=true")
 	}
 }
 

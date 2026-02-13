@@ -455,14 +455,17 @@ func extractJSONBool(data []byte, key string) string {
 }
 
 // Refine promotes a detected protocol to a more specific one when additional
-// context is available. Currently promotes "http" -> "genai" when GenAI
-// endpoints are detected.
+// context is available. Promotes "http" -> "genai" for GenAI endpoints,
+// or "http" -> "mcp" for MCP JSON-RPC 2.0 requests.
 func Refine(proto string, request []byte, port uint16) string {
 	if proto != ProtoHTTP {
 		return proto
 	}
 	if _, _, ok := detectGenAI(request); ok {
 		return ProtoGenAI
+	}
+	if detectMCP(request) {
+		return ProtoMCP
 	}
 	return proto
 }

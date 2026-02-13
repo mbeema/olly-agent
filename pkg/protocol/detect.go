@@ -18,6 +18,7 @@ const (
 	ProtoGRPC     = "grpc"
 	ProtoDNS      = "dns"
 	ProtoGenAI    = "genai"
+	ProtoMCP      = "mcp"
 	ProtoUnknown  = "unknown"
 )
 
@@ -76,6 +77,17 @@ type SpanAttributes struct {
 	GenAIMaxTokensSet  bool
 	GenAIStreaming      bool   // true if SSE streaming response
 
+	// MCP (Model Context Protocol - JSON-RPC 2.0 over HTTP)
+	MCPMethod      string // JSON-RPC method (e.g., "tools/call", "resources/read")
+	MCPRequestID   string // JSON-RPC request ID
+	MCPToolName    string // Tool name for tools/call
+	MCPResourceURI string // Resource URI for resources/read
+	MCPPromptName  string // Prompt name for prompts/get
+	MCPSessionID   string // Mcp-Session-Id header
+	MCPErrorCode   int    // JSON-RPC error code
+	MCPErrorMsg    string // JSON-RPC error message
+	MCPTransport   string // "streamable-http" or "sse"
+
 	// General
 	Error      bool
 	ErrorMsg   string
@@ -124,11 +136,18 @@ func Detect(data []byte, port uint16) string {
 // Refine, not Detect) but must be reachable from Parse.
 var genaiParser = &GenAIParser{}
 
+// mcpParser is kept outside the Detect registry (MCP is detected via
+// Refine, not Detect) but must be reachable from Parse.
+var mcpParser = &MCPParser{}
+
 // Parse uses the appropriate parser to extract span attributes.
 func Parse(proto string, request, response []byte) (*SpanAttributes, error) {
-	// GenAI uses Refine() instead of Detect(), so it's not in the registry.
+	// GenAI and MCP use Refine() instead of Detect(), so they're not in the registry.
 	if proto == ProtoGenAI {
 		return genaiParser.Parse(request, response)
+	}
+	if proto == ProtoMCP {
+		return mcpParser.Parse(request, response)
 	}
 	for _, p := range registry {
 		if p.Name() == proto {

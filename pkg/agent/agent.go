@@ -56,6 +56,7 @@ type Agent struct {
 	metricsColl     *metrics.Collector
 	requestMetrics  *rmetrics.RequestMetrics
 	genaiMetrics    *rmetrics.GenAIMetrics
+	mcpMetrics      *rmetrics.MCPMetrics
 	processColl     *metrics.ProcessCollector
 	containerColl   *metrics.ContainerCollector
 	exporter        *export.Manager
@@ -173,6 +174,11 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 		// GenAI token/duration metrics
 		if cfg.Metrics.GenAI.Enabled {
 			a.genaiMetrics = rmetrics.NewGenAIMetrics(cfg.Metrics.GenAI.Buckets)
+		}
+
+		// MCP tool call/duration metrics
+		if cfg.Metrics.MCP.Enabled {
+			a.mcpMetrics = rmetrics.NewMCPMetrics(cfg.Metrics.MCP.Buckets)
 		}
 
 		// Per-process metrics
@@ -351,28 +357,37 @@ func (a *Agent) Start(ctx context.Context) error {
 					// Priority 2: Check event-embedded BPF trace context (race-free).
 					// BPF embeds trace context directly in the ring buffer event,
 					// eliminating the map read race where BPF overwrites before Go reads.
-					if tctx.TraceID == "" {
-						if etp, ok := a.hookProvider.(hook.EventTraceProvider); ok {
-							if evtTraceID, evtSpanID, evtOK := etp.GetEventTraceContext(pid, tid); evtOK {
+					// Always read BPF SpanID: sk_msg uses BPF's thread_trace_ctx to
+					// inject traceparent into outbound HTTP. The CLIENT span's SpanID
+					// must match what BPF injects, so downstream SERVERs reference
+					// the correct parent. TraceID only used if Priority 1 didn't set it.
+					if etp, ok := a.hookProvider.(hook.EventTraceProvider); ok {
+						if evtTraceID, evtSpanID, evtOK := etp.GetEventTraceContext(pid, tid); evtOK {
+							if tctx.TraceID == "" {
 								tctx.TraceID = evtTraceID
-								tctx.SpanID = evtSpanID
-								a.logger.Debug("using event-embedded BPF trace context",
-									zap.Uint32("pid", pid), zap.Uint32("tid", tid),
-									zap.String("traceID", evtTraceID))
 							}
+							tctx.SpanID = evtSpanID
+							a.logger.Debug("using event-embedded BPF trace context",
+								zap.Uint32("pid", pid), zap.Uint32("tid", tid),
+								zap.String("traceID", tctx.TraceID),
+								zap.String("bpfSpanID", evtSpanID))
 						}
 					}
 
 					// Priority 3: Fall back to BPF map read (backward compat).
 					// Only used if event-embedded context is not available.
-					if tctx.TraceID == "" {
+					if tctx.TraceID == "" || tctx.SpanID == "" {
 						if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
 							if bpfTraceID, bpfSpanID, bpfOK := injector.GetTraceContext(pid, tid); bpfOK {
-								tctx.TraceID = bpfTraceID
-								tctx.SpanID = bpfSpanID
+								if tctx.TraceID == "" {
+									tctx.TraceID = bpfTraceID
+								}
+								if tctx.SpanID == "" {
+									tctx.SpanID = bpfSpanID
+								}
 								a.logger.Debug("using BPF map trace context (fallback)",
 									zap.Uint32("pid", pid), zap.Uint32("tid", tid),
-									zap.String("traceID", bpfTraceID))
+									zap.String("traceID", tctx.TraceID))
 							}
 						}
 					}
@@ -722,8 +737,15 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 		// Only for HTTP/gRPC: sk_msg only injects traceparent into HTTP traffic.
 		// DB/Redis/MongoDB CLIENT spans should get unique generated spanIDs,
 		// not the injected spanID (which would cause duplicate spanIDs).
-		if pair.Protocol == "http" || pair.Protocol == "grpc" || pair.Protocol == "genai" {
+		if pair.Protocol == "http" || pair.Protocol == "grpc" || pair.Protocol == "genai" || pair.Protocol == "mcp" {
 			pair.InjectedSpanID = tctx.SpanID
+			// Consume: generate a new SpanID for subsequent CLIENT spans on
+			// this thread. The BPF-side thread_trace_ctx still has the original,
+			// but only the first CLIENT span should use it as its own SpanID.
+			// Without this, multiple outbound calls on the same thread (e.g.,
+			// Flask handling one inbound request with multiple MCP calls) would
+			// all get the same SpanID → duplicate spanIds across traces.
+			tctx.SpanID = traces.GenerateSpanID()
 		}
 	}
 }
@@ -802,6 +824,11 @@ func (a *Agent) processSpan(span *traces.Span) {
 	// Record GenAI metrics
 	if a.genaiMetrics != nil {
 		a.genaiMetrics.RecordSpan(span)
+	}
+
+	// Record MCP metrics
+	if a.mcpMetrics != nil {
+		a.mcpMetrics.RecordSpan(span)
 	}
 
 	// Export
@@ -1049,6 +1076,9 @@ func (a *Agent) startMetrics() {
 	if cfg.Metrics.GenAI.Enabled {
 		a.genaiMetrics = rmetrics.NewGenAIMetrics(cfg.Metrics.GenAI.Buckets)
 	}
+	if cfg.Metrics.MCP.Enabled {
+		a.mcpMetrics = rmetrics.NewMCPMetrics(cfg.Metrics.MCP.Buckets)
+	}
 	a.metricsColl.OnMetric(func(m *metrics.Metric) {
 		a.exporter.ExportMetric(&export.Metric{
 			Name:        m.Name,
@@ -1083,6 +1113,7 @@ func (a *Agent) stopMetrics() {
 	a.metricsColl = nil
 	a.requestMetrics = nil
 	a.genaiMetrics = nil
+	a.mcpMetrics = nil
 	a.logger.Info("metrics collector stopped via reload")
 }
 
@@ -1252,6 +1283,9 @@ func (a *Agent) requestMetricsLoop(ctx context.Context) {
 			a.exportMetricSlice(a.requestMetrics.Collect(now))
 			if a.genaiMetrics != nil {
 				a.exportMetricSlice(a.genaiMetrics.Collect(now))
+			}
+			if a.mcpMetrics != nil {
+				a.exportMetricSlice(a.mcpMetrics.Collect(now))
 			}
 
 		case <-ctx.Done():

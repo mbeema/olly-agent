@@ -66,6 +66,7 @@ type ProtocolsConfig struct {
 	MongoDB  ProtocolToggle `yaml:"mongodb"`
 	DNS      ProtocolToggle `yaml:"dns"`
 	GenAI    ProtocolToggle `yaml:"genai"`
+	MCP      ProtocolToggle `yaml:"mcp"`
 }
 
 type ProtocolToggle struct {
@@ -103,6 +104,7 @@ type MetricsConfig struct {
 	Process   MetricsToggle         `yaml:"process"`
 	Request   RequestMetricsCfg     `yaml:"request"`
 	GenAI     GenAIMetricsCfg       `yaml:"genai"`
+	MCP       MCPMetricsCfg         `yaml:"mcp"`
 	Interval  time.Duration         `yaml:"interval"`
 	PerProcess PerProcessMetricsCfg `yaml:"per_process"`
 	Container MetricsToggle         `yaml:"container"`
@@ -110,6 +112,12 @@ type MetricsConfig struct {
 
 // GenAIMetricsCfg configures GenAI token and duration metrics.
 type GenAIMetricsCfg struct {
+	Enabled bool      `yaml:"enabled"`
+	Buckets []float64 `yaml:"buckets"` // Duration histogram buckets in seconds
+}
+
+// MCPMetricsCfg configures MCP tool call and duration metrics.
+type MCPMetricsCfg struct {
 	Enabled bool      `yaml:"enabled"`
 	Buckets []float64 `yaml:"buckets"` // Duration histogram buckets in seconds
 }
@@ -245,6 +253,7 @@ func DefaultConfig() *Config {
 				MongoDB:  ProtocolToggle{Enabled: true},
 				DNS:      ProtocolToggle{Enabled: true},
 			GenAI:    ProtocolToggle{Enabled: true},
+			MCP:      ProtocolToggle{Enabled: true},
 			},
 		},
 		Logs: LogsConfig{
@@ -266,6 +275,10 @@ func DefaultConfig() *Config {
 			GenAI: GenAIMetricsCfg{
 				Enabled: true,
 				Buckets: []float64{0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120},
+			},
+			MCP: MCPMetricsCfg{
+				Enabled: true,
+				Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
 			},
 			Interval:   15 * time.Second,
 			PerProcess: PerProcessMetricsCfg{Enabled: false},

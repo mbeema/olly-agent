@@ -63,6 +63,26 @@ for i in $(seq 1 "$ITERATIONS"); do
     # GenAI: Multi-step agent (DB query + LLM summarization)
     curl -s "$BASE_URL/ai/summarize-orders" > /dev/null || true
 
+    # MCP: Initialize session (produces initialize span)
+    curl -s -X POST "$BASE_URL/mcp/init" > /dev/null || true
+
+    # MCP: List and call tools (produces tools/list + tools/call spans)
+    curl -s "$BASE_URL/mcp/tools" > /dev/null || true
+
+    # MCP: Call specific tool (produces tools/call span)
+    curl -s -X POST "$BASE_URL/mcp/tools/call" \
+        -H "Content-Type: application/json" \
+        -d "{\"tool\":\"calculate\",\"arguments\":{\"expression\":\"$i * 42\"}}" > /dev/null || true
+
+    # MCP: List and read resources (produces resources/list + resources/read spans)
+    curl -s "$BASE_URL/mcp/resources" > /dev/null || true
+
+    # MCP: List and get prompts (produces prompts/list + prompts/get spans)
+    curl -s "$BASE_URL/mcp/prompts" > /dev/null || true
+
+    # MCP: Multi-step agent (init → tools/list → tools/call → resources/read)
+    curl -s -X POST "$BASE_URL/mcp/agent" > /dev/null || true
+
     # Slow endpoint (short delay)
     curl -s "$BASE_URL/slow?delay=0.5" > /dev/null
 

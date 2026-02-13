@@ -103,7 +103,7 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 
 	// Try to extract trace context from HTTP headers (R1.2: include tracestate).
 	// This covers: (a) traceparent injected by upstream sk_msg, (b) app-level headers.
-	if proto == protocol.ProtoHTTP || proto == protocol.ProtoGRPC || proto == protocol.ProtoGenAI {
+	if proto == protocol.ProtoHTTP || proto == protocol.ProtoGRPC || proto == protocol.ProtoGenAI || proto == protocol.ProtoMCP {
 		traceCtx := protocol.ExtractTraceContext(pair.Request)
 		if traceCtx.TraceID != "" {
 			span.TraceID = traceCtx.TraceID
@@ -134,9 +134,15 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 			}
 			span.ParentSpanID = pair.ParentSpanID
 		} else {
-			// SERVER span: always use the thread context trace ID and
-			// set SpanID so child CLIENT spans can reference it as parent.
-			span.TraceID = pair.ParentTraceID
+			// SERVER span: use thread context for SpanID (so child CLIENT
+			// spans can reference it as parent). Only overwrite TraceID if
+			// traceparent wasn't extracted — when extraction succeeds, the
+			// extracted traceID is authoritative (from the upstream service).
+			// Thread context traceID may differ (BPF-generated) if the
+			// traceparent was split across reads or reassembled in the pair.
+			if span.Attributes["olly.trace_source"] != "traceparent" {
+				span.TraceID = pair.ParentTraceID
+			}
 			span.SpanID = pair.ParentSpanID
 		}
 	}
@@ -359,6 +365,60 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		// Underlying HTTP attributes
 		if attrs.HTTPMethod != "" {
 			span.SetAttribute("http.request.method", attrs.HTTPMethod)
+		}
+		if attrs.HTTPStatusCode > 0 {
+			span.SetAttribute("http.response.status_code", fmt.Sprintf("%d", attrs.HTTPStatusCode))
+		}
+		if attrs.HTTPHost != "" {
+			span.SetAttribute("server.address", attrs.HTTPHost)
+		}
+		if connInfo != nil {
+			span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
+		}
+		if isSSL {
+			span.SetAttribute("url.scheme", "https")
+		} else {
+			span.SetAttribute("url.scheme", "http")
+		}
+		if attrs.Error && attrs.HTTPStatusCode >= 400 {
+			span.SetAttribute("error.type", fmt.Sprintf("%d", attrs.HTTPStatusCode))
+		}
+
+	case protocol.ProtoMCP:
+		// MCP (Model Context Protocol) - JSON-RPC 2.0 over HTTP
+		if attrs.MCPMethod != "" {
+			span.SetAttribute("mcp.method", attrs.MCPMethod)
+		}
+		if attrs.MCPRequestID != "" {
+			span.SetAttribute("mcp.request.id", attrs.MCPRequestID)
+		}
+		if attrs.MCPToolName != "" {
+			span.SetAttribute("mcp.tool.name", attrs.MCPToolName)
+		}
+		if attrs.MCPResourceURI != "" {
+			span.SetAttribute("mcp.resource.uri", attrs.MCPResourceURI)
+		}
+		if attrs.MCPPromptName != "" {
+			span.SetAttribute("mcp.prompt.name", attrs.MCPPromptName)
+		}
+		if attrs.MCPSessionID != "" {
+			span.SetAttribute("mcp.session.id", attrs.MCPSessionID)
+		}
+		if attrs.MCPTransport != "" {
+			span.SetAttribute("mcp.transport", attrs.MCPTransport)
+		}
+		if attrs.MCPErrorCode != 0 {
+			span.SetAttribute("mcp.error.code", fmt.Sprintf("%d", attrs.MCPErrorCode))
+		}
+		if attrs.MCPErrorMsg != "" {
+			span.SetAttribute("mcp.error.message", attrs.MCPErrorMsg)
+		}
+		// Underlying HTTP attributes
+		if attrs.HTTPMethod != "" {
+			span.SetAttribute("http.request.method", attrs.HTTPMethod)
+		}
+		if attrs.HTTPPath != "" {
+			span.SetAttribute("url.path", attrs.HTTPPath)
 		}
 		if attrs.HTTPStatusCode > 0 {
 			span.SetAttribute("http.response.status_code", fmt.Sprintf("%d", attrs.HTTPStatusCode))

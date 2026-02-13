@@ -30,11 +30,18 @@ cd "$PROJECT_DIR/deploy/demo-app/order-service"
 GOOS=linux GOARCH=amd64 go build -o "$BUILD_DIR/order-service" .
 echo "Binary: $BUILD_DIR/order-service"
 
+# Cross-compile Go MCP demo server
+echo "Building mcp-server..."
+cd "$PROJECT_DIR/deploy/demo-app/mcp-server"
+GOOS=linux GOARCH=amd64 go build -o "$BUILD_DIR/mcp-server" .
+echo "Binary: $BUILD_DIR/mcp-server"
+
 # Package tarball
 cd "$BUILD_DIR"
 mkdir -p olly-deploy/configs
 cp olly olly-deploy/
 cp order-service olly-deploy/
+cp mcp-server olly-deploy/
 cp "$SCRIPT_DIR/configs/"*.yaml olly-deploy/configs/
 cp "$SCRIPT_DIR/otel-collector.yaml" olly-deploy/
 cp -r "$SCRIPT_DIR/demo-app" olly-deploy/

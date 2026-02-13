@@ -69,6 +69,22 @@ if [ -f /var/log/otel/traces.json ]; then
         echo "Cross-service flow: Flask(CLIENT) → order-service(SERVER) detected"
     fi
 
+    # MCP span detection
+    MCP_SPANS=$(grep -c '"mcp.method"' /var/log/otel/traces.json 2>/dev/null || echo 0)
+    echo "MCP spans: $MCP_SPANS"
+    if [ "$MCP_SPANS" -gt 0 ]; then
+        echo "--- MCP methods detected ---"
+        grep -o '"mcp.method","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort | uniq -c | sort -rn || true
+        echo "--- MCP tool names ---"
+        grep -o '"mcp.tool.name","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
+        echo "--- MCP session IDs (first 3) ---"
+        grep -o '"mcp.session.id","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | head -3 || true
+        echo "--- MCP transports ---"
+        grep -o '"mcp.transport","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
+        echo "--- MCP errors ---"
+        grep -o '"mcp.error.code","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null || echo "  (no MCP errors)"
+    fi
+
     # GenAI span detection
     GENAI_SPANS=$(grep -c '"gen_ai.system"' /var/log/otel/traces.json 2>/dev/null || echo 0)
     echo "GenAI spans: $GENAI_SPANS"
@@ -118,6 +134,10 @@ if [ -f /var/log/otel/metrics.json ]; then
     echo "--- GenAI metrics ---"
     grep -c '"gen_ai.client.token.usage"' /var/log/otel/metrics.json 2>/dev/null && echo "  gen_ai.client.token.usage: FOUND" || echo "  gen_ai.client.token.usage: not yet"
     grep -c '"gen_ai.client.operation.duration"' /var/log/otel/metrics.json 2>/dev/null && echo "  gen_ai.client.operation.duration: FOUND" || echo "  gen_ai.client.operation.duration: not yet"
+    echo "--- MCP metrics ---"
+    grep -c '"mcp.client.request.count"' /var/log/otel/metrics.json 2>/dev/null && echo "  mcp.client.request.count: FOUND" || echo "  mcp.client.request.count: not yet"
+    grep -c '"mcp.client.duration"' /var/log/otel/metrics.json 2>/dev/null && echo "  mcp.client.duration: FOUND" || echo "  mcp.client.duration: not yet"
+    grep -c '"mcp.client.error.count"' /var/log/otel/metrics.json 2>/dev/null && echo "  mcp.client.error.count: FOUND" || echo "  mcp.client.error.count: not yet"
 else
     echo "NOT FOUND (file exporter not enabled or no data yet)"
 fi

@@ -11,6 +11,7 @@ import psycopg2
 from flask import Flask, jsonify, request
 
 ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://localhost:3001")
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:3002/mcp")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 app = Flask(__name__)
@@ -289,6 +290,204 @@ def ai_summarize_orders():
         })
     except Exception as e:
         app.logger.error(f"AI summarize failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+### MCP Endpoints ###
+# These make JSON-RPC 2.0 calls to the MCP demo server — Olly intercepts the
+# HTTP traffic via eBPF and produces mcp.* spans with zero instrumentation.
+
+_mcp_request_id = 0
+_mcp_session_id = None
+
+
+def _mcp_call(method, params=None):
+    """Make a JSON-RPC 2.0 call to the MCP server (Streamable HTTP transport)."""
+    global _mcp_request_id, _mcp_session_id
+    _mcp_request_id += 1
+
+    body = json.dumps({
+        "jsonrpc": "2.0",
+        "id": _mcp_request_id,
+        "method": method,
+        "params": params or {},
+    }).encode()
+
+    headers = {"Content-Type": "application/json"}
+    if _mcp_session_id:
+        headers["Mcp-Session-Id"] = _mcp_session_id
+
+    req = urllib.request.Request(
+        MCP_SERVER_URL,
+        data=body,
+        headers=headers,
+        method="POST",
+    )
+    resp = urllib.request.urlopen(req)
+
+    # Capture session ID from response
+    sid = resp.headers.get("Mcp-Session-Id")
+    if sid:
+        _mcp_session_id = sid
+
+    return json.loads(resp.read())
+
+
+@app.route("/mcp/init", methods=["POST"])
+def mcp_init():
+    """Initialize MCP session — produces initialize + notifications/initialized spans."""
+    app.logger.info("MCP: initializing session")
+    try:
+        result = _mcp_call("initialize", {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "olly-demo-client", "version": "1.0.0"},
+        })
+
+        # Send initialized notification (fire-and-forget)
+        try:
+            notif_body = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+            }).encode()
+            notif_headers = {"Content-Type": "application/json"}
+            if _mcp_session_id:
+                notif_headers["Mcp-Session-Id"] = _mcp_session_id
+            notif_req = urllib.request.Request(
+                MCP_SERVER_URL, data=notif_body, headers=notif_headers, method="POST",
+            )
+            urllib.request.urlopen(notif_req)
+        except Exception:
+            pass
+
+        return jsonify({"session": _mcp_session_id, "result": result.get("result")})
+    except Exception as e:
+        app.logger.error(f"MCP init failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/mcp/tools", methods=["GET"])
+def mcp_tools():
+    """List available MCP tools, then call one — produces tools/list + tools/call spans."""
+    app.logger.info("MCP: listing and calling tools")
+    try:
+        # List tools
+        list_result = _mcp_call("tools/list")
+        tools = list_result.get("result", {}).get("tools", [])
+
+        # Call get_weather tool
+        call_result = _mcp_call("tools/call", {
+            "name": "get_weather",
+            "arguments": {"location": "San Francisco"},
+        })
+
+        return jsonify({
+            "available_tools": [t.get("name") for t in tools],
+            "weather_result": call_result.get("result"),
+        })
+    except Exception as e:
+        app.logger.error(f"MCP tools failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/mcp/tools/call", methods=["POST"])
+def mcp_tool_call():
+    """Call a specific MCP tool — produces a tools/call span."""
+    data = request.get_json(force=True)
+    tool_name = data.get("tool", "calculate")
+    arguments = data.get("arguments", {"expression": "2+2"})
+    app.logger.info(f"MCP: calling tool {tool_name}")
+    try:
+        result = _mcp_call("tools/call", {
+            "name": tool_name,
+            "arguments": arguments,
+        })
+        return jsonify(result.get("result"))
+    except Exception as e:
+        app.logger.error(f"MCP tool call failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/mcp/resources", methods=["GET"])
+def mcp_resources():
+    """List and read MCP resources — produces resources/list + resources/read spans."""
+    app.logger.info("MCP: listing and reading resources")
+    try:
+        # List resources
+        list_result = _mcp_call("resources/list")
+        resources = list_result.get("result", {}).get("resources", [])
+
+        # Read app config resource
+        read_result = _mcp_call("resources/read", {"uri": "config://app"})
+
+        return jsonify({
+            "available_resources": [r.get("uri") for r in resources],
+            "config": read_result.get("result"),
+        })
+    except Exception as e:
+        app.logger.error(f"MCP resources failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/mcp/prompts", methods=["GET"])
+def mcp_prompts():
+    """List and get MCP prompts — produces prompts/list + prompts/get spans."""
+    app.logger.info("MCP: listing and getting prompts")
+    try:
+        # List prompts
+        list_result = _mcp_call("prompts/list")
+        prompts = list_result.get("result", {}).get("prompts", [])
+
+        # Get code_review prompt
+        get_result = _mcp_call("prompts/get", {
+            "name": "code_review",
+            "arguments": {"language": "python"},
+        })
+
+        return jsonify({
+            "available_prompts": [p.get("name") for p in prompts],
+            "code_review_prompt": get_result.get("result"),
+        })
+    except Exception as e:
+        app.logger.error(f"MCP prompts failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/mcp/agent", methods=["POST"])
+def mcp_agent():
+    """Multi-step MCP agent: init → list tools → call tool → read resource.
+    Creates a trace with: SERVER → CLIENT(initialize) → CLIENT(tools/list) → CLIENT(tools/call) → CLIENT(resources/read)."""
+    app.logger.info("MCP: running multi-step agent workflow")
+    try:
+        steps = []
+
+        # Step 1: Initialize
+        init_result = _mcp_call("initialize", {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "olly-demo-agent", "version": "1.0.0"},
+        })
+        steps.append({"step": "initialize", "ok": True})
+
+        # Step 2: List tools
+        tools_result = _mcp_call("tools/list")
+        tool_names = [t.get("name") for t in tools_result.get("result", {}).get("tools", [])]
+        steps.append({"step": "tools/list", "tools": tool_names})
+
+        # Step 3: Call lookup_user tool
+        user_result = _mcp_call("tools/call", {
+            "name": "lookup_user",
+            "arguments": {"user_id": 1},
+        })
+        steps.append({"step": "tools/call lookup_user", "result": user_result.get("result")})
+
+        # Step 4: Read user count resource
+        count_result = _mcp_call("resources/read", {"uri": "db://users/count"})
+        steps.append({"step": "resources/read db://users/count", "result": count_result.get("result")})
+
+        return jsonify({"steps": steps, "session": _mcp_session_id})
+    except Exception as e:
+        app.logger.error(f"MCP agent failed: {e}")
         return jsonify({"error": str(e)}), 500
 
 

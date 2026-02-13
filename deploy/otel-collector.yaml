@@ -77,6 +77,12 @@ exporters:
     endpoint: "https://otlp-gateway-prod-us-east-0.grafana.net/otlp"
     auth:
       authenticator: basicauth/grafana_cloud
+  file/traces:
+    path: /var/log/otel/traces.json
+  file/metrics:
+    path: /var/log/otel/metrics.json
+  file/logs:
+    path: /var/log/otel/logs.json
 
 service:
   extensions: [basicauth/grafana_cloud]
@@ -84,12 +90,12 @@ service:
     traces:
       receivers: [otlp]
       processors: [resourcedetection, transform/drop_unneeded_resource_attributes, batch]
-      exporters: [otlphttp/grafana_cloud]
+      exporters: [otlphttp/grafana_cloud, file/traces]
     metrics:
       receivers: [otlp, hostmetrics]
       processors: [resourcedetection, transform/drop_unneeded_resource_attributes, transform/add_resource_attributes_as_metric_attributes, batch]
-      exporters: [otlphttp/grafana_cloud]
+      exporters: [otlphttp/grafana_cloud, file/metrics]
     logs:
       receivers: [otlp]
       processors: [resourcedetection, transform/drop_unneeded_resource_attributes, batch]
-      exporters: [otlphttp/grafana_cloud]
+      exporters: [otlphttp/grafana_cloud, file/logs]

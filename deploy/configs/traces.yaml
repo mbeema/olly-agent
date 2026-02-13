@@ -21,6 +21,8 @@ tracing:
       enabled: true
     genai:
       enabled: true
+    mcp:
+      enabled: true
 
 correlation:
   enabled: true

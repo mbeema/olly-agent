@@ -82,6 +82,14 @@ if [ -f olly-deploy/order-service ]; then
     sleep 1
 fi
 
+# Install MCP server (Go MCP demo for MCP monitoring)
+if [ -f olly-deploy/mcp-server ]; then
+    sudo cp olly-deploy/mcp-server /opt/olly/mcp-server
+    sudo chmod +x /opt/olly/mcp-server
+    sudo bash -c 'nohup /opt/olly/mcp-server > /var/log/demo-app/mcp-server.log 2>&1 &'
+    sleep 1
+fi
+
 # Start demo app (no wrapper needed — eBPF observes all processes automatically)
 # Pass OPENAI_API_KEY if set on the host (for GenAI monitoring demo)
 OPENAI_KEY_FILE="/opt/olly/.openai_key"
