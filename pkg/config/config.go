@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
+	"strconv"
 	"strings"
 	"time"
 
@@ -463,14 +463,14 @@ func parseBool(s string) bool {
 	return s == "true" || s == "1" || s == "yes"
 }
 
+// B9 fix: use strconv.ParseFloat instead of reflect-based parsing
 func parseFloat(s string) (float64, bool) {
 	s = strings.TrimSpace(s)
-	// Simple float parser to avoid importing strconv
-	v := reflect.New(reflect.TypeOf(float64(0)))
-	if _, err := fmt.Sscanf(s, "%f", v.Interface()); err != nil {
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
 		return 0, false
 	}
-	return v.Elem().Float(), true
+	return v, true
 }
 
 // Validate checks the configuration for errors.
@@ -497,6 +497,14 @@ func (c *Config) Validate() error {
 
 	if c.Profiling.Enabled && c.Profiling.Pyroscope.Enabled && c.Profiling.Pyroscope.Endpoint == "" {
 		return fmt.Errorf("profiling.pyroscope.endpoint is required when pyroscope is enabled")
+	}
+
+	// B10 fix: validate sampling rates are in 0.0-1.0 range
+	if c.Tracing.Sampling.Rate < 0 || c.Tracing.Sampling.Rate > 1.0 {
+		return fmt.Errorf("tracing.sampling.rate must be between 0.0 and 1.0")
+	}
+	if c.Logs.Sampling.Rate < 0 || c.Logs.Sampling.Rate > 1.0 {
+		return fmt.Errorf("logs.sampling.rate must be between 0.0 and 1.0")
 	}
 
 	return nil

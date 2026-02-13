@@ -89,8 +89,11 @@ func (w *Watcher) loop(ctx context.Context) {
 			if debounceTimer != nil {
 				debounceTimer.Stop()
 			}
+			// B11 fix: capture lastFile by value to avoid data race
+			// (closure runs on timer goroutine, lastFile written on this goroutine)
+			changedFile := lastFile
 			debounceTimer = time.AfterFunc(500*time.Millisecond, func() {
-				w.reload(lastFile)
+				w.reload(changedFile)
 			})
 
 		case err, ok := <-w.watcher.Errors:

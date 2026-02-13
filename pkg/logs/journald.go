@@ -25,6 +25,10 @@ type JournaldReader struct {
 	mu        sync.RWMutex
 	callbacks []func(*LogRecord)
 
+	// B3 fix: track last cursor so retries don't lose entries between crashes
+	cursorMu   sync.Mutex
+	lastCursor string
+
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -89,7 +93,17 @@ func (j *JournaldReader) run(ctx context.Context) {
 }
 
 func (j *JournaldReader) follow(ctx context.Context) error {
-	args := []string{"--follow", "-o", "json", "--since", "now"}
+	// B3 fix: resume from last cursor if available (avoids losing entries on retry)
+	j.cursorMu.Lock()
+	cursor := j.lastCursor
+	j.cursorMu.Unlock()
+
+	var args []string
+	if cursor != "" {
+		args = []string{"--follow", "-o", "json", "--after-cursor", cursor}
+	} else {
+		args = []string{"--follow", "-o", "json", "--since", "now"}
+	}
 	for _, unit := range j.units {
 		args = append(args, "--unit="+unit)
 	}
@@ -173,6 +187,13 @@ func (j *JournaldReader) parseLine(line string) *LogRecord {
 
 	// Classify log type based on unit
 	record.Attributes["log.type"] = classifyJournaldUnit(unit)
+
+	// B3 fix: track cursor for resume on retry
+	if cursor, ok := data["__CURSOR"].(string); ok && cursor != "" {
+		j.cursorMu.Lock()
+		j.lastCursor = cursor
+		j.cursorMu.Unlock()
+	}
 
 	return record
 }

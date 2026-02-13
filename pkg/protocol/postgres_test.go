@@ -107,13 +107,19 @@ func TestPostgresPreparedStatementCache(t *testing.T) {
 	syncMsg := buildPgMsg('S', nil)
 	request1 := append(parseMsg, syncMsg...)
 
-	// Parse first request (caches the statement)
-	_, err := p.Parse(request1, nil)
+	// Parse first request (statement SQL captured in this call)
+	attrs1, err := p.Parse(request1, nil)
 	if err != nil {
 		t.Fatalf("Parse error: %v", err)
 	}
+	if attrs1.DBStatement != "SELECT name FROM products WHERE id = $1" {
+		t.Errorf("first call: DBStatement = %q, want the parsed query", attrs1.DBStatement)
+	}
 
-	// Second request: Bind+Execute using the cached statement (no Parse)
+	// Second request: Bind+Execute using the statement from a previous call.
+	// B5 fix: caches are cleared per-Parse to prevent cross-connection pollution.
+	// Without the Parse message, the SQL text is unavailable — but the operation
+	// is correctly determined from the CommandComplete response tag.
 	portalName := buildCString("")
 	bindStmt := buildCString("myquery")
 	bindPayload := append(portalName, bindStmt...)
@@ -126,17 +132,19 @@ func TestPostgresPreparedStatementCache(t *testing.T) {
 	request2 := append(bindMsg, execMsg...)
 	request2 = append(request2, syncMsg...)
 
-	attrs, err := p.Parse(request2, nil)
+	// Build CommandComplete response with "SELECT 1" tag
+	completePayload := buildCString("SELECT 1")
+	response := buildPgMsg('C', completePayload)
+
+	attrs, err := p.Parse(request2, response)
 	if err != nil {
 		t.Fatalf("Parse error: %v", err)
 	}
 
-	expectedSQL := "SELECT name FROM products WHERE id = $1"
-	if attrs.DBStatement != expectedSQL {
-		t.Errorf("DBStatement = %q, want %q (from cached prepared statement)", attrs.DBStatement, expectedSQL)
-	}
+	// SQL text is not available from a different Parse call (cross-connection safe)
+	// but the operation is correctly determined from CommandComplete
 	if attrs.DBOperation != "SELECT" {
-		t.Errorf("DBOperation = %q, want SELECT", attrs.DBOperation)
+		t.Errorf("DBOperation = %q, want SELECT (from CommandComplete)", attrs.DBOperation)
 	}
 }
 

@@ -101,3 +101,61 @@ func TestExtractTraceParent(t *testing.T) {
 		t.Error("expected sampled=true")
 	}
 }
+
+// TestExtractTraceContextCaseInsensitive verifies that the B12 fix (indexBytesCI
+// instead of bytes.ToLower) correctly handles mixed-case, lowercase, and
+// uppercase "Traceparent:" headers.
+func TestExtractTraceContextCaseInsensitive(t *testing.T) {
+	const wantTraceID = "0af7651916cd43dd8448eb211c80319c"
+	const wantSpanID = "b7ad6b7169203331"
+	traceparentValue := "00-" + wantTraceID + "-" + wantSpanID + "-01"
+
+	tests := []struct {
+		name       string
+		headerName string
+	}{
+		{"lowercase", "traceparent"},
+		{"uppercase", "TRACEPARENT"},
+		{"mixed TitleCase", "Traceparent"},
+		{"mixed alternating", "tRaCePaReNt"},
+		{"mixed caps prefix", "TRACEparent"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := []byte("GET / HTTP/1.1\r\n" + tt.headerName + ": " + traceparentValue + "\r\n\r\n")
+			ctx := ExtractTraceContext(request)
+
+			if ctx.TraceID != wantTraceID {
+				t.Errorf("TraceID = %q, want %q", ctx.TraceID, wantTraceID)
+			}
+			if ctx.SpanID != wantSpanID {
+				t.Errorf("SpanID = %q, want %q", ctx.SpanID, wantSpanID)
+			}
+			if !ctx.Sampled {
+				t.Error("expected Sampled=true")
+			}
+		})
+	}
+
+	// Verify no match when header is absent
+	t.Run("no header", func(t *testing.T) {
+		request := []byte("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+		ctx := ExtractTraceContext(request)
+		if ctx.TraceID != "" {
+			t.Errorf("TraceID = %q, want empty", ctx.TraceID)
+		}
+	})
+
+	// Verify tracestate is also extracted case-insensitively
+	t.Run("mixed case tracestate", func(t *testing.T) {
+		request := []byte("GET / HTTP/1.1\r\nTRACEPARENT: " + traceparentValue + "\r\nTraceState: congo=t61rcWkgMzE\r\n\r\n")
+		ctx := ExtractTraceContext(request)
+		if ctx.TraceID != wantTraceID {
+			t.Errorf("TraceID = %q, want %q", ctx.TraceID, wantTraceID)
+		}
+		if ctx.TraceState != "congo=t61rcWkgMzE" {
+			t.Errorf("TraceState = %q, want %q", ctx.TraceState, "congo=t61rcWkgMzE")
+		}
+	})
+}

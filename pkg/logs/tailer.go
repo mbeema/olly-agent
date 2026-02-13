@@ -248,6 +248,8 @@ func (t *Tailer) checkRotation() {
 		// Rotation detected: inode changed or file shrank
 		if currentInode != tf.inode || info.Size() < tf.offset {
 			t.logger.Debug("rotation detected", zap.String("path", path))
+			// B2 fix: drain remaining data from old file before closing
+			t.readFile(tf)
 			tf.file.Close()
 			delete(t.files, path)
 			t.openFile(path)

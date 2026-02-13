@@ -10,7 +10,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/mbeema/olly/pkg/config"
@@ -142,10 +141,11 @@ type Collector struct {
 	journaldReader *JournaldReader
 
 	// Sampling and rate limiting
-	sampleRate    float64 // 0.0-1.0, 0 = unset (keep all)
-	rateLimit     int     // max logs/sec, 0 = unlimited
-	tokenCount    atomic.Int64
-	lastRefill    atomic.Int64
+	sampleRate float64 // 0.0-1.0, 0 = unset (keep all)
+	rateLimit  int     // max logs/sec, 0 = unlimited
+	rateMu     sync.Mutex
+	tokenCount int64
+	lastRefill int64
 
 	mu        sync.RWMutex
 	callbacks []func(*LogRecord)
@@ -168,13 +168,13 @@ func NewCollector(cfg *config.LogsConfig, logger *zap.Logger) *Collector {
 		sourceMultiline: make(map[int]*MultilineAssembler),
 	}
 	if c.rateLimit > 0 {
-		c.tokenCount.Store(int64(c.rateLimit))
-		c.lastRefill.Store(time.Now().UnixNano())
+		c.tokenCount = int64(c.rateLimit)
+		c.lastRefill = time.Now().UnixNano()
 	}
 	// Initialize global multiline assembler if configured
 	if cfg.Multiline.Enabled {
 		c.multiline = NewMultilineAssembler(&cfg.Multiline, func(record *LogRecord) {
-			c.emitDirect(record)
+			c.emitAfterAssembly(record)
 		})
 	}
 	// Compile filter patterns
@@ -200,7 +200,7 @@ func NewCollector(cfg *config.LogsConfig, logger *zap.Logger) *Collector {
 		if src.Multiline != nil && src.Multiline.Enabled {
 			idx := i
 			c.sourceMultiline[idx] = NewMultilineAssembler(src.Multiline, func(record *LogRecord) {
-				c.emitDirect(record)
+				c.emitAfterAssembly(record)
 			})
 		}
 	}
@@ -219,24 +219,14 @@ func (c *Collector) emit(record *LogRecord) {
 }
 
 func (c *Collector) emitForSource(sourceIdx int, record *LogRecord) {
-	// Apply filtering first (before sampling)
+	// Apply filtering first (before multiline/sampling)
 	if c.shouldFilter(record) {
 		return
 	}
 
-	// Apply sampling
-	if c.sampleRate > 0 && c.sampleRate < 1.0 {
-		if !c.shouldSampleLog() {
-			return
-		}
-	}
-
-	// Apply rate limiting (token bucket)
-	if c.rateLimit > 0 && !c.tryConsumeToken() {
-		return
-	}
-
 	// Route through per-source multiline assembler if available
+	// E1 fix: multiline assembly BEFORE sampling/rate-limiting
+	// so stack trace continuation lines are not sampled out individually
 	if sourceIdx >= 0 {
 		if ma, ok := c.sourceMultiline[sourceIdx]; ok {
 			ma.Process(record)
@@ -247,6 +237,23 @@ func (c *Collector) emitForSource(sourceIdx int, record *LogRecord) {
 	// Route through global multiline assembler if enabled
 	if c.multiline != nil {
 		c.multiline.Process(record)
+		return
+	}
+
+	c.emitAfterAssembly(record)
+}
+
+// emitAfterAssembly applies sampling and rate limiting after multiline assembly.
+func (c *Collector) emitAfterAssembly(record *LogRecord) {
+	// Apply sampling (after multiline assembly so complete entries are sampled)
+	if c.sampleRate > 0 && c.sampleRate < 1.0 {
+		if !c.shouldSampleLog() {
+			return
+		}
+	}
+
+	// Apply rate limiting (token bucket)
+	if c.rateLimit > 0 && !c.tryConsumeToken() {
 		return
 	}
 
@@ -301,26 +308,25 @@ func (c *Collector) shouldSampleLog() bool {
 	return rand.Float64() < c.sampleRate
 }
 
+// B1 fix: use mutex to prevent TOCTOU race on refill+consume.
 func (c *Collector) tryConsumeToken() bool {
+	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
+
 	now := time.Now().UnixNano()
-	last := c.lastRefill.Load()
-	elapsed := now - last
+	elapsed := now - c.lastRefill
 
 	// Refill tokens every second
 	if elapsed >= int64(time.Second) {
-		c.tokenCount.Store(int64(c.rateLimit))
-		c.lastRefill.Store(now)
+		c.tokenCount = int64(c.rateLimit)
+		c.lastRefill = now
 	}
 
-	for {
-		current := c.tokenCount.Load()
-		if current <= 0 {
-			return false
-		}
-		if c.tokenCount.CompareAndSwap(current, current-1) {
-			return true
-		}
+	if c.tokenCount <= 0 {
+		return false
 	}
+	c.tokenCount--
+	return true
 }
 
 // Start begins collecting logs from configured sources.

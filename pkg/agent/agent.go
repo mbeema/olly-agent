@@ -56,8 +56,8 @@ type Agent struct {
 	logCollector    *logs.Collector
 	metricsColl     *metrics.Collector
 	requestMetrics  *rmetrics.RequestMetrics
-	genaiMetrics    *rmetrics.GenAIMetrics
-	mcpMetrics      *rmetrics.MCPMetrics
+	genaiMetrics    atomic.Pointer[rmetrics.GenAIMetrics]
+	mcpMetrics      atomic.Pointer[rmetrics.MCPMetrics]
 	processColl     *metrics.ProcessCollector
 	containerColl   *metrics.ContainerCollector
 	exporter        *export.Manager
@@ -202,12 +202,14 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 
 		// GenAI token/duration metrics
 		if cfg.Metrics.GenAI.Enabled {
-			a.genaiMetrics = rmetrics.NewGenAIMetrics(cfg.Metrics.GenAI.Buckets)
+			gm := rmetrics.NewGenAIMetrics(cfg.Metrics.GenAI.Buckets)
+			a.genaiMetrics.Store(gm)
 		}
 
 		// MCP tool call/duration metrics
 		if cfg.Metrics.MCP.Enabled {
-			a.mcpMetrics = rmetrics.NewMCPMetrics(cfg.Metrics.MCP.Buckets)
+			mm := rmetrics.NewMCPMetrics(cfg.Metrics.MCP.Buckets)
+			a.mcpMetrics.Store(mm)
 		}
 
 		// Per-process metrics
@@ -932,14 +934,14 @@ func (a *Agent) processSpan(span *traces.Span) {
 		a.requestMetrics.RecordSpan(span)
 	}
 
-	// Record GenAI metrics
-	if a.genaiMetrics != nil {
-		a.genaiMetrics.RecordSpan(span)
+	// Record GenAI metrics (B2 fix: atomic load prevents race with Reload)
+	if gm := a.genaiMetrics.Load(); gm != nil {
+		gm.RecordSpan(span)
 	}
 
 	// Record MCP metrics
-	if a.mcpMetrics != nil {
-		a.mcpMetrics.RecordSpan(span)
+	if mm := a.mcpMetrics.Load(); mm != nil {
+		mm.RecordSpan(span)
 	}
 
 	// Feed CLIENT spans to service map for enrichment
@@ -1206,10 +1208,12 @@ func (a *Agent) startMetrics() {
 		a.requestMetrics = rmetrics.NewRequestMetrics(cfg.Metrics.Request.Buckets)
 	}
 	if cfg.Metrics.GenAI.Enabled {
-		a.genaiMetrics = rmetrics.NewGenAIMetrics(cfg.Metrics.GenAI.Buckets)
+		gm := rmetrics.NewGenAIMetrics(cfg.Metrics.GenAI.Buckets)
+		a.genaiMetrics.Store(gm)
 	}
 	if cfg.Metrics.MCP.Enabled {
-		a.mcpMetrics = rmetrics.NewMCPMetrics(cfg.Metrics.MCP.Buckets)
+		mm := rmetrics.NewMCPMetrics(cfg.Metrics.MCP.Buckets)
+		a.mcpMetrics.Store(mm)
 	}
 	a.metricsColl.OnMetric(func(m *metrics.Metric) {
 		em := &export.Metric{
@@ -1261,8 +1265,8 @@ func (a *Agent) stopMetrics() {
 	a.metricsColl.Stop()
 	a.metricsColl = nil
 	a.requestMetrics = nil
-	a.genaiMetrics = nil
-	a.mcpMetrics = nil
+	a.genaiMetrics.Store(nil)
+	a.mcpMetrics.Store(nil)
 	a.logger.Info("metrics collector stopped via reload")
 }
 
@@ -1566,11 +1570,11 @@ func (a *Agent) requestMetricsLoop(ctx context.Context) {
 		case <-ticker.C:
 			now := time.Now()
 			a.exportMetricSlice(a.requestMetrics.Collect(now))
-			if a.genaiMetrics != nil {
-				a.exportMetricSlice(a.genaiMetrics.Collect(now))
+			if gm := a.genaiMetrics.Load(); gm != nil {
+				a.exportMetricSlice(gm.Collect(now))
 			}
-			if a.mcpMetrics != nil {
-				a.exportMetricSlice(a.mcpMetrics.Collect(now))
+			if mm := a.mcpMetrics.Load(); mm != nil {
+				a.exportMetricSlice(mm.Collect(now))
 			}
 
 		case <-ctx.Done():

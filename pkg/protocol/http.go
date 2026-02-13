@@ -132,14 +132,13 @@ func ExtractTraceParent(request []byte) (traceID, spanID string, sampled bool) {
 }
 
 // ExtractTraceContext extracts both traceparent and tracestate from HTTP request bytes.
+// B12 fix: uses case-insensitive search instead of bytes.ToLower (avoids full buffer copy on hot path).
 func ExtractTraceContext(request []byte) TraceContext {
 	var ctx TraceContext
 
-	// Look for traceparent header (case-insensitive)
-	lower := bytes.ToLower(request)
+	// Look for traceparent header (case-insensitive, zero-alloc)
 	needle := []byte("traceparent: ")
-
-	idx := bytes.Index(lower, needle)
+	idx := indexBytesCI(request, needle)
 	if idx < 0 {
 		return ctx
 	}
@@ -165,7 +164,7 @@ func ExtractTraceContext(request []byte) TraceContext {
 
 	// R1.2: Look for tracestate header
 	tsNeedle := []byte("tracestate: ")
-	tsIdx := bytes.Index(lower, tsNeedle)
+	tsIdx := indexBytesCI(request, tsNeedle)
 	if tsIdx >= 0 {
 		tsStart := tsIdx + len(tsNeedle)
 		tsEnd := bytes.Index(request[tsStart:], []byte("\r\n"))
@@ -176,4 +175,30 @@ func ExtractTraceContext(request []byte) TraceContext {
 	}
 
 	return ctx
+}
+
+// indexBytesCI performs a case-insensitive search for needle in haystack.
+// The needle must be lowercase. Returns the index of the first match or -1.
+func indexBytesCI(haystack, needle []byte) int {
+	if len(needle) == 0 || len(needle) > len(haystack) {
+		return -1
+	}
+	for i := 0; i <= len(haystack)-len(needle); i++ {
+		match := true
+		for j := 0; j < len(needle); j++ {
+			hb := haystack[i+j]
+			// Fast lowercase for ASCII letters
+			if hb >= 'A' && hb <= 'Z' {
+				hb += 'a' - 'A'
+			}
+			if hb != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
 }

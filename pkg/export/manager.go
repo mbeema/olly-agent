@@ -289,13 +289,13 @@ func (m *Manager) processSpans(ctx context.Context) {
 			batch = append(batch, span)
 			if len(batch) >= m.batchSize {
 				m.flushSpans(ctx, batch)
-				batch = batch[:0]
+				batch = make([]*traces.Span, 0, m.batchSize)
 			}
 
 		case <-ticker.C:
 			if len(batch) > 0 {
 				m.flushSpans(ctx, batch)
-				batch = batch[:0]
+				batch = make([]*traces.Span, 0, m.batchSize)
 			}
 
 		case <-m.stopCh:
@@ -342,13 +342,13 @@ func (m *Manager) processLogs(ctx context.Context) {
 			batch = append(batch, log)
 			if len(batch) >= m.batchSize {
 				m.flushLogs(ctx, batch)
-				batch = batch[:0]
+				batch = make([]*LogRecord, 0, m.batchSize)
 			}
 
 		case <-ticker.C:
 			if len(batch) > 0 {
 				m.flushLogs(ctx, batch)
-				batch = batch[:0]
+				batch = make([]*LogRecord, 0, m.batchSize)
 			}
 
 		case <-m.stopCh:
@@ -393,13 +393,13 @@ func (m *Manager) processMetrics(ctx context.Context) {
 			batch = append(batch, metric)
 			if len(batch) >= m.batchSize {
 				m.flushMetrics(ctx, batch)
-				batch = batch[:0]
+				batch = make([]*Metric, 0, m.batchSize)
 			}
 
 		case <-ticker.C:
 			if len(batch) > 0 {
 				m.flushMetrics(ctx, batch)
-				batch = batch[:0]
+				batch = make([]*Metric, 0, m.batchSize)
 			}
 
 		case <-m.stopCh:
@@ -444,13 +444,13 @@ func (m *Manager) processProfiles(ctx context.Context) {
 			batch = append(batch, p)
 			if len(batch) >= 16 {
 				m.flushProfiles(ctx, batch)
-				batch = batch[:0]
+				batch = make([]*profiling.Profile, 0, 16)
 			}
 
 		case <-ticker.C:
 			if len(batch) > 0 {
 				m.flushProfiles(ctx, batch)
-				batch = batch[:0]
+				batch = make([]*profiling.Profile, 0, 16)
 			}
 
 		case <-m.stopCh:
@@ -498,41 +498,46 @@ func (m *Manager) flushProfiles(ctx context.Context, profiles []*profiling.Profi
 }
 
 // H1 fix: flushSpans with exponential backoff retry.
+// B1 fix: only count items on successful export (not on failure/circuit-breaker drop).
 func (m *Manager) flushSpans(ctx context.Context, spans []*traces.Span) {
 	for _, exp := range m.exporters {
-		m.retryExport(ctx, "spans", func(expCtx context.Context) error {
+		if m.retryExport(ctx, "spans", func(expCtx context.Context) error {
 			return exp.ExportSpans(expCtx, spans)
-		})
+		}) {
+			m.spanCount.Add(int64(len(spans)))
+		}
 	}
-	m.spanCount.Add(int64(len(spans)))
 }
 
 func (m *Manager) flushLogs(ctx context.Context, logs []*LogRecord) {
 	for _, exp := range m.exporters {
-		m.retryExport(ctx, "logs", func(expCtx context.Context) error {
+		if m.retryExport(ctx, "logs", func(expCtx context.Context) error {
 			return exp.ExportLogs(expCtx, logs)
-		})
+		}) {
+			m.logCount.Add(int64(len(logs)))
+		}
 	}
-	m.logCount.Add(int64(len(logs)))
 }
 
 func (m *Manager) flushMetrics(ctx context.Context, metrics []*Metric) {
 	for _, exp := range m.exporters {
-		m.retryExport(ctx, "metrics", func(expCtx context.Context) error {
+		if m.retryExport(ctx, "metrics", func(expCtx context.Context) error {
 			return exp.ExportMetrics(expCtx, metrics)
-		})
+		}) {
+			m.metricCount.Add(int64(len(metrics)))
+		}
 	}
-	m.metricCount.Add(int64(len(metrics)))
 }
 
 // retryExport attempts an export with exponential backoff and circuit breaker.
-func (m *Manager) retryExport(ctx context.Context, signal string, exportFn func(context.Context) error) {
+// Returns true on success, false on failure (for accurate counting).
+func (m *Manager) retryExport(ctx context.Context, signal string, exportFn func(context.Context) error) bool {
 	if !m.circuitBreaker.Allow() {
 		m.dropCount.Add(1)
 		m.logger.Debug("circuit breaker open, dropping export",
 			zap.String("signal", signal),
 		)
-		return
+		return false
 	}
 
 	backoff := initialBackoff
@@ -544,7 +549,7 @@ func (m *Manager) retryExport(ctx context.Context, signal string, exportFn func(
 
 		if err == nil {
 			m.circuitBreaker.RecordSuccess()
-			return
+			return true
 		}
 
 		m.circuitBreaker.RecordFailure()
@@ -556,7 +561,7 @@ func (m *Manager) retryExport(ctx context.Context, signal string, exportFn func(
 				zap.Error(err),
 			)
 			m.dropCount.Add(1)
-			return
+			return false
 		}
 
 		m.logger.Warn("export failed, retrying",
@@ -569,7 +574,7 @@ func (m *Manager) retryExport(ctx context.Context, signal string, exportFn func(
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
-			return
+			return false
 		}
 
 		// Exponential backoff with cap
@@ -578,6 +583,7 @@ func (m *Manager) retryExport(ctx context.Context, signal string, exportFn func(
 			float64(maxBackoff),
 		))
 	}
+	return false
 }
 
 // Stats returns current export statistics.

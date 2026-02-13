@@ -86,6 +86,15 @@ func (p *PostgresParser) Parse(request, response []byte) (*SpanAttributes, error
 		DBOperation: "QUERY",
 	}
 
+	// B5 fix: clear caches before each parse to prevent cross-connection
+	// statement pollution. The per-call local variables handle the common
+	// Parse+Bind+Execute-in-same-buffer case. CommandComplete in the response
+	// provides the operation when cached SQL is unavailable.
+	p.mu.Lock()
+	p.stmtCache = nil
+	p.portalCache = nil
+	p.mu.Unlock()
+
 	// Walk all messages in the request buffer.
 	// Extended query sends Parse + Bind + Describe + Execute + Sync in sequence.
 	p.parseExtendedQuery(request, attrs)

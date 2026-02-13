@@ -347,15 +347,20 @@ func (e *OTLPExporter) convertLogRecord(l *LogRecord) *logspb.LogRecord {
 	}
 
 	// R3.4: Add log source attributes
+	// Clone attributes to avoid mutating the input (B4 fix: race between exporters)
+	attrs := make(map[string]interface{}, len(l.Attributes)+3)
+	for k, v := range l.Attributes {
+		attrs[k] = v
+	}
 	if l.FilePath != "" {
-		l.Attributes["log.file.path"] = l.FilePath
-		l.Attributes["log.file.name"] = filepath.Base(l.FilePath)
+		attrs["log.file.path"] = l.FilePath
+		attrs["log.file.name"] = filepath.Base(l.FilePath)
 	}
 	if l.Source != "" {
-		l.Attributes["source"] = l.Source
+		attrs["source"] = l.Source
 	}
 
-	for k, v := range l.Attributes {
+	for k, v := range attrs {
 		pl.Attributes = append(pl.Attributes, &commonpb.KeyValue{
 			Key:   k,
 			Value: toAnyValue(v),

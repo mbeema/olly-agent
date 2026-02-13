@@ -127,8 +127,10 @@ func (pc *ProcessCollector) collect() {
 func (pc *ProcessCollector) collectPID(pid uint32, now time.Time) {
 	proc, err := process.NewProcess(int32(pid))
 	if err != nil {
-		// Process may have exited
-		pc.RemovePID(pid)
+		// B8 fix: log instead of removing — transient /proc errors (permission,
+		// race with short-lived threads) would permanently lose the PID.
+		// PIDs are removed explicitly via RemovePID when the hook detects exit.
+		pc.logger.Debug("process not found", zap.Uint32("pid", pid), zap.Error(err))
 		return
 	}
 

@@ -23,6 +23,7 @@ import (
 type ContainerCollector struct {
 	logger    *zap.Logger
 	cgroupDir string // auto-detected cgroup v2 mount path
+	startTime time.Time // B6 fix: OTLP StartTimeUnixNano for cumulative counters
 
 	mu        sync.RWMutex
 	callbacks []func(*Metric)
@@ -44,6 +45,7 @@ func NewContainerCollector(logger *zap.Logger) *ContainerCollector {
 	return &ContainerCollector{
 		logger:    logger,
 		cgroupDir: cgroupDir,
+		startTime: time.Now(),
 		stopCh:    make(chan struct{}),
 	}
 }
@@ -120,6 +122,7 @@ func (cc *ContainerCollector) collectCPU(now time.Time) {
 	}
 
 	stats := parseCgroupKV(data)
+	// B6 fix: all counters include StartTime for OTLP cumulative semantics
 	if v, ok := stats["usage_usec"]; ok {
 		cc.emit(&Metric{
 			Name:      "container.cpu.usage",
@@ -127,6 +130,7 @@ func (cc *ContainerCollector) collectCPU(now time.Time) {
 			Type:      Counter,
 			Value:     float64(v),
 			Timestamp: now,
+			StartTime: cc.startTime,
 		})
 	}
 	if v, ok := stats["user_usec"]; ok {
@@ -136,6 +140,7 @@ func (cc *ContainerCollector) collectCPU(now time.Time) {
 			Type:      Counter,
 			Value:     float64(v),
 			Timestamp: now,
+			StartTime: cc.startTime,
 		})
 	}
 	if v, ok := stats["system_usec"]; ok {
@@ -145,6 +150,7 @@ func (cc *ContainerCollector) collectCPU(now time.Time) {
 			Type:      Counter,
 			Value:     float64(v),
 			Timestamp: now,
+			StartTime: cc.startTime,
 		})
 	}
 	if v, ok := stats["nr_throttled"]; ok {
@@ -154,6 +160,7 @@ func (cc *ContainerCollector) collectCPU(now time.Time) {
 			Type:      Counter,
 			Value:     float64(v),
 			Timestamp: now,
+			StartTime: cc.startTime,
 		})
 	}
 	if v, ok := stats["throttled_usec"]; ok {
@@ -163,6 +170,7 @@ func (cc *ContainerCollector) collectCPU(now time.Time) {
 			Type:      Counter,
 			Value:     float64(v),
 			Timestamp: now,
+			StartTime: cc.startTime,
 		})
 	}
 
@@ -212,13 +220,13 @@ func (cc *ContainerCollector) collectMemory(now time.Time) {
 				Value:     float64(v),
 				Timestamp: now,
 			})
-			// Memory utilization vs limit
+			// B7 fix: OTEL semconv uses 0-1 ratio, not 0-100 percentage
 			if current >= 0 && v > 0 {
 				cc.emit(&Metric{
 					Name:      "container.memory.utilization",
-					Unit:      "%",
+					Unit:      "1",
 					Type:      Gauge,
-					Value:     float64(current) / float64(v) * 100,
+					Value:     float64(current) / float64(v),
 					Timestamp: now,
 				})
 			}
@@ -250,13 +258,17 @@ func (cc *ContainerCollector) collectMemory(now time.Time) {
 				unit = "{events}"
 				mtype = Counter
 			}
-			cc.emit(&Metric{
+			m := &Metric{
 				Name:      metricName,
 				Unit:      unit,
 				Type:      MetricType(mtype),
 				Value:     float64(v),
 				Timestamp: now,
-			})
+			}
+			if mtype == Counter {
+				m.StartTime = cc.startTime
+			}
+			cc.emit(m)
 		}
 	}
 }
@@ -316,6 +328,7 @@ func (cc *ContainerCollector) collectIO(now time.Time) {
 				Type:      Counter,
 				Value:     float64(val),
 				Timestamp: now,
+				StartTime: cc.startTime,
 				Labels:    labels,
 			})
 		}
