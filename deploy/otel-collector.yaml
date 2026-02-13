@@ -4,8 +4,8 @@
 extensions:
   basicauth/grafana_cloud:
     client_auth:
-      username: "${GRAFANA_CLOUD_INSTANCE_ID}"   # e.g. "${GRAFANA_CLOUD_INSTANCE_ID}"
-      password: "${GRAFANA_CLOUD_API_TOKEN}"     # glc_... token from Grafana Cloud
+      username: "780407"
+      password: "glc_eyJvIjoiOTgxNDIzIiwibiI6InN0YWNrLTc4MDQwNy1pbnRlZ3JhdGlvbi0wMjEzIiwiayI6InU4WTdsbDZJSng0QTUxSW5POHE5MTlHSiIsIm0iOnsiciI6InByb2QtdXMtZWFzdC0wIn19"
 
 receivers:
   otlp:
@@ -18,8 +18,6 @@ receivers:
     scrapers:
       load:
       memory:
-  # NOTE: Profiles are pushed directly from olly agent to Grafana Cloud Pyroscope
-  # (otelcol-contrib does not include a pyroscope receiver)
 
 processors:
   batch:
