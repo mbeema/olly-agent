@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,9 +70,18 @@ type Agent struct {
 	logCh  chan *logs.LogRecord
 	spanCh chan *traces.Span
 
-	// Thread-local trace context for intra-process parent-child linking.
-	// Maps PID+TID → trace context when an inbound HTTP request is active.
-	threadCtx sync.Map // key: uint64(pid)<<32|uint64(tid), value: *threadTraceCtx
+	// Trace filtering (compiled from config)
+	excludedAddrs   map[string]bool // connection-level: skip these remote IPs entirely
+	excludePaths    []string        // span-level: drop spans matching these URL path prefixes
+	includeServices map[string]bool // span-level: if non-empty, only export these services
+
+	// Connection-scoped trace context for intra-process parent-child linking.
+	// FD-keyed instead of TID-keyed: survives goroutine migration, handles
+	// concurrent requests, and provides O(1) PID fallback.
+	connCtx         sync.Map // key: uint64(PID)<<32|uint64(uint32(FD)) -> *connTraceCtx
+	threadInboundFD sync.Map // key: uint64(PID)<<32|uint64(TID)        -> int32 (inbound FD)
+	fdCausal        sync.Map // key: uint64(PID)<<32|uint64(uint32(FD)) -> *causalEntry
+	pidActiveCtx    sync.Map // key: uint32(PID)                        -> int32 (most recent inbound FD)
 
 	mu            sync.Mutex
 	ctx           context.Context
@@ -80,13 +90,22 @@ type Agent struct {
 	wg            sync.WaitGroup
 }
 
-// threadTraceCtx holds trace context for an active inbound request on a thread.
-type threadTraceCtx struct {
+// connTraceCtx holds trace context for an active inbound request on a connection.
+// Keyed by PID+FD (connection-scoped) instead of PID+TID (thread-scoped) to
+// survive Go goroutine migration and handle concurrent requests correctly.
+type connTraceCtx struct {
 	TraceID      string
 	SpanID       string // injected via sk_msg → becomes CLIENT span's own spanID
 	ServerSpanID string // SERVER span's own spanID (CLIENT spans reference this as parent)
 	ParentSpanID string // from incoming traceparent header (cross-service linking)
 	Created      time.Time
+}
+
+// causalEntry records which inbound FD caused an outbound write.
+// Written in OnDataOut, read in enrichPairContext Layer 1.
+type causalEntry struct {
+	InboundFD int32
+	Timestamp time.Time
 }
 
 // New creates a new agent from configuration.
@@ -219,6 +238,9 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 	// Initialize service map
 	a.serviceMap = servicemap.NewGenerator(logger)
 
+	// Compile trace filter maps from config
+	a.buildFilterMaps(cfg)
+
 	// Select hook provider: eBPF on Linux 5.8+, stub otherwise
 	if cfg.Hook.Enabled {
 		a.hookProvider = selectHookProvider(cfg, logger)
@@ -297,9 +319,15 @@ func (a *Agent) Start(ctx context.Context) error {
 					conn.IsSSL = true
 				}
 			}
+
+			// Connection-level filter: skip excluded addresses early
+			remoteAddr := conn.RemoteAddrStr()
+			if a.excludedAddrs[remoteAddr] {
+				return
+			}
+
 			a.connTracker.AddBytesSent(pid, fd, uint64(len(data)))
 
-			remoteAddr := conn.RemoteAddrStr()
 			remotePort := conn.RemotePort
 			// For inbound (server) connections, outgoing data is the response.
 			// Swap to keep sendBuf=request, recvBuf=response in the reassembler.
@@ -307,6 +335,16 @@ func (a *Agent) Start(ctx context.Context) error {
 				a.reassembler.AppendRecv(pid, tid, fd, data, remoteAddr, remotePort, conn.IsSSL)
 				a.reassembler.SetDirection(pid, fd, 1) // 1=inbound
 			} else {
+				// Record causal mapping: this outbound write was caused by
+				// whichever inbound FD this thread is currently serving.
+				tidKey := uint64(pid)<<32 | uint64(tid)
+				if inboundFD, ok := a.threadInboundFD.Load(tidKey); ok {
+					causalKey := uint64(pid)<<32 | uint64(uint32(fd))
+					a.fdCausal.Store(causalKey, &causalEntry{
+						InboundFD: inboundFD.(int32),
+						Timestamp: time.Now(),
+					})
+				}
 				a.reassembler.AppendSend(pid, tid, fd, data, remoteAddr, remotePort, conn.IsSSL)
 			}
 		},
@@ -320,23 +358,33 @@ func (a *Agent) Start(ctx context.Context) error {
 			} else if !conn.IsSSL && conn.RemotePort == 443 {
 				conn.IsSSL = true
 			}
+
+			// Connection-level filter: skip excluded addresses early
+			remoteAddr := conn.RemoteAddrStr()
+			if a.excludedAddrs[remoteAddr] {
+				return
+			}
+
 			a.connTracker.AddBytesRecv(pid, fd, uint64(len(data)))
 
-			remoteAddr := conn.RemoteAddrStr()
 			remotePort := conn.RemotePort
 			// For inbound (server) connections, incoming data is the request.
 			// Swap to keep sendBuf=request, recvBuf=response in the reassembler.
 			if conn.Direction == conntrack.ConnInbound {
-				// Store trace context for intra-process parent-child linking.
-				// When the request arrives, generate/extract trace context so
-				// outbound CLIENT spans (e.g., DB queries) can inherit it.
-				ctxKey := uint64(pid)<<32 | uint64(tid)
-				// Always create fresh context for each inbound request.
-				// Previous context is NOT deleted in enrichPairContext (to allow
-				// CLIENT spans to inherit it), so we must overwrite here when
-				// the next request arrives on the same thread.
+				// Store trace context keyed by FD (connection-scoped).
+				// FD-keyed context survives goroutine migration and handles
+				// concurrent requests correctly (each connection has its own context).
+				connKey := uint64(pid)<<32 | uint64(uint32(fd))
+
+				// Track which inbound FD this thread is serving (for causal mapping)
+				tidKey := uint64(pid)<<32 | uint64(tid)
+				a.threadInboundFD.Store(tidKey, fd)
+
+				// Update PID-level fallback (O(1) replacement for O(N) Range scan)
+				a.pidActiveCtx.Store(pid, fd)
+
 				{
-					tctx := &threadTraceCtx{Created: time.Now()}
+					tctx := &connTraceCtx{Created: time.Now()}
 
 					// Priority 1: Extract traceparent from HTTP headers in the data.
 					// This captures injected headers from upstream sk_msg and gives
@@ -397,19 +445,8 @@ func (a *Agent) Start(ctx context.Context) error {
 					if tctx.SpanID == "" {
 						tctx.SpanID = traces.GenerateSpanID()
 					}
-					// ServerSpanID is always a separate ID for the SERVER span.
-					// tctx.SpanID is what gets injected via sk_msg and becomes
-					// the CLIENT span's own spanID. This creates a proper chain:
-					// SERVER(ServerSpanID) → CLIENT(SpanID) → downstream SERVER(parent=SpanID)
 					tctx.ServerSpanID = traces.GenerateSpanID()
-					a.threadCtx.Store(ctxKey, tctx)
-
-					// NOTE: SetTraceContext removed to fix race condition #3.
-					// BPF generates trace context in kretprobe_read and stores it
-					// in thread_trace_ctx map. Go no longer writes back to BPF,
-					// eliminating the race where Go's SetTraceContext overwrites
-					// BPF's freshly-generated context for the NEXT request.
-					// sk_msg reads directly from BPF's thread_trace_ctx map.
+					a.connCtx.Store(connKey, tctx)
 				}
 				a.reassembler.AppendSend(pid, tid, fd, data, remoteAddr, remotePort, conn.IsSSL)
 				a.reassembler.SetDirection(pid, fd, 1) // 1=inbound; set after AppendSend creates the stream
@@ -420,6 +457,10 @@ func (a *Agent) Start(ctx context.Context) error {
 
 		OnClose: func(pid, tid uint32, fd int32, ts uint64) {
 			a.reassembler.RemoveStream(pid, fd, tid)
+			// Clean up FD-keyed context maps before removing from connTracker
+			connKey := uint64(pid)<<32 | uint64(uint32(fd))
+			a.connCtx.Delete(connKey)
+			a.fdCausal.Delete(connKey)
 			a.connTracker.Remove(pid, fd)
 		},
 
@@ -435,7 +476,7 @@ func (a *Agent) Start(ctx context.Context) error {
 	// This ensures the reassembler's stream lock is released before trace processing begins.
 	a.reassembler.OnPair(func(pair *reassembly.RequestPair) {
 		// Enrich context HERE (in ring buffer reader goroutine) to avoid race:
-		// OnDataIn creates threadCtx in this same goroutine, so the context
+		// OnDataIn creates connCtx in this same goroutine, so the context
 		// is guaranteed to still be for this request. If we waited until
 		// pairDispatchLoop (separate goroutine), a new inbound request could
 		// overwrite the context before the pair is processed.
@@ -673,78 +714,89 @@ func (a *Agent) pairDispatchLoop(ctx context.Context) {
 // For inbound SERVER spans: use the stored context as this span's IDs, then clear.
 // For outbound CLIENT spans: use the stored context as parent.
 func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
-	ctxKey := uint64(pair.PID)<<32 | uint64(pair.TID)
-	val, ok := a.threadCtx.Load(ctxKey)
-	if !ok {
-		// Fallback: search by PID only. Go goroutines execute on different
-		// OS threads, so the PG query may run on a different TID than the
-		// inbound HTTP handler. Find the most recent context for this PID.
-		var bestCtx *threadTraceCtx
-		a.threadCtx.Range(func(key, value any) bool {
-			k, ok := key.(uint64)
-			if !ok {
-				return true
-			}
-			if uint32(k>>32) == pair.PID {
-				tctx, ok := value.(*threadTraceCtx)
-				if !ok {
-					return true
-				}
-				if bestCtx == nil || tctx.Created.After(bestCtx.Created) {
-					bestCtx = tctx
-				}
-			}
-			return true
-		})
-		if bestCtx == nil {
+	connInfo := a.connTracker.Lookup(pair.PID, pair.FD)
+
+	// SERVER pairs: direct lookup by the pair's own FD (which IS the inbound FD).
+	if connInfo != nil && connInfo.Direction == conntrack.ConnInbound {
+		connKey := uint64(pair.PID)<<32 | uint64(uint32(pair.FD))
+		val, ok := a.connCtx.Load(connKey)
+		if !ok {
 			return
 		}
-		val = bestCtx
-	}
-	tctx, ok := val.(*threadTraceCtx)
-	if !ok {
-		return
-	}
-	// Only apply if context is recent (within 30s)
-	if time.Since(tctx.Created) > 30*time.Second {
-		a.threadCtx.Delete(ctxKey)
-		// Clean up leaked BPF map entry for this expired thread context
-		if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
-			injector.ClearTraceContext(pair.PID, pair.TID)
+		tctx, ok := val.(*connTraceCtx)
+		if !ok || time.Since(tctx.Created) > 30*time.Second {
+			return
 		}
-		return
-	}
-	pair.ParentTraceID = tctx.TraceID
-	pair.ParentSpanID = tctx.ServerSpanID // SERVER span's own ID
-
-	// For inbound connections, the SERVER span uses the context but does NOT
-	// delete it. Subsequent outbound CLIENT spans on the same thread need to
-	// inherit the trace ID to maintain end-to-end trace continuity.
-	// Context is cleaned up when the next inbound request arrives (line 303
-	// only stores if !loaded) or by the 30s TTL above.
-	connInfo := a.connTracker.Lookup(pair.PID, pair.FD)
-	if connInfo != nil && connInfo.Direction == conntrack.ConnInbound {
-		// Don't delete context — CLIENT spans on this thread still need it.
+		pair.ParentTraceID = tctx.TraceID
+		pair.ParentSpanID = tctx.ServerSpanID
 		// Clear BPF trace context since sk_msg injection already happened.
 		if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
 			injector.ClearTraceContext(pair.PID, pair.TID)
 		}
-	} else {
-		// Outbound CLIENT span: pass the sk_msg-injected spanID so the
-		// CLIENT span uses it as its own spanID (matching what downstream sees).
-		// Only for HTTP/gRPC: sk_msg only injects traceparent into HTTP traffic.
-		// DB/Redis/MongoDB CLIENT spans should get unique generated spanIDs,
-		// not the injected spanID (which would cause duplicate spanIDs).
-		if pair.Protocol == "http" || pair.Protocol == "grpc" || pair.Protocol == "genai" || pair.Protocol == "mcp" {
-			pair.InjectedSpanID = tctx.SpanID
-			// Consume: generate a new SpanID for subsequent CLIENT spans on
-			// this thread. The BPF-side thread_trace_ctx still has the original,
-			// but only the first CLIENT span should use it as its own SpanID.
-			// Without this, multiple outbound calls on the same thread (e.g.,
-			// Flask handling one inbound request with multiple MCP calls) would
-			// all get the same SpanID → duplicate spanIds across traces.
-			tctx.SpanID = traces.GenerateSpanID()
+		return
+	}
+
+	// CLIENT pairs: 3-layer FD-based lookup to find the inbound context
+	// that caused this outbound request.
+	var inboundFD int32
+	var found bool
+
+	// Layer 1: FD causal mapping (most accurate).
+	// OnDataOut recorded which inbound FD caused this outbound write.
+	causalKey := uint64(pair.PID)<<32 | uint64(uint32(pair.FD))
+	if val, ok := a.fdCausal.Load(causalKey); ok {
+		ce := val.(*causalEntry)
+		if time.Since(ce.Timestamp) <= 30*time.Second {
+			inboundFD = ce.InboundFD
+			found = true
 		}
+	}
+
+	// Layer 2: Thread → inbound FD mapping (fallback for first write).
+	if !found {
+		tidKey := uint64(pair.PID)<<32 | uint64(pair.TID)
+		if val, ok := a.threadInboundFD.Load(tidKey); ok {
+			inboundFD = val.(int32)
+			found = true
+		}
+	}
+
+	// Layer 3: PID-level most-recent inbound FD (O(1) fallback).
+	// Replaces O(N) threadCtx.Range() scan. Works for Go goroutine TID mismatch.
+	if !found {
+		if val, ok := a.pidActiveCtx.Load(pair.PID); ok {
+			inboundFD = val.(int32)
+			found = true
+		}
+	}
+
+	if !found {
+		return
+	}
+
+	// Resolve inbound FD → connection trace context
+	connKey := uint64(pair.PID)<<32 | uint64(uint32(inboundFD))
+	val, ok := a.connCtx.Load(connKey)
+	if !ok {
+		return
+	}
+	tctx, ok := val.(*connTraceCtx)
+	if !ok || time.Since(tctx.Created) > 30*time.Second {
+		return
+	}
+
+	pair.ParentTraceID = tctx.TraceID
+	pair.ParentSpanID = tctx.ServerSpanID
+
+	// Outbound CLIENT span: pass the sk_msg-injected spanID so the
+	// CLIENT span uses it as its own spanID (matching what downstream sees).
+	// Only for HTTP/gRPC: sk_msg only injects traceparent into HTTP traffic.
+	if pair.Protocol == "http" || pair.Protocol == "grpc" || pair.Protocol == "genai" || pair.Protocol == "mcp" {
+		pair.InjectedSpanID = tctx.SpanID
+		// Consume: generate a new SpanID for subsequent CLIENT spans on
+		// this connection. Without this, multiple outbound calls reusing
+		// the same FD would all get the same SpanID.
+		tctx.SpanID = traces.GenerateSpanID()
 	}
 }
 
@@ -784,6 +836,12 @@ func (a *Agent) processSpan(span *traces.Span) {
 	// Enrich with service name
 	if a.discoverer != nil && span.ServiceName == "" {
 		span.ServiceName = a.discoverer.GetServiceName(span.PID)
+	}
+
+	// Span-level filter: service whitelist, path exclusion, protocol toggle
+	if a.shouldFilterSpan(span) {
+		a.healthStats.SpansDropped.Add(1)
+		return
 	}
 
 	// Apply PII redaction to sensitive attributes
@@ -1022,6 +1080,9 @@ func (a *Agent) Reload(cfg *config.Config) error {
 	oldCfg := a.cfg.Load()
 	a.cfg.Store(cfg)
 
+	// Recompile trace filter maps
+	a.buildFilterMaps(cfg)
+
 	// Logs: start/stop collector
 	if !oldCfg.Logs.Enabled && cfg.Logs.Enabled {
 		a.startLogs()
@@ -1185,26 +1246,70 @@ func (a *Agent) cleanupLoop(ctx context.Context) {
 				staleStitched = a.traceStitcher.Cleanup()
 			}
 
-			// Clean stale thread trace contexts (and their BPF map entries)
-			staleThreadCtx := 0
-			a.threadCtx.Range(func(key, value any) bool {
-				tctx, ok := value.(*threadTraceCtx)
+			// Clean stale connection trace contexts
+			staleConnCtx := 0
+			a.connCtx.Range(func(key, value any) bool {
+				tctx, ok := value.(*connTraceCtx)
 				if !ok {
-					a.threadCtx.Delete(key)
+					a.connCtx.Delete(key)
 					return true
 				}
 				if time.Since(tctx.Created) > 30*time.Second {
-					a.threadCtx.Delete(key)
-					staleThreadCtx++
+					a.connCtx.Delete(key)
+					staleConnCtx++
+				}
+				return true
+			})
+
+			// Clean stale causal entries
+			a.fdCausal.Range(func(key, value any) bool {
+				ce, ok := value.(*causalEntry)
+				if !ok || time.Since(ce.Timestamp) > 30*time.Second {
+					a.fdCausal.Delete(key)
+				}
+				return true
+			})
+
+			// Clean stale threadInboundFD entries (whose connCtx no longer exists)
+			a.threadInboundFD.Range(func(key, value any) bool {
+				fd, ok := value.(int32)
+				if !ok {
+					a.threadInboundFD.Delete(key)
+					return true
+				}
+				k, ok := key.(uint64)
+				if !ok {
+					a.threadInboundFD.Delete(key)
+					return true
+				}
+				pid := uint32(k >> 32)
+				connKey := uint64(pid)<<32 | uint64(uint32(fd))
+				if _, exists := a.connCtx.Load(connKey); !exists {
+					a.threadInboundFD.Delete(key)
 					// Clear leaked BPF map entry
 					if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
-						k, ok := key.(uint64)
-						if ok {
-							pid := uint32(k >> 32)
-							tid := uint32(k & 0xFFFFFFFF)
-							injector.ClearTraceContext(pid, tid)
-						}
+						tid := uint32(k & 0xFFFFFFFF)
+						injector.ClearTraceContext(pid, tid)
 					}
+				}
+				return true
+			})
+
+			// Clean stale pidActiveCtx entries (whose connCtx no longer exists)
+			a.pidActiveCtx.Range(func(key, value any) bool {
+				pid, ok := key.(uint32)
+				if !ok {
+					a.pidActiveCtx.Delete(key)
+					return true
+				}
+				fd, ok := value.(int32)
+				if !ok {
+					a.pidActiveCtx.Delete(key)
+					return true
+				}
+				connKey := uint64(pid)<<32 | uint64(uint32(fd))
+				if _, exists := a.connCtx.Load(connKey); !exists {
+					a.pidActiveCtx.Delete(key)
 				}
 				return true
 			})
@@ -1218,12 +1323,12 @@ func (a *Agent) cleanupLoop(ctx context.Context) {
 				}
 			}
 
-			if staleConns > 0 || staleStreams > 0 || staleStitched > 0 || staleThreadCtx > 0 {
+			if staleConns > 0 || staleStreams > 0 || staleStitched > 0 || staleConnCtx > 0 {
 				a.logger.Debug("cleanup",
 					zap.Int("stale_connections", staleConns),
 					zap.Int("stale_streams", staleStreams),
 					zap.Int("stale_stitched", staleStitched),
-					zap.Int("stale_thread_ctx", staleThreadCtx),
+					zap.Int("stale_conn_ctx", staleConnCtx),
 					zap.Int("active_connections", a.connTracker.Count()),
 					zap.Int("active_streams", a.reassembler.StreamCount()),
 				)
@@ -1283,6 +1388,87 @@ func (a *Agent) exportMetricSlice(metrics []*metrics.Metric) {
 			}
 		}
 		a.exporter.ExportMetric(em)
+	}
+}
+
+// buildFilterMaps compiles filter config into maps for fast lookup.
+func (a *Agent) buildFilterMaps(cfg *config.Config) {
+	// Excluded addresses (connection-level)
+	addrs := make(map[string]bool, len(cfg.Tracing.Filter.ExcludeAddresses))
+	for _, addr := range cfg.Tracing.Filter.ExcludeAddresses {
+		addrs[addr] = true
+	}
+	a.excludedAddrs = addrs
+
+	// Include services whitelist (span-level)
+	services := make(map[string]bool, len(cfg.Tracing.Filter.IncludeServices))
+	for _, svc := range cfg.Tracing.Filter.IncludeServices {
+		services[svc] = true
+	}
+	a.includeServices = services
+
+	// Exclude paths (span-level)
+	a.excludePaths = cfg.Tracing.Filter.ExcludePaths
+
+	if len(addrs) > 0 || len(services) > 0 || len(a.excludePaths) > 0 {
+		a.logger.Info("trace filters configured",
+			zap.Int("exclude_addresses", len(addrs)),
+			zap.Int("include_services", len(services)),
+			zap.Int("exclude_paths", len(a.excludePaths)),
+		)
+	}
+}
+
+// shouldFilterSpan returns true if the span should be dropped based on filters.
+func (a *Agent) shouldFilterSpan(span *traces.Span) bool {
+	// Service whitelist: if configured, only allow listed services
+	if len(a.includeServices) > 0 && span.ServiceName != "" {
+		if !a.includeServices[span.ServiceName] {
+			return true
+		}
+	}
+
+	// Path exclusion: drop spans matching excluded URL path prefixes
+	if urlPath, ok := span.Attributes["url.path"]; ok && len(a.excludePaths) > 0 {
+		for _, prefix := range a.excludePaths {
+			if strings.HasPrefix(urlPath, prefix) {
+				return true
+			}
+		}
+	}
+
+	// Protocol toggle: drop spans for disabled protocols
+	if !a.isProtocolEnabled(span.Protocol) {
+		return true
+	}
+
+	return false
+}
+
+// isProtocolEnabled checks whether the given protocol is enabled in config.
+func (a *Agent) isProtocolEnabled(proto string) bool {
+	cfg := a.cfg.Load()
+	switch proto {
+	case "http":
+		return cfg.Tracing.Protocols.HTTP.Enabled
+	case "grpc":
+		return cfg.Tracing.Protocols.GRPC.Enabled
+	case "postgres":
+		return cfg.Tracing.Protocols.Postgres.Enabled
+	case "mysql":
+		return cfg.Tracing.Protocols.MySQL.Enabled
+	case "redis":
+		return cfg.Tracing.Protocols.Redis.Enabled
+	case "mongodb":
+		return cfg.Tracing.Protocols.MongoDB.Enabled
+	case "dns":
+		return cfg.Tracing.Protocols.DNS.Enabled
+	case "genai":
+		return cfg.Tracing.Protocols.GenAI.Enabled
+	case "mcp":
+		return cfg.Tracing.Protocols.MCP.Enabled
+	default:
+		return true // unknown protocols pass through
 	}
 }
 

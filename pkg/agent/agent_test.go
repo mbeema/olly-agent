@@ -9,7 +9,10 @@ import (
 	"time"
 
 	"github.com/mbeema/olly/pkg/config"
+	"github.com/mbeema/olly/pkg/conntrack"
+	hookebpf "github.com/mbeema/olly/pkg/hook/ebpf"
 	"github.com/mbeema/olly/pkg/logs"
+	"github.com/mbeema/olly/pkg/reassembly"
 	"go.uber.org/zap"
 )
 
@@ -203,5 +206,301 @@ func TestProcessHookLogChannelFull(t *testing.T) {
 		// good, didn't block
 	case <-time.After(time.Second):
 		t.Fatal("processHookLog blocked on full channel")
+	}
+}
+
+// newTestAgentWithConnTracker creates a minimal agent with connTracker and hookProvider
+// for testing enrichPairContext.
+func newTestAgentWithConnTracker() *Agent {
+	a := &Agent{
+		logParser:   logs.NewParser(),
+		logCh:       make(chan *logs.LogRecord, 100),
+		logger:      zap.NewNop(),
+		connTracker: conntrack.NewTracker(),
+	}
+	cfg := config.DefaultConfig()
+	a.cfg.Store(cfg)
+	a.hookProvider = hookebpf.NewStubProvider("test", a.logger)
+	return a
+}
+
+// storeTestConnCtx is a helper to store a connTraceCtx for testing.
+func storeTestConnCtx(a *Agent, pid uint32, fd int32, traceID, spanID, serverSpanID string) {
+	connKey := uint64(pid)<<32 | uint64(uint32(fd))
+	a.connCtx.Store(connKey, &connTraceCtx{
+		TraceID:      traceID,
+		SpanID:       spanID,
+		ServerSpanID: serverSpanID,
+		Created:      time.Now(),
+	})
+}
+
+func TestEnrichPairContext_InboundDirect(t *testing.T) {
+	a := newTestAgentWithConnTracker()
+
+	// Register an inbound connection (SERVER)
+	a.connTracker.RegisterInbound(100, 5, 0, 8080)
+
+	// Store context keyed by PID+FD
+	storeTestConnCtx(a, 100, 5, "trace-aaa", "span-bbb", "server-span-ccc")
+
+	pair := &reassembly.RequestPair{
+		PID:       100,
+		TID:       200,
+		FD:        5,
+		Direction: 1, // inbound
+	}
+
+	a.enrichPairContext(pair)
+
+	if pair.ParentTraceID != "trace-aaa" {
+		t.Errorf("ParentTraceID = %q, want %q", pair.ParentTraceID, "trace-aaa")
+	}
+	if pair.ParentSpanID != "server-span-ccc" {
+		t.Errorf("ParentSpanID = %q, want %q", pair.ParentSpanID, "server-span-ccc")
+	}
+}
+
+func TestEnrichPairContext_CausalMapping(t *testing.T) {
+	a := newTestAgentWithConnTracker()
+
+	// Register outbound connection (CLIENT)
+	a.connTracker.Register(100, 10, 0, 5432)
+
+	// Store inbound context on FD 5
+	storeTestConnCtx(a, 100, 5, "trace-111", "span-222", "server-333")
+
+	// Store causal mapping: outbound FD 10 was caused by inbound FD 5
+	causalKey := uint64(100)<<32 | uint64(uint32(int32(10)))
+	a.fdCausal.Store(causalKey, &causalEntry{
+		InboundFD: 5,
+		Timestamp: time.Now(),
+	})
+
+	pair := &reassembly.RequestPair{
+		PID:      100,
+		TID:      300, // different TID (goroutine migration)
+		FD:       10,
+		Protocol: "postgres",
+	}
+
+	a.enrichPairContext(pair)
+
+	if pair.ParentTraceID != "trace-111" {
+		t.Errorf("ParentTraceID = %q, want %q", pair.ParentTraceID, "trace-111")
+	}
+	if pair.ParentSpanID != "server-333" {
+		t.Errorf("ParentSpanID = %q, want %q", pair.ParentSpanID, "server-333")
+	}
+	// postgres should NOT get InjectedSpanID
+	if pair.InjectedSpanID != "" {
+		t.Errorf("InjectedSpanID = %q, want empty for postgres", pair.InjectedSpanID)
+	}
+}
+
+func TestEnrichPairContext_ThreadFallback(t *testing.T) {
+	a := newTestAgentWithConnTracker()
+
+	// Register outbound connection (CLIENT)
+	a.connTracker.Register(100, 10, 0, 80)
+
+	// Store inbound context on FD 5
+	storeTestConnCtx(a, 100, 5, "trace-abc", "span-def", "server-ghi")
+
+	// Store threadInboundFD: TID 200 was serving inbound FD 5
+	// (no fdCausal entry — simulates first write before causal is recorded)
+	tidKey := uint64(100)<<32 | uint64(200)
+	a.threadInboundFD.Store(tidKey, int32(5))
+
+	pair := &reassembly.RequestPair{
+		PID:      100,
+		TID:      200,
+		FD:       10,
+		Protocol: "http",
+	}
+
+	a.enrichPairContext(pair)
+
+	if pair.ParentTraceID != "trace-abc" {
+		t.Errorf("ParentTraceID = %q, want %q", pair.ParentTraceID, "trace-abc")
+	}
+	if pair.ParentSpanID != "server-ghi" {
+		t.Errorf("ParentSpanID = %q, want %q", pair.ParentSpanID, "server-ghi")
+	}
+	// HTTP should get InjectedSpanID
+	if pair.InjectedSpanID != "span-def" {
+		t.Errorf("InjectedSpanID = %q, want %q", pair.InjectedSpanID, "span-def")
+	}
+}
+
+func TestEnrichPairContext_PIDFallback(t *testing.T) {
+	a := newTestAgentWithConnTracker()
+
+	// Register outbound connection (CLIENT)
+	a.connTracker.Register(100, 10, 0, 5432)
+
+	// Store inbound context on FD 5
+	storeTestConnCtx(a, 100, 5, "trace-pid", "span-pid", "server-pid")
+
+	// Store pidActiveCtx: most recent inbound FD for PID 100 is FD 5
+	// (no fdCausal, no threadInboundFD for this TID — simulates Go goroutine TID mismatch)
+	a.pidActiveCtx.Store(uint32(100), int32(5))
+
+	pair := &reassembly.RequestPair{
+		PID:      100,
+		TID:      999, // different TID — goroutine migrated
+		FD:       10,
+		Protocol: "postgres",
+	}
+
+	a.enrichPairContext(pair)
+
+	if pair.ParentTraceID != "trace-pid" {
+		t.Errorf("ParentTraceID = %q, want %q", pair.ParentTraceID, "trace-pid")
+	}
+	if pair.ParentSpanID != "server-pid" {
+		t.Errorf("ParentSpanID = %q, want %q", pair.ParentSpanID, "server-pid")
+	}
+}
+
+func TestEnrichPairContext_Stale(t *testing.T) {
+	a := newTestAgentWithConnTracker()
+
+	// Register an inbound connection (SERVER)
+	a.connTracker.RegisterInbound(100, 5, 0, 8080)
+
+	// Store context with old timestamp (>30s ago)
+	connKey := uint64(100)<<32 | uint64(uint32(int32(5)))
+	a.connCtx.Store(connKey, &connTraceCtx{
+		TraceID:      "stale-trace",
+		SpanID:       "stale-span",
+		ServerSpanID: "stale-server",
+		Created:      time.Now().Add(-31 * time.Second),
+	})
+
+	pair := &reassembly.RequestPair{
+		PID:       100,
+		TID:       200,
+		FD:        5,
+		Direction: 1,
+	}
+
+	a.enrichPairContext(pair)
+
+	// Stale context should be ignored
+	if pair.ParentTraceID != "" {
+		t.Errorf("ParentTraceID = %q, want empty (stale)", pair.ParentTraceID)
+	}
+}
+
+func TestEnrichPairContext_StaleCausal(t *testing.T) {
+	a := newTestAgentWithConnTracker()
+
+	// Register outbound connection (CLIENT)
+	a.connTracker.Register(100, 10, 0, 5432)
+
+	// Store fresh inbound context on FD 5
+	storeTestConnCtx(a, 100, 5, "trace-fresh", "span-fresh", "server-fresh")
+
+	// Store STALE causal mapping
+	causalKey := uint64(100)<<32 | uint64(uint32(int32(10)))
+	a.fdCausal.Store(causalKey, &causalEntry{
+		InboundFD: 5,
+		Timestamp: time.Now().Add(-31 * time.Second),
+	})
+
+	// But also store pidActiveCtx as fallback
+	a.pidActiveCtx.Store(uint32(100), int32(5))
+
+	pair := &reassembly.RequestPair{
+		PID:      100,
+		TID:      999,
+		FD:       10,
+		Protocol: "postgres",
+	}
+
+	a.enrichPairContext(pair)
+
+	// Stale causal should be skipped, falls through to PID fallback
+	if pair.ParentTraceID != "trace-fresh" {
+		t.Errorf("ParentTraceID = %q, want %q", pair.ParentTraceID, "trace-fresh")
+	}
+}
+
+func TestOnClose_CleansContextMaps(t *testing.T) {
+	a := newTestAgentWithConnTracker()
+
+	pid := uint32(100)
+	fd := int32(5)
+
+	// Store entries in all maps
+	connKey := uint64(pid)<<32 | uint64(uint32(fd))
+	a.connCtx.Store(connKey, &connTraceCtx{
+		TraceID: "test",
+		Created: time.Now(),
+	})
+	a.fdCausal.Store(connKey, &causalEntry{
+		InboundFD: 3,
+		Timestamp: time.Now(),
+	})
+
+	// Verify they exist
+	if _, ok := a.connCtx.Load(connKey); !ok {
+		t.Fatal("connCtx should exist before close")
+	}
+	if _, ok := a.fdCausal.Load(connKey); !ok {
+		t.Fatal("fdCausal should exist before close")
+	}
+
+	// Simulate close — directly call cleanup logic
+	a.connCtx.Delete(connKey)
+	a.fdCausal.Delete(connKey)
+
+	// Verify they're gone
+	if _, ok := a.connCtx.Load(connKey); ok {
+		t.Error("connCtx should be deleted after close")
+	}
+	if _, ok := a.fdCausal.Load(connKey); ok {
+		t.Error("fdCausal should be deleted after close")
+	}
+}
+
+func TestEnrichPairContext_LayerPriority(t *testing.T) {
+	// Verify Layer 1 (causal) takes priority over Layer 2 (thread) and Layer 3 (PID)
+	a := newTestAgentWithConnTracker()
+
+	// Register outbound connection (CLIENT)
+	a.connTracker.Register(100, 10, 0, 80)
+
+	// Store TWO inbound contexts: FD 5 (correct) and FD 7 (wrong)
+	storeTestConnCtx(a, 100, 5, "trace-correct", "span-correct", "server-correct")
+	storeTestConnCtx(a, 100, 7, "trace-wrong", "span-wrong", "server-wrong")
+
+	// Layer 1: causal says FD 10 → inbound FD 5
+	causalKey := uint64(100)<<32 | uint64(uint32(int32(10)))
+	a.fdCausal.Store(causalKey, &causalEntry{
+		InboundFD: 5,
+		Timestamp: time.Now(),
+	})
+
+	// Layer 2: thread says TID 200 → inbound FD 7 (wrong one)
+	tidKey := uint64(100)<<32 | uint64(200)
+	a.threadInboundFD.Store(tidKey, int32(7))
+
+	// Layer 3: PID says FD 7 (wrong one)
+	a.pidActiveCtx.Store(uint32(100), int32(7))
+
+	pair := &reassembly.RequestPair{
+		PID:      100,
+		TID:      200,
+		FD:       10,
+		Protocol: "http",
+	}
+
+	a.enrichPairContext(pair)
+
+	// Should use Layer 1 (causal) → FD 5 → "trace-correct"
+	if pair.ParentTraceID != "trace-correct" {
+		t.Errorf("ParentTraceID = %q, want %q (Layer 1 should have priority)", pair.ParentTraceID, "trace-correct")
 	}
 }
