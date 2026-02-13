@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/mbeema/olly/pkg/config"
 	"github.com/mbeema/olly/pkg/traces"
@@ -247,8 +248,8 @@ func (e *OTLPExporter) convertSpan(s *traces.Span) (*tracepb.Span, error) {
 	ps := &tracepb.Span{
 		TraceId:           traceID,
 		SpanId:            spanID,
-		TraceState:        s.TraceState, // R1.2: propagate tracestate
-		Name:              s.Name,
+		TraceState:        s.TraceState,
+		Name:              sanitizeUTF8(s.Name),
 		Kind:              convertSpanKind(s.Kind),
 		StartTimeUnixNano: uint64(s.StartTime.UnixNano()),
 		EndTimeUnixNano:   uint64(s.EndTime.UnixNano()),
@@ -268,29 +269,29 @@ func (e *OTLPExporter) convertSpan(s *traces.Span) (*tracepb.Span, error) {
 		ps.Status.Code = tracepb.Status_STATUS_CODE_OK
 	case traces.StatusError:
 		ps.Status.Code = tracepb.Status_STATUS_CODE_ERROR
-		ps.Status.Message = s.StatusMsg
+		ps.Status.Message = sanitizeUTF8(s.StatusMsg)
 	default:
 		ps.Status.Code = tracepb.Status_STATUS_CODE_UNSET
 	}
 
-	// Attributes
+	// Attributes — sanitize values to valid UTF-8 (eBPF payloads may contain binary data)
 	for k, v := range s.Attributes {
 		ps.Attributes = append(ps.Attributes, &commonpb.KeyValue{
 			Key:   k,
-			Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: v}},
+			Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: sanitizeUTF8(v)}},
 		})
 	}
 
 	// Events
 	for _, ev := range s.Events {
 		pe := &tracepb.Span_Event{
-			Name:         ev.Name,
+			Name:         sanitizeUTF8(ev.Name),
 			TimeUnixNano: uint64(ev.Timestamp.UnixNano()),
 		}
 		for k, v := range ev.Attributes {
 			pe.Attributes = append(pe.Attributes, &commonpb.KeyValue{
 				Key:   k,
-				Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: v}},
+				Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: sanitizeUTF8(v)}},
 			})
 		}
 		ps.Events = append(ps.Events, pe)
@@ -519,6 +520,17 @@ func (e *OTLPExporter) Shutdown(ctx context.Context) error {
 		return e.conn.Close()
 	}
 	return nil
+}
+
+// sanitizeUTF8 replaces invalid UTF-8 sequences with the Unicode replacement
+// character. eBPF-captured payloads may contain encrypted TLS bytes or truncated
+// multi-byte sequences that are not valid UTF-8, causing gRPC protobuf marshaling
+// to fail.
+func sanitizeUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return string([]rune(s))
 }
 
 func hexToBytes(s string, expectedLen int) ([]byte, error) {

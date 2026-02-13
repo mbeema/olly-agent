@@ -50,6 +50,19 @@ for i in $(seq 1 "$ITERATIONS"); do
     curl -s "$BASE_URL/orders" \
         -H "traceparent: 00-${TRACE_ID}-${SPAN_ID}-01" > /dev/null || true
 
+    # GenAI: Chat completion (Flask → OpenAI API)
+    curl -s -X POST "$BASE_URL/ai/chat" \
+        -H "Content-Type: application/json" \
+        -d "{\"prompt\":\"What is order number $i about? Reply in one sentence.\",\"model\":\"gpt-4o-mini\"}" > /dev/null || true
+
+    # GenAI: Embeddings
+    curl -s -X POST "$BASE_URL/ai/embeddings" \
+        -H "Content-Type: application/json" \
+        -d "{\"text\":\"Widget-$i product description for search indexing\"}" > /dev/null || true
+
+    # GenAI: Multi-step agent (DB query + LLM summarization)
+    curl -s "$BASE_URL/ai/summarize-orders" > /dev/null || true
+
     # Slow endpoint (short delay)
     curl -s "$BASE_URL/slow?delay=0.5" > /dev/null
 

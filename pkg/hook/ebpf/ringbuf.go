@@ -70,6 +70,13 @@ type eventReader struct {
 	// OnDataIn, so the agent can read it race-free in the same goroutine.
 	lastTraceCtx   map[uint64]*eventTraceCtx
 	lastTraceCtxMu sync.Mutex
+
+	// sslFDs tracks PID+FD combinations that have received SSL uprobe events.
+	// When an SSL event arrives, the FD is marked as SSL. Subsequent kprobe
+	// DATA events for the same PID+FD are skipped because they contain
+	// encrypted ciphertext (useless for protocol parsing). Only the SSL
+	// uprobe events carry plaintext.
+	sslFDs map[uint64]struct{}
 }
 
 // newEventReader creates a ring buffer reader for the given BPF map.
@@ -83,6 +90,7 @@ func newEventReader(eventsMap *ebpf.Map, callbacks hook.Callbacks, logger *zap.L
 		callbacks:    callbacks,
 		logger:       logger,
 		lastTraceCtx: make(map[uint64]*eventTraceCtx),
+		sslFDs:       make(map[uint64]struct{}),
 	}, nil
 }
 
@@ -174,17 +182,70 @@ func (er *eventReader) dispatch(raw []byte) {
 			er.callbacks.OnAccept(pid, tid, fd, remoteAddr, remotePort, ts)
 		}
 
-	case eventDataOut, eventSSLOut:
+	case eventSSLOut:
+		// Mark this PID+FD as SSL so subsequent kprobe DATA events are skipped.
+		sslKey := uint64(pid)<<32 | uint64(uint32(fd))
+		er.sslFDs[sslKey] = struct{}{}
+		if len(payload) > 0 {
+			preview := string(payload)
+			if len(preview) > 80 {
+				preview = preview[:80]
+			}
+			er.logger.Debug("dispatch SSL_OUT", zap.Uint32("pid", pid), zap.Int32("fd", fd), zap.Int("len", len(payload)), zap.String("preview", preview))
+		}
 		if er.callbacks.OnDataOut != nil && len(payload) > 0 {
 			er.callbacks.OnDataOut(pid, tid, fd, payload, ts)
 		}
 
-	case eventDataIn, eventSSLIn:
+	case eventSSLIn:
+		sslKey := uint64(pid)<<32 | uint64(uint32(fd))
+		er.sslFDs[sslKey] = struct{}{}
+		if len(payload) > 0 {
+			preview := string(payload)
+			if len(preview) > 80 {
+				preview = preview[:80]
+			}
+			er.logger.Debug("dispatch SSL_IN", zap.Uint32("pid", pid), zap.Int32("fd", fd), zap.Int("len", len(payload)), zap.String("preview", preview))
+		}
+		if er.callbacks.OnDataIn != nil && len(payload) > 0 {
+			er.callbacks.OnDataIn(pid, tid, fd, payload, ts)
+		}
+
+	case eventDataOut:
+		sslKey := uint64(pid)<<32 | uint64(uint32(fd))
+		if _, isSSL := er.sslFDs[sslKey]; isSSL {
+			break // Skip kprobe data for SSL connections (encrypted ciphertext).
+		}
+		// Detect TLS record headers from the handshake phase (before SSL_write
+		// fires). TLS records start with content type 0x14-0x17 followed by
+		// version 0x03 0x01/0x03 0x03. Mark the FD as SSL preemptively.
+		if len(payload) >= 3 && payload[0] >= 0x14 && payload[0] <= 0x17 &&
+			payload[1] == 0x03 && (payload[2] == 0x01 || payload[2] == 0x03) {
+			er.sslFDs[sslKey] = struct{}{}
+			break
+		}
+		if er.callbacks.OnDataOut != nil && len(payload) > 0 {
+			er.callbacks.OnDataOut(pid, tid, fd, payload, ts)
+		}
+
+	case eventDataIn:
+		sslKey := uint64(pid)<<32 | uint64(uint32(fd))
+		if _, isSSL := er.sslFDs[sslKey]; isSSL {
+			break
+		}
+		if len(payload) >= 3 && payload[0] >= 0x14 && payload[0] <= 0x17 &&
+			payload[1] == 0x03 && (payload[2] == 0x01 || payload[2] == 0x03) {
+			er.sslFDs[sslKey] = struct{}{}
+			break
+		}
 		if er.callbacks.OnDataIn != nil && len(payload) > 0 {
 			er.callbacks.OnDataIn(pid, tid, fd, payload, ts)
 		}
 
 	case eventClose:
+		// Clean up SSL FD tracking.
+		sslKey := uint64(pid)<<32 | uint64(uint32(fd))
+		delete(er.sslFDs, sslKey)
 		if er.callbacks.OnClose != nil {
 			er.callbacks.OnClose(pid, tid, fd, ts)
 		}

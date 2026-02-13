@@ -17,6 +17,7 @@ const (
 	ProtoMongoDB  = "mongodb"
 	ProtoGRPC     = "grpc"
 	ProtoDNS      = "dns"
+	ProtoGenAI    = "genai"
 	ProtoUnknown  = "unknown"
 )
 
@@ -55,6 +56,25 @@ type SpanAttributes struct {
 	DNSType    string
 	DNSRcode   string
 	DNSAnswers int
+
+	// GenAI (OTEL gen_ai.* semantic conventions)
+	GenAIProvider      string  // e.g., "openai", "anthropic", "aws.bedrock"
+	GenAIOperation     string  // e.g., "chat", "text_completion", "embeddings"
+	GenAIRequestModel  string  // model from request
+	GenAIResponseModel string  // model from response (may differ)
+	GenAIResponseID    string  // response ID (e.g., "chatcmpl-...")
+	GenAIInputTokens   int     // prompt/input tokens
+	GenAIOutputTokens  int     // completion/output tokens
+	GenAIInputTokensSet  bool  // true if input tokens were parsed
+	GenAIOutputTokensSet bool  // true if output tokens were parsed
+	GenAIFinishReason  string  // e.g., "stop", "end_turn", "length"
+	GenAITemperature   float64
+	GenAITemperatureSet bool
+	GenAITopP          float64
+	GenAITopPSet       bool
+	GenAIMaxTokens     int
+	GenAIMaxTokensSet  bool
+	GenAIStreaming      bool   // true if SSE streaming response
 
 	// General
 	Error      bool
@@ -100,8 +120,16 @@ func Detect(data []byte, port uint16) string {
 	return ProtoUnknown
 }
 
+// genaiParser is kept outside the Detect registry (GenAI is detected via
+// Refine, not Detect) but must be reachable from Parse.
+var genaiParser = &GenAIParser{}
+
 // Parse uses the appropriate parser to extract span attributes.
 func Parse(proto string, request, response []byte) (*SpanAttributes, error) {
+	// GenAI uses Refine() instead of Detect(), so it's not in the registry.
+	if proto == ProtoGenAI {
+		return genaiParser.Parse(request, response)
+	}
 	for _, p := range registry {
 		if p.Name() == proto {
 			return p.Parse(request, response)

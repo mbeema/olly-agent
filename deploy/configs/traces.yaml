@@ -19,6 +19,8 @@ tracing:
       enabled: false
     dns:
       enabled: true
+    genai:
+      enabled: true
 
 correlation:
   enabled: true

@@ -69,6 +69,19 @@ if [ -f /var/log/otel/traces.json ]; then
         echo "Cross-service flow: Flask(CLIENT) → order-service(SERVER) detected"
     fi
 
+    # GenAI span detection
+    GENAI_SPANS=$(grep -c '"gen_ai.system"' /var/log/otel/traces.json 2>/dev/null || echo 0)
+    echo "GenAI spans: $GENAI_SPANS"
+    if [ "$GENAI_SPANS" -gt 0 ]; then
+        echo "--- GenAI providers detected ---"
+        grep -o '"gen_ai.system","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
+        echo "--- GenAI models ---"
+        grep -o '"gen_ai.response.model","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | sort -u || true
+        echo "--- GenAI token usage (first 3) ---"
+        grep -o '"gen_ai.usage.input_tokens","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | head -3 || true
+        grep -o '"gen_ai.usage.output_tokens","value":{"stringValue":"[^"]*"}' /var/log/otel/traces.json 2>/dev/null | head -3 || true
+    fi
+
     echo "--- Last 5 span names ---"
     grep -o '"name":"[^"]*"' /var/log/otel/traces.json 2>/dev/null | tail -5
 
@@ -101,7 +114,10 @@ echo "=== Metrics ==="
 if [ -f /var/log/otel/metrics.json ]; then
     echo "File size: $(wc -c < /var/log/otel/metrics.json) bytes"
     echo "--- Metric names ---"
-    grep -o '"name":"[^"]*"' /var/log/otel/metrics.json 2>/dev/null | sort -u | head -20
+    grep -o '"name":"[^"]*"' /var/log/otel/metrics.json 2>/dev/null | sort -u | head -30
+    echo "--- GenAI metrics ---"
+    grep -c '"gen_ai.client.token.usage"' /var/log/otel/metrics.json 2>/dev/null && echo "  gen_ai.client.token.usage: FOUND" || echo "  gen_ai.client.token.usage: not yet"
+    grep -c '"gen_ai.client.operation.duration"' /var/log/otel/metrics.json 2>/dev/null && echo "  gen_ai.client.operation.duration: FOUND" || echo "  gen_ai.client.operation.duration: not yet"
 else
     echo "NOT FOUND (file exporter not enabled or no data yet)"
 fi

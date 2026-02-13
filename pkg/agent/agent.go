@@ -55,6 +55,7 @@ type Agent struct {
 	logCollector    *logs.Collector
 	metricsColl     *metrics.Collector
 	requestMetrics  *rmetrics.RequestMetrics
+	genaiMetrics    *rmetrics.GenAIMetrics
 	processColl     *metrics.ProcessCollector
 	containerColl   *metrics.ContainerCollector
 	exporter        *export.Manager
@@ -169,6 +170,11 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 		a.metricsColl = metrics.NewCollector(&cfg.Metrics, logger)
 		a.requestMetrics = rmetrics.NewRequestMetrics(cfg.Metrics.Request.Buckets)
 
+		// GenAI token/duration metrics
+		if cfg.Metrics.GenAI.Enabled {
+			a.genaiMetrics = rmetrics.NewGenAIMetrics(cfg.Metrics.GenAI.Buckets)
+		}
+
 		// Per-process metrics
 		if cfg.Metrics.PerProcess.Enabled {
 			a.processColl = metrics.NewProcessCollector(logger)
@@ -272,7 +278,20 @@ func (a *Agent) Start(ctx context.Context) error {
 		OnDataOut: func(pid, tid uint32, fd int32, data []byte, ts uint64) {
 			conn := a.connTracker.Lookup(pid, fd)
 			if conn == nil {
-				return
+				// SSL uprobe events bypass BPF conn_map check, so the connect
+				// kprobe may not have registered this connection (e.g., sockaddr
+				// unreadable in kretprobe). Auto-register as outbound SSL.
+				// kprobe DATA events always require conn_map, so they can't
+				// reach here without a prior connect event.
+				conn = a.connTracker.Register(pid, fd, 0, 443)
+				conn.IsSSL = true
+			} else if !conn.IsSSL {
+				// Mark existing connection as SSL if plaintext looks like HTTP
+				// over a port-443 connection (SSL uprobe data arriving for a
+				// connection that was registered by the connect kprobe).
+				if conn.RemotePort == 443 {
+					conn.IsSSL = true
+				}
 			}
 			a.connTracker.AddBytesSent(pid, fd, uint64(len(data)))
 
@@ -281,17 +300,21 @@ func (a *Agent) Start(ctx context.Context) error {
 			// For inbound (server) connections, outgoing data is the response.
 			// Swap to keep sendBuf=request, recvBuf=response in the reassembler.
 			if conn.Direction == conntrack.ConnInbound {
-				a.reassembler.AppendRecv(pid, tid, fd, data, remoteAddr, remotePort, false)
+				a.reassembler.AppendRecv(pid, tid, fd, data, remoteAddr, remotePort, conn.IsSSL)
 				a.reassembler.SetDirection(pid, fd, 1) // 1=inbound
 			} else {
-				a.reassembler.AppendSend(pid, tid, fd, data, remoteAddr, remotePort, false)
+				a.reassembler.AppendSend(pid, tid, fd, data, remoteAddr, remotePort, conn.IsSSL)
 			}
 		},
 
 		OnDataIn: func(pid, tid uint32, fd int32, data []byte, ts uint64) {
 			conn := a.connTracker.Lookup(pid, fd)
 			if conn == nil {
-				return
+				// SSL uprobe events bypass BPF conn_map — auto-register.
+				conn = a.connTracker.Register(pid, fd, 0, 443)
+				conn.IsSSL = true
+			} else if !conn.IsSSL && conn.RemotePort == 443 {
+				conn.IsSSL = true
 			}
 			a.connTracker.AddBytesRecv(pid, fd, uint64(len(data)))
 
@@ -375,10 +398,10 @@ func (a *Agent) Start(ctx context.Context) error {
 					// BPF's freshly-generated context for the NEXT request.
 					// sk_msg reads directly from BPF's thread_trace_ctx map.
 				}
-				a.reassembler.AppendSend(pid, tid, fd, data, remoteAddr, remotePort, false)
+				a.reassembler.AppendSend(pid, tid, fd, data, remoteAddr, remotePort, conn.IsSSL)
 				a.reassembler.SetDirection(pid, fd, 1) // 1=inbound; set after AppendSend creates the stream
 			} else {
-				a.reassembler.AppendRecv(pid, tid, fd, data, remoteAddr, remotePort, false)
+				a.reassembler.AppendRecv(pid, tid, fd, data, remoteAddr, remotePort, conn.IsSSL)
 			}
 		},
 
@@ -699,7 +722,7 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 		// Only for HTTP/gRPC: sk_msg only injects traceparent into HTTP traffic.
 		// DB/Redis/MongoDB CLIENT spans should get unique generated spanIDs,
 		// not the injected spanID (which would cause duplicate spanIDs).
-		if pair.Protocol == "http" || pair.Protocol == "grpc" {
+		if pair.Protocol == "http" || pair.Protocol == "grpc" || pair.Protocol == "genai" {
 			pair.InjectedSpanID = tctx.SpanID
 		}
 	}
@@ -774,6 +797,11 @@ func (a *Agent) processSpan(span *traces.Span) {
 	// Record request metrics
 	if a.requestMetrics != nil {
 		a.requestMetrics.RecordSpan(span)
+	}
+
+	// Record GenAI metrics
+	if a.genaiMetrics != nil {
+		a.genaiMetrics.RecordSpan(span)
 	}
 
 	// Export
@@ -1018,6 +1046,9 @@ func (a *Agent) startMetrics() {
 	cfg := a.cfg.Load()
 	a.metricsColl = metrics.NewCollector(&cfg.Metrics, a.logger)
 	a.requestMetrics = rmetrics.NewRequestMetrics(cfg.Metrics.Request.Buckets)
+	if cfg.Metrics.GenAI.Enabled {
+		a.genaiMetrics = rmetrics.NewGenAIMetrics(cfg.Metrics.GenAI.Buckets)
+	}
 	a.metricsColl.OnMetric(func(m *metrics.Metric) {
 		a.exporter.ExportMetric(&export.Metric{
 			Name:        m.Name,
@@ -1051,6 +1082,7 @@ func (a *Agent) stopMetrics() {
 	a.metricsColl.Stop()
 	a.metricsColl = nil
 	a.requestMetrics = nil
+	a.genaiMetrics = nil
 	a.logger.Info("metrics collector stopped via reload")
 }
 
@@ -1097,9 +1129,10 @@ func (a *Agent) cleanupLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			// Clean stale connections (5 min timeout)
+			// Clean stale connections and streams. Use 30s for streams so
+			// SSL connections (no BPF CLOSE events) emit pairs promptly.
 			staleConns := a.connTracker.CleanStale(5 * time.Minute)
-			staleStreams := a.reassembler.CleanStale(5 * time.Minute)
+			staleStreams := a.reassembler.CleanStale(30 * time.Second)
 
 			// Clean stale stitching entries
 			staleStitched := 0
@@ -1169,6 +1202,36 @@ func logLevelToSeverityNumber(level logs.LogLevel) int32 {
 	}
 }
 
+// exportMetricSlice converts and exports a slice of internal metrics.
+func (a *Agent) exportMetricSlice(metrics []*metrics.Metric) {
+	for _, m := range metrics {
+		em := &export.Metric{
+			Name:        m.Name,
+			Description: m.Description,
+			Unit:        m.Unit,
+			Type:        export.MetricType(m.Type),
+			Value:       m.Value,
+			Timestamp:   m.Timestamp,
+			Labels:      m.Labels,
+		}
+		if m.Histogram != nil {
+			buckets := make([]export.HistogramBucket, len(m.Histogram.Buckets))
+			for i, b := range m.Histogram.Buckets {
+				buckets[i] = export.HistogramBucket{
+					UpperBound: b.UpperBound,
+					Count:      b.Count,
+				}
+			}
+			em.Histogram = &export.HistogramValue{
+				Count:   m.Histogram.Count,
+				Sum:     m.Histogram.Sum,
+				Buckets: buckets,
+			}
+		}
+		a.exporter.ExportMetric(em)
+	}
+}
+
 func (a *Agent) requestMetricsLoop(ctx context.Context) {
 	defer a.wg.Done()
 
@@ -1186,32 +1249,9 @@ func (a *Agent) requestMetricsLoop(ctx context.Context) {
 		select {
 		case <-ticker.C:
 			now := time.Now()
-			for _, m := range a.requestMetrics.Collect(now) {
-				em := &export.Metric{
-					Name:        m.Name,
-					Description: m.Description,
-					Unit:        m.Unit,
-					Type:        export.MetricType(m.Type),
-					Value:       m.Value,
-					Timestamp:   m.Timestamp,
-					Labels:      m.Labels,
-				}
-				// Pass through histogram data for proper OTLP export
-				if m.Histogram != nil {
-					buckets := make([]export.HistogramBucket, len(m.Histogram.Buckets))
-					for i, b := range m.Histogram.Buckets {
-						buckets[i] = export.HistogramBucket{
-							UpperBound: b.UpperBound,
-							Count:      b.Count,
-						}
-					}
-					em.Histogram = &export.HistogramValue{
-						Count:   m.Histogram.Count,
-						Sum:     m.Histogram.Sum,
-						Buckets: buckets,
-					}
-				}
-				a.exporter.ExportMetric(em)
+			a.exportMetricSlice(a.requestMetrics.Collect(now))
+			if a.genaiMetrics != nil {
+				a.exportMetricSlice(a.genaiMetrics.Collect(now))
 			}
 
 		case <-ctx.Done():

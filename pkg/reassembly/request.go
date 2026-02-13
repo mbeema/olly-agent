@@ -403,14 +403,58 @@ func (r *Reassembler) CleanStale(maxIdle time.Duration) int {
 	cutoff := time.Now().Add(-maxIdle)
 	removed := 0
 
+	// Collect stale streams with data so we can emit pairs outside the lock.
+	type staleEntry struct {
+		key streamKey
+		ss  *streamState
+	}
+	var stale []staleEntry
+
 	r.mu.Lock()
 	for key, ss := range r.streams {
 		if ss.stream.LastActivity().Before(cutoff) {
 			delete(r.streams, key)
 			removed++
+			if ss.stream.HasData() && r.onPair != nil {
+				stale = append(stale, staleEntry{key, ss})
+			}
 		}
 	}
 	r.mu.Unlock()
+
+	// Emit pairs from stale streams that had data (e.g., SSL connections
+	// where no CLOSE event was received from BPF).
+	for _, e := range stale {
+		s := e.ss.stream
+		s.mu.Lock()
+		duration := s.lastRecv.Sub(s.lastSend)
+		if duration <= 0 {
+			duration = time.Since(s.lastSend)
+		}
+		pairTID := e.ss.lastTID.Load()
+		pair := &RequestPair{
+			PID:         s.PID,
+			TID:         pairTID,
+			FD:          s.FD,
+			RemoteAddr:  s.RemoteAddr,
+			RemotePort:  s.RemotePort,
+			IsSSL:       s.IsSSL,
+			Protocol:    e.ss.protocol,
+			Request:     make([]byte, len(s.sendBuf)),
+			Response:    make([]byte, len(s.recvBuf)),
+			RequestTime: s.lastSend,
+			Duration:    duration,
+			Direction:   int(e.ss.direction.Load()),
+		}
+		copy(pair.Request, s.sendBuf)
+		copy(pair.Response, s.recvBuf)
+		s.mu.Unlock()
+
+		if pair.Duration < 0 {
+			pair.Duration = 0
+		}
+		r.onPair(pair)
+	}
 
 	return removed
 }

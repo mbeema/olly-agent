@@ -83,7 +83,14 @@ if [ -f olly-deploy/order-service ]; then
 fi
 
 # Start demo app (no wrapper needed — eBPF observes all processes automatically)
-sudo bash -c 'nohup python3 /opt/olly/demo-app/app.py > /var/log/demo-app/stdout.log 2>&1 &'
+# Pass OPENAI_API_KEY if set on the host (for GenAI monitoring demo)
+OPENAI_KEY_FILE="/opt/olly/.openai_key"
+if [ -f "$OPENAI_KEY_FILE" ]; then
+    OPENAI_KEY=$(cat "$OPENAI_KEY_FILE")
+    sudo bash -c "OPENAI_API_KEY=$OPENAI_KEY nohup python3 /opt/olly/demo-app/app.py > /var/log/demo-app/stdout.log 2>&1 &"
+else
+    sudo bash -c 'nohup python3 /opt/olly/demo-app/app.py > /var/log/demo-app/stdout.log 2>&1 &'
+fi
 sleep 3
 
 # Activate tracing if on-demand mode is configured

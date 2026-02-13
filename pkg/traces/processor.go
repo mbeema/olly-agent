@@ -58,6 +58,9 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 		proto = protocol.Detect(pair.Request, pair.RemotePort)
 	}
 
+	// Refine protocol: promote "http" → "genai" when GenAI endpoint detected
+	proto = protocol.Refine(proto, pair.Request, pair.RemotePort)
+
 	// Parse request/response
 	// Note: agent.go already swaps send/recv for inbound (SERVER) connections,
 	// so pair.Request always contains the request and pair.Response the response.
@@ -100,7 +103,7 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 
 	// Try to extract trace context from HTTP headers (R1.2: include tracestate).
 	// This covers: (a) traceparent injected by upstream sk_msg, (b) app-level headers.
-	if proto == protocol.ProtoHTTP || proto == protocol.ProtoGRPC {
+	if proto == protocol.ProtoHTTP || proto == protocol.ProtoGRPC || proto == protocol.ProtoGenAI {
 		traceCtx := protocol.ExtractTraceContext(pair.Request)
 		if traceCtx.TraceID != "" {
 			span.TraceID = traceCtx.TraceID
@@ -313,6 +316,66 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		}
 		if attrs.DNSAnswers > 0 {
 			span.SetAttribute("dns.answers", fmt.Sprintf("%d", attrs.DNSAnswers))
+		}
+
+	case protocol.ProtoGenAI:
+		// OTEL GenAI semantic conventions (gen_ai.* namespace)
+		if attrs.GenAIProvider != "" {
+			span.SetAttribute("gen_ai.system", attrs.GenAIProvider)
+		}
+		if attrs.GenAIOperation != "" {
+			span.SetAttribute("gen_ai.operation.name", attrs.GenAIOperation)
+		}
+		if attrs.GenAIRequestModel != "" {
+			span.SetAttribute("gen_ai.request.model", attrs.GenAIRequestModel)
+		}
+		if attrs.GenAIResponseModel != "" {
+			span.SetAttribute("gen_ai.response.model", attrs.GenAIResponseModel)
+		}
+		if attrs.GenAIResponseID != "" {
+			span.SetAttribute("gen_ai.response.id", attrs.GenAIResponseID)
+		}
+		if attrs.GenAIInputTokensSet {
+			span.SetAttribute("gen_ai.usage.input_tokens", fmt.Sprintf("%d", attrs.GenAIInputTokens))
+		}
+		if attrs.GenAIOutputTokensSet {
+			span.SetAttribute("gen_ai.usage.output_tokens", fmt.Sprintf("%d", attrs.GenAIOutputTokens))
+		}
+		if attrs.GenAIFinishReason != "" {
+			span.SetAttribute("gen_ai.response.finish_reasons", attrs.GenAIFinishReason)
+		}
+		if attrs.GenAITemperatureSet {
+			span.SetAttribute("gen_ai.request.temperature", fmt.Sprintf("%.2f", attrs.GenAITemperature))
+		}
+		if attrs.GenAITopPSet {
+			span.SetAttribute("gen_ai.request.top_p", fmt.Sprintf("%.2f", attrs.GenAITopP))
+		}
+		if attrs.GenAIMaxTokensSet {
+			span.SetAttribute("gen_ai.request.max_tokens", fmt.Sprintf("%d", attrs.GenAIMaxTokens))
+		}
+		if attrs.GenAIStreaming {
+			span.SetAttribute("gen_ai.request.streaming", "true")
+		}
+		// Underlying HTTP attributes
+		if attrs.HTTPMethod != "" {
+			span.SetAttribute("http.request.method", attrs.HTTPMethod)
+		}
+		if attrs.HTTPStatusCode > 0 {
+			span.SetAttribute("http.response.status_code", fmt.Sprintf("%d", attrs.HTTPStatusCode))
+		}
+		if attrs.HTTPHost != "" {
+			span.SetAttribute("server.address", attrs.HTTPHost)
+		}
+		if connInfo != nil {
+			span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
+		}
+		if isSSL {
+			span.SetAttribute("url.scheme", "https")
+		} else {
+			span.SetAttribute("url.scheme", "http")
+		}
+		if attrs.Error && attrs.HTTPStatusCode >= 400 {
+			span.SetAttribute("error.type", fmt.Sprintf("%d", attrs.HTTPStatusCode))
 		}
 	}
 }

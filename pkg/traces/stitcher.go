@@ -105,8 +105,10 @@ func (s *Stitcher) ProcessSpan(span *Span) bool {
 // then stores for future SERVER matching if no match found.
 // Returns true if the span was stored (deferred) for future matching.
 func (s *Stitcher) processClientSpan(span *Span) bool {
-	// Only stitch HTTP/gRPC CLIENT spans. DB/Redis/MongoDB CLIENT spans
+	// Only stitch HTTP/gRPC CLIENT spans. DB/Redis/MongoDB/GenAI CLIENT spans
 	// connect to unmonitored services — no matching SERVER span will arrive.
+	// GenAI CLIENT spans go to external APIs (OpenAI, Anthropic, etc.) which
+	// are not monitored by this agent.
 	if span.Protocol != "http" && span.Protocol != "grpc" {
 		return false
 	}
@@ -262,6 +264,7 @@ store:
 // then stores for future CLIENT matching if no match found.
 func (s *Stitcher) processServerSpan(span *Span) bool {
 	// Only stitch HTTP/gRPC SERVER spans (symmetric with client filter).
+	// GenAI spans are CLIENT-only (to external LLM APIs), so no SERVER filter needed.
 	if span.Protocol != "http" && span.Protocol != "grpc" {
 		return false
 	}
