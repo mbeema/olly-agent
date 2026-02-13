@@ -27,8 +27,9 @@ type ContainerCollector struct {
 	mu        sync.RWMutex
 	callbacks []func(*Metric)
 
-	wg     sync.WaitGroup
-	stopCh chan struct{}
+	wg       sync.WaitGroup
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // NewContainerCollector creates a container metrics collector.
@@ -99,7 +100,7 @@ func (cc *ContainerCollector) Start(ctx context.Context, interval time.Duration)
 
 // Stop halts container metric collection.
 func (cc *ContainerCollector) Stop() error {
-	close(cc.stopCh)
+	cc.stopOnce.Do(func() { close(cc.stopCh) })
 	cc.wg.Wait()
 	return nil
 }

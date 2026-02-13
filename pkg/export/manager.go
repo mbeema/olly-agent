@@ -43,6 +43,7 @@ type Metric struct {
 	Type        MetricType
 	Value       float64
 	Timestamp   time.Time
+	StartTime   time.Time // OTLP StartTimeUnixNano for cumulative counters/histograms
 	Labels      map[string]string
 	Histogram   *HistogramValue
 	ServiceName string // Service that produced this metric

@@ -99,8 +99,12 @@ func (p *HTTPParser) Parse(request, response []byte) (*SpanAttributes, error) {
 		}
 	}
 
-	// Build span name (OTEL: low-cardinality, use method only when route unknown)
-	if attrs.HTTPMethod != "" {
+	// Build span name per OTEL semantic conventions:
+	// HTTP SERVER: "{method} {http.route}" — we use path since routes aren't available
+	// HTTP CLIENT: "{method}"
+	if attrs.HTTPMethod != "" && attrs.HTTPPath != "" {
+		attrs.Name = attrs.HTTPMethod + " " + attrs.HTTPPath
+	} else if attrs.HTTPMethod != "" {
 		attrs.Name = attrs.HTTPMethod
 	} else {
 		attrs.Name = "HTTP"

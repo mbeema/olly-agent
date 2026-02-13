@@ -27,6 +27,7 @@ type Metric struct {
 	Type        MetricType
 	Value       float64
 	Timestamp   time.Time
+	StartTime   time.Time         // Start time for cumulative counters/histograms (OTLP StartTimeUnixNano)
 	Labels      map[string]string
 	Histogram   *HistogramData // populated for Histogram type
 	ServiceName string         // Service that produced this metric
@@ -56,22 +57,25 @@ const (
 
 // Collector gathers host and process metrics.
 type Collector struct {
-	cfg    *config.MetricsConfig
-	logger *zap.Logger
+	cfg       *config.MetricsConfig
+	logger    *zap.Logger
+	startTime time.Time // OTLP StartTimeUnixNano for cumulative metrics
 
 	mu        sync.RWMutex
 	callbacks []func(*Metric)
 
-	wg     sync.WaitGroup
-	stopCh chan struct{}
+	wg       sync.WaitGroup
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // NewCollector creates a new metrics collector.
 func NewCollector(cfg *config.MetricsConfig, logger *zap.Logger) *Collector {
 	return &Collector{
-		cfg:    cfg,
-		logger: logger,
-		stopCh: make(chan struct{}),
+		cfg:       cfg,
+		logger:    logger,
+		startTime: time.Now(),
+		stopCh:    make(chan struct{}),
 	}
 }
 
@@ -127,7 +131,7 @@ func (c *Collector) Start(ctx context.Context) error {
 
 // Stop halts metric collection.
 func (c *Collector) Stop() error {
-	close(c.stopCh)
+	c.stopOnce.Do(func() { close(c.stopCh) })
 	c.wg.Wait()
 	return nil
 }
@@ -163,10 +167,10 @@ func (c *Collector) collectCPU(now time.Time) {
 	if len(percentages) > 0 {
 		c.emit(&Metric{
 			Name:        "system.cpu.utilization",
-			Description: "CPU utilization as a percentage",
-			Unit:        "%",
+			Description: "CPU utilization as a ratio (0-1)",
+			Unit:        "1",
 			Type:        Gauge,
-			Value:       percentages[0],
+			Value:       percentages[0] / 100,
 			Timestamp:   now,
 			Labels:      map[string]string{"cpu": "total"},
 		})
@@ -178,41 +182,39 @@ func (c *Collector) collectCPU(now time.Time) {
 		for i, pct := range perCPU {
 			c.emit(&Metric{
 				Name:      "system.cpu.utilization",
-				Unit:      "%",
+				Unit:      "1",
 				Type:      Gauge,
-				Value:     pct,
+				Value:     pct / 100,
 				Timestamp: now,
 				Labels:    map[string]string{"cpu": fmt.Sprintf("cpu%d", i)},
 			})
 		}
 	}
 
-	// CPU time breakdown by state (what Datadog/Dynatrace/New Relic all collect)
+	// CPU time breakdown by mode (OTEL semconv: system.cpu.time, unit=s, Counter)
 	times, err := cpu.Times(false)
 	if err == nil && len(times) > 0 {
 		t := times[0]
-		total := t.User + t.System + t.Idle + t.Nice + t.Iowait + t.Irq + t.Softirq + t.Steal
-		if total > 0 {
-			states := map[string]float64{
-				"user":    t.User / total * 100,
-				"system":  t.System / total * 100,
-				"idle":    t.Idle / total * 100,
-				"nice":    t.Nice / total * 100,
-				"iowait":  t.Iowait / total * 100,
-				"irq":     t.Irq / total * 100,
-				"softirq": t.Softirq / total * 100,
-				"steal":   t.Steal / total * 100,
-			}
-			for state, pct := range states {
-				c.emit(&Metric{
-					Name:      "system.cpu.time",
-					Unit:      "%",
-					Type:      Gauge,
-					Value:     pct,
-					Timestamp: now,
-					Labels:    map[string]string{"state": state},
-				})
-			}
+		modes := map[string]float64{
+			"user":    t.User,
+			"system":  t.System,
+			"idle":    t.Idle,
+			"nice":    t.Nice,
+			"iowait":  t.Iowait,
+			"irq":     t.Irq,
+			"softirq": t.Softirq,
+			"steal":   t.Steal,
+		}
+		for mode, seconds := range modes {
+			c.emit(&Metric{
+				Name:      "system.cpu.time",
+				Unit:      "s",
+				Type:      Counter,
+				Value:     seconds,
+				Timestamp: now,
+				StartTime: c.startTime,
+				Labels:    map[string]string{"cpu.mode": mode},
+			})
 		}
 	}
 
@@ -235,7 +237,7 @@ func (c *Collector) collectMemory(now time.Time) {
 		return
 	}
 
-	// Breakdown by state (matches Datadog/Dynatrace memory breakdown)
+	// Breakdown by state (OTEL semconv: system.memory.usage, attr system.memory.state)
 	memStates := map[string]float64{
 		"used":      float64(v.Used),
 		"free":      float64(v.Free),
@@ -252,12 +254,12 @@ func (c *Collector) collectMemory(now time.Time) {
 			Type:      Gauge,
 			Value:     val,
 			Timestamp: now,
-			Labels:    map[string]string{"state": state},
+			Labels:    map[string]string{"system.memory.state": state},
 		})
 	}
 
 	c.emit(&Metric{
-		Name:        "system.memory.total",
+		Name:        "system.memory.limit",
 		Description: "Total physical memory",
 		Unit:        "By",
 		Type:        Gauge,
@@ -267,34 +269,34 @@ func (c *Collector) collectMemory(now time.Time) {
 
 	c.emit(&Metric{
 		Name:        "system.memory.utilization",
-		Description: "Memory utilization as a percentage",
-		Unit:        "%",
+		Description: "Memory utilization as a ratio (0-1)",
+		Unit:        "1",
 		Type:        Gauge,
-		Value:       v.UsedPercent,
+		Value:       v.UsedPercent / 100,
 		Timestamp:   now,
 	})
 
-	// Swap metrics
+	// Paging metrics (OTEL semconv: system.paging.*)
 	swap, err := mem.SwapMemory()
 	if err == nil {
 		c.emit(&Metric{
-			Name:      "system.swap.usage",
+			Name:      "system.paging.usage",
 			Unit:      "By",
 			Type:      Gauge,
 			Value:     float64(swap.Used),
 			Timestamp: now,
-			Labels:    map[string]string{"state": "used"},
+			Labels:    map[string]string{"system.paging.state": "used"},
 		})
 		c.emit(&Metric{
-			Name:      "system.swap.usage",
+			Name:      "system.paging.usage",
 			Unit:      "By",
 			Type:      Gauge,
 			Value:     float64(swap.Free),
 			Timestamp: now,
-			Labels:    map[string]string{"state": "free"},
+			Labels:    map[string]string{"system.paging.state": "free"},
 		})
 		c.emit(&Metric{
-			Name:        "system.swap.total",
+			Name:        "system.paging.limit",
 			Description: "Total swap space",
 			Unit:        "By",
 			Type:        Gauge,
@@ -303,10 +305,10 @@ func (c *Collector) collectMemory(now time.Time) {
 		})
 		if swap.Total > 0 {
 			c.emit(&Metric{
-				Name:      "system.swap.utilization",
-				Unit:      "%",
+				Name:      "system.paging.utilization",
+				Unit:      "1",
 				Type:      Gauge,
-				Value:     swap.UsedPercent,
+				Value:     swap.UsedPercent / 100,
 				Timestamp: now,
 			})
 		}
@@ -343,9 +345,9 @@ func (c *Collector) collectDisk(now time.Time) {
 
 		c.emit(&Metric{
 			Name:      "system.disk.utilization",
-			Unit:      "%",
+			Unit:      "1",
 			Type:      Gauge,
-			Value:     usage.UsedPercent,
+			Value:     usage.UsedPercent / 100,
 			Timestamp: now,
 			Labels:    labels,
 		})
@@ -396,9 +398,9 @@ func (c *Collector) collectDisk(now time.Time) {
 			})
 			c.emit(&Metric{
 				Name:      "system.filesystem.inodes.utilization",
-				Unit:      "%",
+				Unit:      "1",
 				Type:      Gauge,
-				Value:     usage.InodesUsedPercent,
+				Value:     usage.InodesUsedPercent / 100,
 				Timestamp: now,
 				Labels:    labels,
 			})
@@ -414,7 +416,7 @@ func (c *Collector) collectNetwork(now time.Time) {
 	}
 
 	for _, iface := range counters {
-		labels := map[string]string{"interface": iface.Name}
+		labels := map[string]string{"network.interface.name": iface.Name}
 
 		c.emit(&Metric{
 			Name:      "system.network.io",
@@ -422,7 +424,8 @@ func (c *Collector) collectNetwork(now time.Time) {
 			Type:      Counter,
 			Value:     float64(iface.BytesSent),
 			Timestamp: now,
-			Labels:    mergeMaps(labels, map[string]string{"direction": "transmit"}),
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"network.io.direction": "transmit"}),
 		})
 
 		c.emit(&Metric{
@@ -431,25 +434,28 @@ func (c *Collector) collectNetwork(now time.Time) {
 			Type:      Counter,
 			Value:     float64(iface.BytesRecv),
 			Timestamp: now,
-			Labels:    mergeMaps(labels, map[string]string{"direction": "receive"}),
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"network.io.direction": "receive"}),
 		})
 
 		c.emit(&Metric{
-			Name:      "system.network.packets",
+			Name:      "system.network.packet.count",
 			Unit:      "{packets}",
 			Type:      Counter,
 			Value:     float64(iface.PacketsSent),
 			Timestamp: now,
-			Labels:    mergeMaps(labels, map[string]string{"direction": "transmit"}),
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"network.io.direction": "transmit"}),
 		})
 
 		c.emit(&Metric{
-			Name:      "system.network.packets",
+			Name:      "system.network.packet.count",
 			Unit:      "{packets}",
 			Type:      Counter,
 			Value:     float64(iface.PacketsRecv),
 			Timestamp: now,
-			Labels:    mergeMaps(labels, map[string]string{"direction": "receive"}),
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"network.io.direction": "receive"}),
 		})
 
 		c.emit(&Metric{
@@ -458,7 +464,8 @@ func (c *Collector) collectNetwork(now time.Time) {
 			Type:      Counter,
 			Value:     float64(iface.Errout),
 			Timestamp: now,
-			Labels:    mergeMaps(labels, map[string]string{"direction": "transmit"}),
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"network.io.direction": "transmit"}),
 		})
 
 		c.emit(&Metric{
@@ -467,26 +474,28 @@ func (c *Collector) collectNetwork(now time.Time) {
 			Type:      Counter,
 			Value:     float64(iface.Errin),
 			Timestamp: now,
-			Labels:    mergeMaps(labels, map[string]string{"direction": "receive"}),
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"network.io.direction": "receive"}),
 		})
 
-		// Network drops (what Datadog/Dynatrace/New Relic collect)
 		c.emit(&Metric{
-			Name:      "system.network.dropped",
+			Name:      "system.network.packet.dropped",
 			Unit:      "{packets}",
 			Type:      Counter,
 			Value:     float64(iface.Dropout),
 			Timestamp: now,
-			Labels:    mergeMaps(labels, map[string]string{"direction": "transmit"}),
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"network.io.direction": "transmit"}),
 		})
 
 		c.emit(&Metric{
-			Name:      "system.network.dropped",
+			Name:      "system.network.packet.dropped",
 			Unit:      "{packets}",
 			Type:      Counter,
 			Value:     float64(iface.Dropin),
 			Timestamp: now,
-			Labels:    mergeMaps(labels, map[string]string{"direction": "receive"}),
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"network.io.direction": "receive"}),
 		})
 	}
 }

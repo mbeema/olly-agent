@@ -70,6 +70,30 @@ processors:
           - set(attributes["deployment.environment"], resource.attributes["deployment.environment"])
           - set(attributes["service.version"], resource.attributes["service.version"])
 
+connectors:
+  # Generates service graph metrics from trace spans (powers Grafana service map)
+  servicegraph:
+    latency_histogram_buckets: [2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
+    dimensions:
+      - db.system
+    store:
+      ttl: 5s
+      max_items: 500
+  # Generates RED metrics (rate, errors, duration) from spans (powers service structure)
+  spanmetrics:
+    histogram:
+      explicit:
+        buckets: [2ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s]
+    dimensions:
+      - name: http.request.method
+      - name: http.response.status_code
+      - name: db.system
+      - name: db.operation.name
+      - name: mcp.method.name
+    dimensions_cache_size: 1000
+    aggregation_temporality: "AGGREGATION_TEMPORALITY_CUMULATIVE"
+    metrics_flush_interval: 15s
+
 exporters:
   otlphttp/grafana_cloud:
     endpoint: "https://otlp-gateway-prod-us-east-0.grafana.net/otlp"
@@ -88,11 +112,19 @@ service:
     traces:
       receivers: [otlp]
       processors: [resourcedetection, transform/drop_unneeded_resource_attributes, batch]
-      exporters: [otlphttp/grafana_cloud, file/traces]
+      exporters: [otlphttp/grafana_cloud, file/traces, servicegraph, spanmetrics]
     metrics:
       receivers: [otlp, hostmetrics]
       processors: [resourcedetection, transform/drop_unneeded_resource_attributes, transform/add_resource_attributes_as_metric_attributes, batch]
       exporters: [otlphttp/grafana_cloud, file/metrics]
+    metrics/servicegraph:
+      receivers: [servicegraph]
+      processors: [batch]
+      exporters: [otlphttp/grafana_cloud]
+    metrics/spanmetrics:
+      receivers: [spanmetrics]
+      processors: [batch]
+      exporters: [otlphttp/grafana_cloud]
     logs:
       receivers: [otlp]
       processors: [resourcedetection, transform/drop_unneeded_resource_attributes, batch]

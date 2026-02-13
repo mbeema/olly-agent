@@ -194,7 +194,11 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 	// Initialize metrics collector
 	if cfg.Metrics.Enabled {
 		a.metricsColl = metrics.NewCollector(&cfg.Metrics, logger)
-		a.requestMetrics = rmetrics.NewRequestMetrics(cfg.Metrics.Request.Buckets)
+
+		// Request RED metrics (gated by config toggle)
+		if cfg.Metrics.Request.Enabled {
+			a.requestMetrics = rmetrics.NewRequestMetrics(cfg.Metrics.Request.Buckets)
+		}
 
 		// GenAI token/duration metrics
 		if cfg.Metrics.GenAI.Enabled {
@@ -531,15 +535,32 @@ func (a *Agent) Start(ctx context.Context) error {
 	// Wire: MetricsCollector → Exporter (no lock concerns - simple callback)
 	if a.metricsColl != nil {
 		a.metricsColl.OnMetric(func(m *metrics.Metric) {
-			a.exporter.ExportMetric(&export.Metric{
+			em := &export.Metric{
 				Name:        m.Name,
 				Description: m.Description,
 				Unit:        m.Unit,
 				Type:        export.MetricType(m.Type),
 				Value:       m.Value,
 				Timestamp:   m.Timestamp,
+				StartTime:   m.StartTime,
 				Labels:      m.Labels,
-			})
+				ServiceName: m.ServiceName,
+			}
+			if m.Histogram != nil {
+				buckets := make([]export.HistogramBucket, len(m.Histogram.Buckets))
+				for i, b := range m.Histogram.Buckets {
+					buckets[i] = export.HistogramBucket{
+						UpperBound: b.UpperBound,
+						Count:      b.Count,
+					}
+				}
+				em.Histogram = &export.HistogramValue{
+					Count:   m.Histogram.Count,
+					Sum:     m.Histogram.Sum,
+					Buckets: buckets,
+				}
+			}
+			a.exporter.ExportMetric(em)
 		})
 	}
 
@@ -586,15 +607,32 @@ func (a *Agent) Start(ctx context.Context) error {
 	// Start per-process metrics
 	if a.processColl != nil {
 		a.processColl.OnMetric(func(m *metrics.Metric) {
-			a.exporter.ExportMetric(&export.Metric{
+			em := &export.Metric{
 				Name:        m.Name,
 				Description: m.Description,
 				Unit:        m.Unit,
 				Type:        export.MetricType(m.Type),
 				Value:       m.Value,
 				Timestamp:   m.Timestamp,
+				StartTime:   m.StartTime,
 				Labels:      m.Labels,
-			})
+				ServiceName: m.ServiceName,
+			}
+			if m.Histogram != nil {
+				buckets := make([]export.HistogramBucket, len(m.Histogram.Buckets))
+				for i, b := range m.Histogram.Buckets {
+					buckets[i] = export.HistogramBucket{
+						UpperBound: b.UpperBound,
+						Count:      b.Count,
+					}
+				}
+				em.Histogram = &export.HistogramValue{
+					Count:   m.Histogram.Count,
+					Sum:     m.Histogram.Sum,
+					Buckets: buckets,
+				}
+			}
+			a.exporter.ExportMetric(em)
 		})
 		if err := a.processColl.Start(ctx, cfg.Metrics.Interval); err != nil {
 			a.logger.Warn("process metrics start error", zap.Error(err))
@@ -604,15 +642,32 @@ func (a *Agent) Start(ctx context.Context) error {
 	// Start container metrics
 	if a.containerColl != nil {
 		a.containerColl.OnMetric(func(m *metrics.Metric) {
-			a.exporter.ExportMetric(&export.Metric{
+			em := &export.Metric{
 				Name:        m.Name,
 				Description: m.Description,
 				Unit:        m.Unit,
 				Type:        export.MetricType(m.Type),
 				Value:       m.Value,
 				Timestamp:   m.Timestamp,
+				StartTime:   m.StartTime,
 				Labels:      m.Labels,
-			})
+				ServiceName: m.ServiceName,
+			}
+			if m.Histogram != nil {
+				buckets := make([]export.HistogramBucket, len(m.Histogram.Buckets))
+				for i, b := range m.Histogram.Buckets {
+					buckets[i] = export.HistogramBucket{
+						UpperBound: b.UpperBound,
+						Count:      b.Count,
+					}
+				}
+				em.Histogram = &export.HistogramValue{
+					Count:   m.Histogram.Count,
+					Sum:     m.Histogram.Sum,
+					Buckets: buckets,
+				}
+			}
+			a.exporter.ExportMetric(em)
 		})
 		if err := a.containerColl.Start(ctx, cfg.Metrics.Interval); err != nil {
 			a.logger.Warn("container metrics start error", zap.Error(err))
@@ -1147,7 +1202,9 @@ func (a *Agent) startMetrics() {
 	}
 	cfg := a.cfg.Load()
 	a.metricsColl = metrics.NewCollector(&cfg.Metrics, a.logger)
-	a.requestMetrics = rmetrics.NewRequestMetrics(cfg.Metrics.Request.Buckets)
+	if cfg.Metrics.Request.Enabled {
+		a.requestMetrics = rmetrics.NewRequestMetrics(cfg.Metrics.Request.Buckets)
+	}
 	if cfg.Metrics.GenAI.Enabled {
 		a.genaiMetrics = rmetrics.NewGenAIMetrics(cfg.Metrics.GenAI.Buckets)
 	}
@@ -1155,15 +1212,32 @@ func (a *Agent) startMetrics() {
 		a.mcpMetrics = rmetrics.NewMCPMetrics(cfg.Metrics.MCP.Buckets)
 	}
 	a.metricsColl.OnMetric(func(m *metrics.Metric) {
-		a.exporter.ExportMetric(&export.Metric{
+		em := &export.Metric{
 			Name:        m.Name,
 			Description: m.Description,
 			Unit:        m.Unit,
 			Type:        export.MetricType(m.Type),
 			Value:       m.Value,
 			Timestamp:   m.Timestamp,
+			StartTime:   m.StartTime,
 			Labels:      m.Labels,
-		})
+			ServiceName: m.ServiceName,
+		}
+		if m.Histogram != nil {
+			buckets := make([]export.HistogramBucket, len(m.Histogram.Buckets))
+			for i, b := range m.Histogram.Buckets {
+				buckets[i] = export.HistogramBucket{
+					UpperBound: b.UpperBound,
+					Count:      b.Count,
+				}
+			}
+			em.Histogram = &export.HistogramValue{
+				Count:   m.Histogram.Count,
+				Sum:     m.Histogram.Sum,
+				Buckets: buckets,
+			}
+		}
+		a.exporter.ExportMetric(em)
 	})
 	if err := a.metricsColl.Start(a.ctx); err != nil {
 		a.logger.Warn("metrics collector start error on reload", zap.Error(err))
@@ -1371,7 +1445,9 @@ func (a *Agent) exportMetricSlice(metrics []*metrics.Metric) {
 			Type:        export.MetricType(m.Type),
 			Value:       m.Value,
 			Timestamp:   m.Timestamp,
+			StartTime:   m.StartTime,
 			Labels:      m.Labels,
+			ServiceName: m.ServiceName,
 		}
 		if m.Histogram != nil {
 			buckets := make([]export.HistogramBucket, len(m.Histogram.Buckets))

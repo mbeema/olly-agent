@@ -584,14 +584,41 @@ func TestSkipMySQLHandshake_GreetingAndOK(t *testing.T) {
 }
 
 func TestSkipMySQLHandshake_StopsAtResultSet(t *testing.T) {
-	ok := buildMySQLOK(2)
-	// Result set column count: seq=1, payload=0x02 (2 columns) - not a handshake type
-	resultPkt := buildMySQLPacket(1, []byte{0x02})
-	buf := append(ok, resultPkt...)
+	greeting := buildMySQLGreeting()
+	ok := buildMySQLOK(2) // auth OK (seq=2 → part of handshake)
+	// Result set column count: seq=0 → new command response, should NOT consume
+	resultPkt := buildMySQLPacket(0, []byte{0x02})
+	buf := append(greeting, ok...)
+	buf = append(buf, resultPkt...)
 
+	expected := len(greeting) + len(ok)
 	n := skipMySQLHandshake(buf)
-	if n != len(ok) {
-		t.Errorf("skipMySQLHandshake should stop at result set: got %d, want %d", n, len(ok))
+	if n != expected {
+		t.Errorf("skipMySQLHandshake should stop at result set: got %d, want %d", n, expected)
+	}
+}
+
+func TestSkipMySQLHandshake_StopsBeforePingOK(t *testing.T) {
+	greeting := buildMySQLGreeting()
+	authOK := buildMySQLOK(2)   // auth OK (seq=2 → handshake, consumed)
+	pingOK := buildMySQLOK(1)   // COM_PING OK (seq=1 → command response, NOT consumed)
+	buf := append(greeting, authOK...)
+	buf = append(buf, pingOK...)
+
+	// Should consume greeting + auth OK, but NOT the ping OK (seq=1 < 2)
+	expected := len(greeting) + len(authOK)
+	n := skipMySQLHandshake(buf)
+	if n != expected {
+		t.Errorf("skipMySQLHandshake should stop before ping OK: got %d, want %d", n, expected)
+	}
+}
+
+func TestSkipMySQLHandshake_NoGreeting(t *testing.T) {
+	// If buffer starts with OK (no greeting), should consume nothing
+	ok := buildMySQLOK(2)
+	n := skipMySQLHandshake(ok)
+	if n != 0 {
+		t.Errorf("skipMySQLHandshake without greeting should return 0: got %d", n)
 	}
 }
 
@@ -644,6 +671,51 @@ func TestMySQLReadyIntegration(t *testing.T) {
 	// Request should be the COM_QUERY packet
 	if len(pair.Request) < 5 || pair.Request[4] != 0x03 {
 		t.Errorf("expected COM_QUERY (0x03), got %v", pair.Request[:min(5, len(pair.Request))])
+	}
+}
+
+func TestMySQLPingThenQuery(t *testing.T) {
+	// Regression test: Go's database/sql sends COM_PING during Ping() at startup.
+	// Before the fix, skipMySQLHandshake consumed the COM_PING OK response along
+	// with auth handshake packets, causing cascading misalignment.
+	r := NewReassembler(zap.NewNop())
+
+	var pairs []*RequestPair
+	r.OnPair(func(p *RequestPair) {
+		pairs = append(pairs, p)
+	})
+
+	pid := uint32(100)
+	fd := int32(7)
+	tid := uint32(200)
+	addr := "127.0.0.1"
+	port := uint16(3306)
+
+	// Handshake
+	r.AppendRecv(pid, tid, fd, buildMySQLGreeting(), addr, port, false)
+	r.AppendSend(pid, tid, fd, buildMySQLPacket(1, []byte{0x85, 0xa6, 0x3f, 0x20, 0x00, 0x00, 0x00, 0x01}), addr, port, false)
+	r.AppendRecv(pid, tid, fd, buildMySQLOK(2), addr, port, false)
+
+	// COM_PING (0x0e) sent by db.Ping() at startup
+	r.AppendSend(pid, tid, fd, buildMySQLPacket(0, []byte{0x0e}), addr, port, false)
+	r.AppendRecv(pid, tid, fd, buildMySQLOK(1), addr, port, false)
+
+	// COM_QUERY — the real query that should produce a span
+	r.AppendSend(pid, tid, fd, buildMySQLComQuery("SELECT * FROM products"), addr, port, false)
+	r.AppendRecv(pid, tid, fd, buildMySQLOK(1), addr, port, false)
+
+	// Should have 2 pairs: COM_PING (handshake, filtered later) + COM_QUERY
+	if len(pairs) < 2 {
+		t.Fatalf("expected at least 2 pairs (ping + query), got %d", len(pairs))
+	}
+
+	// Last pair should be the COM_QUERY
+	lastPair := pairs[len(pairs)-1]
+	if lastPair.Protocol != "mysql" {
+		t.Errorf("expected protocol mysql, got %s", lastPair.Protocol)
+	}
+	if len(lastPair.Request) < 5 || lastPair.Request[4] != 0x03 {
+		t.Errorf("expected COM_QUERY (0x03) in last pair, got %v", lastPair.Request[:min(5, len(lastPair.Request))])
 	}
 }
 

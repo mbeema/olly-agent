@@ -39,6 +39,9 @@ type RequestPair struct {
 
 	// Direction: 0=outbound (connect), 1=inbound (accept)
 	Direction int
+
+	// Database name extracted from protocol handshake (PG startup, MySQL COM_INIT_DB)
+	DBNamespace string
 }
 
 // streamKey uniquely identifies a stream.
@@ -65,6 +68,9 @@ type streamState struct {
 	// MySQL: true after server greeting + auth handshake is consumed.
 	// MySQL's handshake is server-initiated (greeting → auth response → OK).
 	mysqlReady bool
+
+	// Database name extracted from protocol handshake (propagated to pairs)
+	dbNamespace string
 }
 
 // Reassembler manages streams and emits request/response pairs.
@@ -189,6 +195,10 @@ func (r *Reassembler) tryExtractPairs(ss *streamState) {
 		// This data doesn't represent queries and would create noise spans
 		// with wrong timestamps. Discard it until the first actual query (Q/P).
 		if ss.protocol == "postgres" && !ss.pgReady {
+			// Extract database name from PG startup message before discarding
+			if ss.dbNamespace == "" {
+				ss.dbNamespace = extractPgDatabase(s.sendBuf)
+			}
 			queryStart := findPgQueryStart(s.sendBuf)
 			if queryStart < 0 {
 				// No query found yet — discard all auth data
@@ -213,6 +223,10 @@ func (r *Reassembler) tryExtractPairs(ss *streamState) {
 		// MySQL handshake is server-initiated: greeting → client auth → OK/ERR.
 		// Discard until the first COM_* command (seq=0 + valid command byte).
 		if ss.protocol == "mysql" && !ss.mysqlReady {
+			// Extract database name from MySQL handshake response
+			if ss.dbNamespace == "" {
+				ss.dbNamespace = extractMySQLDatabase(s.sendBuf)
+			}
 			queryStart := findMySQLQueryStart(s.sendBuf)
 			if queryStart < 0 {
 				s.sendBuf = s.sendBuf[:0]
@@ -227,6 +241,25 @@ func (r *Reassembler) tryExtractPairs(ss *streamState) {
 			if len(s.sendBuf) == 0 || len(s.recvBuf) == 0 {
 				s.mu.Unlock()
 				return
+			}
+		}
+
+		// MySQL: skip commands that have no server response (COM_STMT_CLOSE,
+		// COM_QUIT). Without this, the no-response command in sendBuf gets
+		// paired with the NEXT query's response in recvBuf, causing cascading
+		// misalignment that loses most MySQL spans. Go's database/sql always
+		// sends COM_STMT_CLOSE after each prepared statement execution.
+		if ss.protocol == "mysql" && len(s.sendBuf) >= 5 {
+			cmd := s.sendBuf[4]
+			if cmd == 0x19 || cmd == 0x01 { // COM_STMT_CLOSE or COM_QUIT
+				pktLen := int(s.sendBuf[0]) | int(s.sendBuf[1])<<8 | int(s.sendBuf[2])<<16
+				totalLen := 4 + pktLen
+				if totalLen > 0 && totalLen <= len(s.sendBuf) {
+					s.sendBuf = s.sendBuf[totalLen:]
+					s.mu.Unlock()
+					r.tryExtractPairs(ss)
+					return
+				}
 			}
 		}
 
@@ -245,12 +278,19 @@ func (r *Reassembler) tryExtractPairs(ss *streamState) {
 		}
 
 		// Build pair from exactly one request + one response.
-		// Duration fix: if lastRecv predates lastSend (stale timestamp from
-		// a previous message cycle, e.g., PG auth), use time.Now() as the
-		// response time instead of producing a zero-duration span.
-		duration := s.lastRecv.Sub(s.lastSend)
+		// Duration fix: guard against zero lastSend (no AppendSend happened).
+		// time.Since(time.Time{}) saturates to math.MaxInt64 (~292 years).
+		reqTime := s.lastSend
+		if reqTime.IsZero() {
+			reqTime = s.lastRecv
+		}
+		duration := s.lastRecv.Sub(reqTime)
 		if duration <= 0 {
-			duration = time.Since(s.lastSend)
+			duration = time.Since(reqTime)
+		}
+		if reqTime.IsZero() {
+			reqTime = time.Now()
+			duration = 0
 		}
 		pair := &RequestPair{
 			PID:         s.PID,
@@ -262,9 +302,10 @@ func (r *Reassembler) tryExtractPairs(ss *streamState) {
 			Protocol:    ss.protocol,
 			Request:     make([]byte, reqLen),
 			Response:    make([]byte, respLen),
-			RequestTime: s.lastSend,
+			RequestTime: reqTime,
 			Duration:    duration,
 			Direction:   int(ss.direction.Load()),
+			DBNamespace: ss.dbNamespace,
 		}
 		copy(pair.Request, s.sendBuf[:reqLen])
 		copy(pair.Response, s.recvBuf[:respLen])
@@ -351,9 +392,18 @@ func (r *Reassembler) RemoveStream(pid uint32, fd int32, tid uint32) {
 			}
 		}
 
-		duration := s.lastRecv.Sub(s.lastSend)
+		// Guard against zero lastSend (only recvBuf had data).
+		reqTime := s.lastSend
+		if reqTime.IsZero() {
+			reqTime = s.lastRecv
+		}
+		duration := s.lastRecv.Sub(reqTime)
 		if duration <= 0 {
-			duration = time.Since(s.lastSend)
+			duration = time.Since(reqTime)
+		}
+		if reqTime.IsZero() {
+			reqTime = time.Now()
+			duration = 0
 		}
 		// Use lastTID (set by AppendSend = request direction) instead of the
 		// close event's tid. The close() syscall may execute on a different OS
@@ -374,9 +424,10 @@ func (r *Reassembler) RemoveStream(pid uint32, fd int32, tid uint32) {
 			Protocol:    ss.protocol,
 			Request:     make([]byte, len(s.sendBuf)),
 			Response:    make([]byte, len(s.recvBuf)),
-			RequestTime: s.lastSend,
+			RequestTime: reqTime,
 			Duration:    duration,
 			Direction:   int(ss.direction.Load()),
+			DBNamespace: ss.dbNamespace,
 		}
 		copy(pair.Request, s.sendBuf)
 		copy(pair.Response, s.recvBuf)
@@ -427,9 +478,18 @@ func (r *Reassembler) CleanStale(maxIdle time.Duration) int {
 	for _, e := range stale {
 		s := e.ss.stream
 		s.mu.Lock()
-		duration := s.lastRecv.Sub(s.lastSend)
+		// Guard against zero lastSend (stale stream with only recv data).
+		reqTime := s.lastSend
+		if reqTime.IsZero() {
+			reqTime = s.lastRecv
+		}
+		duration := s.lastRecv.Sub(reqTime)
 		if duration <= 0 {
-			duration = time.Since(s.lastSend)
+			duration = time.Since(reqTime)
+		}
+		if reqTime.IsZero() {
+			reqTime = time.Now()
+			duration = 0
 		}
 		pairTID := e.ss.lastTID.Load()
 		pair := &RequestPair{
@@ -442,9 +502,10 @@ func (r *Reassembler) CleanStale(maxIdle time.Duration) int {
 			Protocol:    e.ss.protocol,
 			Request:     make([]byte, len(s.sendBuf)),
 			Response:    make([]byte, len(s.recvBuf)),
-			RequestTime: s.lastSend,
+			RequestTime: reqTime,
 			Duration:    duration,
 			Direction:   int(e.ss.direction.Load()),
+			DBNamespace: e.ss.dbNamespace,
 		}
 		copy(pair.Request, s.sendBuf)
 		copy(pair.Response, s.recvBuf)
@@ -470,7 +531,10 @@ func frameMessage(buf []byte, proto string, isRequest bool) int {
 	case "postgres":
 		return framePostgres(buf, isRequest)
 	case "mysql":
-		return frameMySQL(buf)
+		if isRequest {
+			return frameMySQL(buf)
+		}
+		return frameMySQLResponse(buf)
 	case "redis":
 		return frameRedis(buf)
 	case "mongodb":
@@ -864,30 +928,178 @@ func findMySQLQueryStart(buf []byte) int {
 	return -1
 }
 
-// skipMySQLHandshake consumes MySQL handshake response packets from recvBuf:
-// server greeting (0x0a), OK (0x00), ERR (0xff), EOF/AuthSwitch (0xfe).
-// Returns the number of bytes to skip.
+// skipMySQLHandshake consumes MySQL handshake response packets from recvBuf.
+// Uses sequence numbers to distinguish auth-phase packets from command responses:
+//   - Server greeting: seq=0, payload[0]=0x0a (consumed)
+//   - Auth OK/ERR/AuthSwitch: seq >= 2 (consumed — part of auth sequence)
+//   - Command response (e.g., COM_PING OK): seq=0 (NOT consumed — new command)
+//
+// Without seq-number tracking, this function greedily consumed ALL OK (0x00)
+// packets, eating COM_PING and even query responses from the connection pool's
+// startup Ping(). That caused cascading misalignment and lost most MySQL spans.
 func skipMySQLHandshake(buf []byte) int {
 	offset := 0
-	for offset+4 < len(buf) {
+	sawGreeting := false
+	for offset+5 <= len(buf) {
 		pktLen := int(buf[offset]) | int(buf[offset+1])<<8 | int(buf[offset+2])<<16
 		totalLen := 4 + pktLen
 		if pktLen <= 0 || totalLen > len(buf) {
 			break
 		}
-		// Check payload first byte for handshake message types
+		seqID := buf[offset+3]
 		payloadType := buf[offset+4]
-		switch payloadType {
-		case 0x0a: // Server greeting
-		case 0x00: // OK packet
-		case 0xff: // ERR packet
-		case 0xfe: // EOF / AuthSwitch
-		default:
-			return offset // non-handshake: result set or other data
+
+		if !sawGreeting {
+			// First packet must be server greeting (0x0a, seq=0)
+			if payloadType == 0x0a && seqID == 0 {
+				sawGreeting = true
+				offset += totalLen
+				continue
+			}
+			break // not a greeting — can't skip anything
+		}
+
+		// After greeting: consume auth-phase responses (seq >= 2).
+		// MySQL auth: greeting(seq=0) → client_auth(seq=1) → OK/ERR(seq=2)
+		// AuthSwitch: → switch_req(seq=2) → client_data(seq=3) → OK(seq=4)
+		// All server auth responses have seq >= 2 because client sends seq=1.
+		// Command responses (e.g., COM_PING OK) start at seq=1, so seq < 2.
+		if seqID >= 2 {
+			offset += totalLen
+			continue
+		}
+
+		// seq < 2 after greeting = command response (COM_PING OK, query result)
+		break
+	}
+	return offset
+}
+
+// extractPgDatabase extracts the database name from a PostgreSQL startup message.
+// Startup format: length(4) + version(4) + key\0value\0...key\0value\0\0
+func extractPgDatabase(buf []byte) string {
+	offset := 0
+	for offset < len(buf) {
+		// Startup message starts with 0x00 (high byte of int32 length)
+		if buf[offset] != 0 {
+			// Skip standard PG messages (type + length)
+			if offset+5 <= len(buf) {
+				ml := int(binary.BigEndian.Uint32(buf[offset+1 : offset+5]))
+				if ml >= 4 && offset+1+ml <= len(buf) {
+					offset += 1 + ml
+					continue
+				}
+			}
+			break
+		}
+		if offset+8 > len(buf) {
+			break
+		}
+		msgLen := int(binary.BigEndian.Uint32(buf[offset : offset+4]))
+		version := binary.BigEndian.Uint32(buf[offset+4 : offset+8])
+		if version != 0x00030000 || msgLen < 8 || msgLen > 1024 {
+			break
+		}
+		if offset+msgLen > len(buf) {
+			break
+		}
+		// Parse key=value pairs
+		pos := offset + 8
+		end := offset + msgLen
+		for pos < end {
+			// Read key
+			keyEnd := pos
+			for keyEnd < end && buf[keyEnd] != 0 {
+				keyEnd++
+			}
+			if keyEnd >= end {
+				break
+			}
+			key := string(buf[pos:keyEnd])
+			pos = keyEnd + 1
+			if key == "" {
+				break // end of params
+			}
+			// Read value
+			valEnd := pos
+			for valEnd < end && buf[valEnd] != 0 {
+				valEnd++
+			}
+			val := string(buf[pos:valEnd])
+			pos = valEnd + 1
+			if key == "database" {
+				return val
+			}
+		}
+		break
+	}
+	return ""
+}
+
+// extractMySQLDatabase extracts the database name from a MySQL client handshake response.
+// The auth response packet (seq=1) contains: capabilities + user + auth + database.
+// Go's mysql driver sends the database in the initial auth packet.
+func extractMySQLDatabase(buf []byte) string {
+	offset := 0
+	for offset+5 <= len(buf) {
+		pktLen := int(buf[offset]) | int(buf[offset+1])<<8 | int(buf[offset+2])<<16
+		totalLen := 4 + pktLen
+		if pktLen <= 0 || totalLen > len(buf) {
+			break
+		}
+		seqID := buf[offset+3]
+		// Client auth response is seq=1 (reply to server greeting seq=0)
+		if seqID == 1 && pktLen > 32 {
+			payload := buf[offset+4 : offset+totalLen]
+			// MySQL 4.1+ auth response:
+			// capabilities(4) + max_packet(4) + charset(1) + reserved(23) + user\0 + auth_len + auth + database\0
+			if len(payload) < 32 {
+				break
+			}
+			caps := uint32(payload[0]) | uint32(payload[1])<<8 | uint32(payload[2])<<16 | uint32(payload[3])<<24
+			// CLIENT_CONNECT_WITH_DB flag = 0x08
+			if caps&0x08 == 0 {
+				break // no database in this packet
+			}
+			// Skip to user field (after 32 bytes of fixed header)
+			pos := 32
+			// Skip user (null-terminated)
+			for pos < len(payload) && payload[pos] != 0 {
+				pos++
+			}
+			pos++ // skip null
+			if pos >= len(payload) {
+				break
+			}
+			// Skip auth data
+			if caps&0x00200000 != 0 { // CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+				authLen := int(payload[pos])
+				pos += 1 + authLen
+			} else if caps&0x00008000 != 0 { // CLIENT_SECURE_CONNECTION
+				authLen := int(payload[pos])
+				pos += 1 + authLen
+			} else {
+				// Old-style: null-terminated
+				for pos < len(payload) && payload[pos] != 0 {
+					pos++
+				}
+				pos++
+			}
+			if pos >= len(payload) {
+				break
+			}
+			// Database name (null-terminated)
+			dbEnd := pos
+			for dbEnd < len(payload) && payload[dbEnd] != 0 {
+				dbEnd++
+			}
+			if dbEnd > pos {
+				return string(payload[pos:dbEnd])
+			}
 		}
 		offset += totalLen
 	}
-	return offset
+	return ""
 }
 
 // frameMySQL finds the boundary of one MySQL packet.
@@ -904,6 +1116,54 @@ func frameMySQL(buf []byte) int {
 		return 0
 	}
 	return totalLen
+}
+
+// frameMySQLResponse frames a complete MySQL response, which may span multiple
+// packets (result sets: column_count + col_defs + EOF + rows + EOF).
+// Consumes consecutive packets where the sequence number increments.
+// A seq break (next command's response starting at seq=1) stops consumption.
+//
+// eBPF captures only 256 bytes per read() syscall, so MySQL result sets are
+// often truncated mid-packet. If we've consumed at least one complete packet
+// and then encounter an incomplete trailing packet, we consume ALL remaining
+// bytes to prevent the partial data from corrupting the next response's framing.
+func frameMySQLResponse(buf []byte) int {
+	if len(buf) < 5 {
+		return 0
+	}
+
+	offset := 0
+	expectedSeq := byte(0) // will be set from first packet
+	first := true
+
+	for offset+4 <= len(buf) {
+		pktLen := int(buf[offset]) | int(buf[offset+1])<<8 | int(buf[offset+2])<<16
+		totalLen := 4 + pktLen
+		if pktLen <= 0 || offset+totalLen > len(buf) {
+			if !first {
+				// Incomplete trailing packet in a multi-packet response.
+				// eBPF truncated the capture at 256 bytes. Consume all
+				// remaining data to prevent it from corrupting the next
+				// response's framing.
+				return len(buf)
+			}
+			return 0 // truly incomplete first packet — wait for more data
+		}
+
+		seq := buf[offset+3]
+		if first {
+			expectedSeq = seq + 1 // accept whatever seq the first packet has
+			first = false
+		} else if seq != expectedSeq {
+			break // seq gap = start of a new command's response
+		} else {
+			expectedSeq = seq + 1
+		}
+
+		offset += totalLen
+	}
+
+	return offset
 }
 
 const maxRedisDepth = 32

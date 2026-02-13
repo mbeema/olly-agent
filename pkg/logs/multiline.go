@@ -5,6 +5,7 @@
 package logs
 
 import (
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,7 @@ type MultilineAssembler struct {
 	maxLines     int
 	flushTimeout time.Duration
 	emit         func(*LogRecord)
+	firstLineRE  *regexp.Regexp // If set, lines matching this regex start a new entry
 
 	mu      sync.Mutex
 	buffer  []*LogRecord
@@ -34,11 +36,15 @@ func NewMultilineAssembler(cfg *config.MultilineConfig, emit func(*LogRecord)) *
 		flushTimeout = 100 * time.Millisecond
 	}
 
-	return &MultilineAssembler{
+	m := &MultilineAssembler{
 		maxLines:     maxLines,
 		flushTimeout: flushTimeout,
 		emit:         emit,
 	}
+	if cfg.FirstLinePattern != "" {
+		m.firstLineRE = regexp.MustCompile(cfg.FirstLinePattern)
+	}
+	return m
 }
 
 // Process takes a log record and either buffers it (continuation) or flushes
@@ -47,7 +53,9 @@ func (m *MultilineAssembler) Process(record *LogRecord) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if isContinuation(record.Body) && len(m.buffer) > 0 {
+	isNewEntry := m.isNewEntry(record.Body)
+
+	if !isNewEntry && len(m.buffer) > 0 {
 		m.buffer = append(m.buffer, record)
 		if len(m.buffer) >= m.maxLines {
 			m.flushLocked()
@@ -63,6 +71,16 @@ func (m *MultilineAssembler) Process(record *LogRecord) {
 	}
 	m.buffer = append(m.buffer, record)
 	m.resetTimerLocked()
+}
+
+// isNewEntry returns true if the line starts a new log entry.
+// When firstLineRE is set, a match means new entry.
+// Otherwise, falls back to the heuristic: non-continuation = new entry.
+func (m *MultilineAssembler) isNewEntry(line string) bool {
+	if m.firstLineRE != nil {
+		return m.firstLineRE.MatchString(line)
+	}
+	return !isContinuation(line)
 }
 
 // Flush emits any buffered log records as a single joined entry.

@@ -7,6 +7,8 @@ package logs
 import (
 	"context"
 	"math/rand/v2"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,7 +62,7 @@ type LogRecord struct {
 	TraceID     string
 	SpanID      string
 	ServiceName string
-	Source      string // "file"
+	Source      string // "file", "journald", "audit", "auth"
 	FilePath    string
 }
 
@@ -100,6 +102,26 @@ func (r *LogRecord) HasTraceContext() bool {
 	return r.TraceID != ""
 }
 
+// ParseLevel parses a level string to LogLevel.
+func ParseLevel(s string) LogLevel {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "TRACE":
+		return LevelTrace
+	case "DEBUG":
+		return LevelDebug
+	case "INFO":
+		return LevelInfo
+	case "WARN", "WARNING":
+		return LevelWarn
+	case "ERROR", "ERR":
+		return LevelError
+	case "FATAL", "CRITICAL", "EMERG", "ALERT":
+		return LevelFatal
+	default:
+		return LevelUnspecified
+	}
+}
+
 // Collector manages log collection from multiple sources.
 type Collector struct {
 	cfg         *config.LogsConfig
@@ -107,6 +129,17 @@ type Collector struct {
 	parser      *Parser
 	auditParser *AuditParser
 	multiline   *MultilineAssembler
+
+	// Per-source multiline assemblers (index by source position)
+	sourceMultiline map[int]*MultilineAssembler
+
+	// Filtering
+	includeREs []*regexp.Regexp
+	excludeREs []*regexp.Regexp
+	minLevel   LogLevel
+
+	// Journald
+	journaldReader *JournaldReader
 
 	// Sampling and rate limiting
 	sampleRate    float64 // 0.0-1.0, 0 = unset (keep all)
@@ -125,23 +158,51 @@ type Collector struct {
 // NewCollector creates a new log collector.
 func NewCollector(cfg *config.LogsConfig, logger *zap.Logger) *Collector {
 	c := &Collector{
-		cfg:         cfg,
-		logger:      logger,
-		parser:      NewParser(),
-		auditParser: NewAuditParser(),
-		stopCh:      make(chan struct{}),
-		sampleRate:  cfg.Sampling.Rate,
-		rateLimit:   cfg.RateLimit,
+		cfg:             cfg,
+		logger:          logger,
+		parser:          NewParser(),
+		auditParser:     NewAuditParser(),
+		stopCh:          make(chan struct{}),
+		sampleRate:      cfg.Sampling.Rate,
+		rateLimit:       cfg.RateLimit,
+		sourceMultiline: make(map[int]*MultilineAssembler),
 	}
 	if c.rateLimit > 0 {
 		c.tokenCount.Store(int64(c.rateLimit))
 		c.lastRefill.Store(time.Now().UnixNano())
 	}
-	// Initialize multiline assembler if configured
+	// Initialize global multiline assembler if configured
 	if cfg.Multiline.Enabled {
 		c.multiline = NewMultilineAssembler(&cfg.Multiline, func(record *LogRecord) {
 			c.emitDirect(record)
 		})
+	}
+	// Compile filter patterns
+	for _, p := range cfg.Filter.IncludePatterns {
+		if re, err := regexp.Compile(p); err != nil {
+			logger.Warn("invalid include pattern", zap.String("pattern", p), zap.Error(err))
+		} else {
+			c.includeREs = append(c.includeREs, re)
+		}
+	}
+	for _, p := range cfg.Filter.ExcludePatterns {
+		if re, err := regexp.Compile(p); err != nil {
+			logger.Warn("invalid exclude pattern", zap.String("pattern", p), zap.Error(err))
+		} else {
+			c.excludeREs = append(c.excludeREs, re)
+		}
+	}
+	if cfg.Filter.MinLevel != "" {
+		c.minLevel = ParseLevel(cfg.Filter.MinLevel)
+	}
+	// Build per-source multiline assemblers
+	for i, src := range cfg.Sources {
+		if src.Multiline != nil && src.Multiline.Enabled {
+			idx := i
+			c.sourceMultiline[idx] = NewMultilineAssembler(src.Multiline, func(record *LogRecord) {
+				c.emitDirect(record)
+			})
+		}
 	}
 	return c
 }
@@ -154,6 +215,15 @@ func (c *Collector) OnLog(fn func(*LogRecord)) {
 }
 
 func (c *Collector) emit(record *LogRecord) {
+	c.emitForSource(-1, record)
+}
+
+func (c *Collector) emitForSource(sourceIdx int, record *LogRecord) {
+	// Apply filtering first (before sampling)
+	if c.shouldFilter(record) {
+		return
+	}
+
 	// Apply sampling
 	if c.sampleRate > 0 && c.sampleRate < 1.0 {
 		if !c.shouldSampleLog() {
@@ -166,13 +236,54 @@ func (c *Collector) emit(record *LogRecord) {
 		return
 	}
 
-	// Route through multiline assembler if enabled
+	// Route through per-source multiline assembler if available
+	if sourceIdx >= 0 {
+		if ma, ok := c.sourceMultiline[sourceIdx]; ok {
+			ma.Process(record)
+			return
+		}
+	}
+
+	// Route through global multiline assembler if enabled
 	if c.multiline != nil {
 		c.multiline.Process(record)
 		return
 	}
 
 	c.emitDirect(record)
+}
+
+// shouldFilter returns true if the record should be dropped.
+func (c *Collector) shouldFilter(record *LogRecord) bool {
+	// Level filtering
+	if c.minLevel > LevelUnspecified && record.Level > LevelUnspecified {
+		if record.Level < c.minLevel {
+			return true
+		}
+	}
+
+	// Include patterns: if set, record must match at least one
+	if len(c.includeREs) > 0 {
+		matched := false
+		for _, re := range c.includeREs {
+			if re.MatchString(record.Body) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return true
+		}
+	}
+
+	// Exclude patterns: record must not match any
+	for _, re := range c.excludeREs {
+		if re.MatchString(record.Body) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // emitDirect sends a record directly to callbacks (bypasses multiline/sampling).
@@ -214,7 +325,8 @@ func (c *Collector) tryConsumeToken() bool {
 
 // Start begins collecting logs from configured sources.
 func (c *Collector) Start(ctx context.Context) error {
-	for _, src := range c.cfg.Sources {
+	for i, src := range c.cfg.Sources {
+		srcIdx := i
 		switch src.Type {
 		case "file":
 			for _, pattern := range src.Paths {
@@ -223,8 +335,9 @@ func (c *Collector) Start(ctx context.Context) error {
 					c.logger.Warn("failed to create tailer", zap.String("pattern", pattern), zap.Error(err))
 					continue
 				}
+				idx := srcIdx
 				tailer.OnLog(func(record *LogRecord) {
-					c.emit(record)
+					c.emitForSource(idx, record)
 				})
 				c.tailers = append(c.tailers, tailer)
 
@@ -233,6 +346,18 @@ func (c *Collector) Start(ctx context.Context) error {
 					defer c.wg.Done()
 					t.Run(ctx, c.stopCh)
 				}(tailer)
+			}
+
+		case "journald":
+			j := NewJournaldReader(src.Paths, c.logger)
+			idx := srcIdx
+			j.OnLog(func(record *LogRecord) {
+				c.emitForSource(idx, record)
+			})
+			if err := j.Start(ctx); err != nil {
+				c.logger.Warn("failed to start journald reader", zap.Error(err))
+			} else {
+				c.journaldReader = j
 			}
 
 		case "audit":
@@ -244,10 +369,11 @@ func (c *Collector) Start(ctx context.Context) error {
 					continue
 				}
 				ap := c.auditParser
+				idx := srcIdx
 				tailer.OnLog(func(record *LogRecord) {
 					auditRecord := ap.ParseAuditLine(record.Body)
 					if auditRecord != nil {
-						c.emit(auditRecord)
+						c.emitForSource(idx, auditRecord)
 					}
 				})
 				c.tailers = append(c.tailers, tailer)
@@ -269,10 +395,11 @@ func (c *Collector) Start(ctx context.Context) error {
 					continue
 				}
 				ap := c.auditParser
+				idx := srcIdx
 				tailer.OnLog(func(record *LogRecord) {
 					authRecord := ap.ParseAuthLine(record.Body)
 					if authRecord != nil {
-						c.emit(authRecord)
+						c.emitForSource(idx, authRecord)
 					}
 				})
 				c.tailers = append(c.tailers, tailer)
@@ -299,10 +426,16 @@ func (c *Collector) Stop() error {
 	for _, t := range c.tailers {
 		t.Stop()
 	}
+	if c.journaldReader != nil {
+		c.journaldReader.Stop()
+	}
 	c.wg.Wait()
-	// Flush any remaining multiline buffer
+	// Flush any remaining multiline buffers
 	if c.multiline != nil {
 		c.multiline.Flush()
+	}
+	for _, ma := range c.sourceMultiline {
+		ma.Flush()
 	}
 	return nil
 }

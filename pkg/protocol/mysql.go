@@ -153,8 +153,13 @@ func (p *MySQLParser) Parse(request, response []byte) (*SpanAttributes, error) {
 		}
 	}
 
-	// Build span name (OTEL: low-cardinality, use operation name)
-	attrs.Name = attrs.DBOperation
+	// Extract table name and build span name per OTEL: "{operation} {table}"
+	attrs.DBTable = extractSQLTable(attrs.DBStatement)
+	if attrs.DBTable != "" {
+		attrs.Name = attrs.DBOperation + " " + attrs.DBTable
+	} else {
+		attrs.Name = attrs.DBOperation
+	}
 
 	return attrs, nil
 }

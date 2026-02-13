@@ -94,6 +94,26 @@ for i in $(seq 1 "$ITERATIONS"); do
     # MCP: Multi-step agent (init → tools/list → tools/call → resources/read)
     curl -s -X POST "$BASE_URL/mcp/agent" > /dev/null || true
 
+    # Redis: Set + Get + Counter
+    curl -s -X PUT "$BASE_URL/cache/user:$i" \
+        -H "Content-Type: application/json" \
+        -d "{\"value\":\"User$i data cached at $(date +%s)\"}" > /dev/null || true
+
+    curl -s "$BASE_URL/cache/user:$i" > /dev/null || true
+
+    curl -s -X POST "$BASE_URL/cache/counter/page_views" > /dev/null || true
+
+    curl -s "$BASE_URL/cache" > /dev/null || true
+
+    # MongoDB: Create + List + Query reviews
+    curl -s -X POST "$BASE_URL/reviews" \
+        -H "Content-Type: application/json" \
+        -d "{\"product\":\"Widget-$((i % 3 + 1))\",\"rating\":$((i % 5 + 1)),\"comment\":\"Review from iteration $i\",\"user\":\"User$i\"}" > /dev/null || true
+
+    curl -s "$BASE_URL/reviews" > /dev/null || true
+
+    curl -s "$BASE_URL/reviews/Widget-1" > /dev/null || true
+
     # Slow endpoint (short delay)
     curl -s "$BASE_URL/slow?delay=0.5" > /dev/null
 

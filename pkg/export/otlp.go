@@ -485,6 +485,12 @@ func (e *OTLPExporter) convertMetric(m *Metric) *metricspb.Metric {
 
 	ts := uint64(m.Timestamp.UnixNano())
 
+	// StartTimeUnixNano for cumulative data points (Sum, Histogram)
+	var startTs uint64
+	if !m.StartTime.IsZero() {
+		startTs = uint64(m.StartTime.UnixNano())
+	}
+
 	switch m.Type {
 	case MetricGauge:
 		pm.Data = &metricspb.Metric_Gauge{
@@ -506,9 +512,10 @@ func (e *OTLPExporter) convertMetric(m *Metric) *metricspb.Metric {
 				AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
 				DataPoints: []*metricspb.NumberDataPoint{
 					{
-						TimeUnixNano: ts,
-						Value:        &metricspb.NumberDataPoint_AsDouble{AsDouble: m.Value},
-						Attributes:   attrs,
+						StartTimeUnixNano: startTs,
+						TimeUnixNano:      ts,
+						Value:             &metricspb.NumberDataPoint_AsDouble{AsDouble: m.Value},
+						Attributes:        attrs,
 					},
 				},
 			},
@@ -537,12 +544,13 @@ func (e *OTLPExporter) convertMetric(m *Metric) *metricspb.Metric {
 					AggregationTemporality: metricspb.AggregationTemporality_AGGREGATION_TEMPORALITY_CUMULATIVE,
 					DataPoints: []*metricspb.HistogramDataPoint{
 						{
-							TimeUnixNano:   ts,
-							Count:          m.Histogram.Count,
-							Sum:            &m.Histogram.Sum,
-							ExplicitBounds: bounds,
-							BucketCounts:   counts,
-							Attributes:     attrs,
+							StartTimeUnixNano: startTs,
+							TimeUnixNano:      ts,
+							Count:             m.Histogram.Count,
+							Sum:               &m.Histogram.Sum,
+							ExplicitBounds:    bounds,
+							BucketCounts:      counts,
+							Attributes:        attrs,
 						},
 					},
 				},

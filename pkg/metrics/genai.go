@@ -19,9 +19,10 @@ var DefaultGenAIBuckets = []float64{0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
 
 // GenAIMetrics tracks token usage and operation duration per model.
 type GenAIMetrics struct {
-	mu      sync.RWMutex
-	models  map[genaiModelKey]*genaiModelMetrics
-	buckets []float64
+	mu        sync.RWMutex
+	models    map[genaiModelKey]*genaiModelMetrics
+	buckets   []float64
+	startTime time.Time // OTLP StartTimeUnixNano for cumulative metrics
 }
 
 // genaiModelKey identifies a unique model for metric aggregation.
@@ -38,7 +39,6 @@ type genaiModelMetrics struct {
 	requestCount    atomic.Uint64
 	durationSumNs   atomic.Int64
 	durationBuckets []atomic.Uint64
-	overflowCount   atomic.Uint64
 }
 
 // NewGenAIMetrics creates a new GenAI metrics tracker.
@@ -47,8 +47,9 @@ func NewGenAIMetrics(buckets []float64) *GenAIMetrics {
 		buckets = DefaultGenAIBuckets
 	}
 	return &GenAIMetrics{
-		models:  make(map[genaiModelKey]*genaiModelMetrics),
-		buckets: buckets,
+		models:    make(map[genaiModelKey]*genaiModelMetrics),
+		buckets:   buckets,
+		startTime: time.Now(),
 	}
 }
 
@@ -92,17 +93,13 @@ func (g *GenAIMetrics) RecordSpan(span *traces.Span) {
 	durationSec := span.Duration.Seconds()
 	mm.durationSumNs.Add(span.Duration.Nanoseconds())
 
-	placed := false
 	for i, bound := range g.buckets {
 		if durationSec <= bound {
 			mm.durationBuckets[i].Add(1)
-			placed = true
-			break
+			return
 		}
 	}
-	if !placed {
-		mm.overflowCount.Add(1)
-	}
+	// +Inf overflow: counted via total count minus cumulative at export
 }
 
 func (g *GenAIMetrics) getOrCreate(key genaiModelKey) *genaiModelMetrics {
@@ -162,6 +159,7 @@ func (g *GenAIMetrics) Collect(now time.Time) []*Metric {
 				Type:        Counter,
 				Value:       float64(inputTokens),
 				Timestamp:   now,
+				StartTime:   g.startTime,
 				Labels:      inputLabels,
 			})
 		}
@@ -178,6 +176,7 @@ func (g *GenAIMetrics) Collect(now time.Time) []*Metric {
 				Type:        Counter,
 				Value:       float64(outputTokens),
 				Timestamp:   now,
+				StartTime:   g.startTime,
 				Labels:      outputLabels,
 			})
 		}
@@ -203,6 +202,7 @@ func (g *GenAIMetrics) Collect(now time.Time) []*Metric {
 			Type:        Histogram,
 			Value:       float64(sumNs) / float64(time.Second),
 			Timestamp:   now,
+			StartTime:   g.startTime,
 			Labels:      durationLabels,
 			Histogram: &HistogramData{
 				Count:   count,

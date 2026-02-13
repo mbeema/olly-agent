@@ -4,6 +4,13 @@
 # Traces signal configuration
 tracing:
   enabled: true
+  filter:
+    exclude_addresses:
+      - "169.254.169.254"   # EC2 instance metadata
+    include_services:
+      - "app"
+      - "order-service"
+      - "mcp-server"
   protocols:
     http:
       enabled: true
@@ -12,11 +19,11 @@ tracing:
     postgres:
       enabled: true
     mysql:
-      enabled: false
+      enabled: true
     redis:
-      enabled: false
+      enabled: true
     mongodb:
-      enabled: false
+      enabled: true
     dns:
       enabled: true
     genai:

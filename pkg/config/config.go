@@ -55,6 +55,14 @@ type TracingConfig struct {
 	Enabled   bool             `yaml:"enabled"`
 	Protocols ProtocolsConfig  `yaml:"protocols"`
 	Sampling  SamplingConfig   `yaml:"sampling"`
+	Filter    FilterConfig     `yaml:"filter"`
+}
+
+// FilterConfig configures trace filtering to reduce noise.
+type FilterConfig struct {
+	ExcludeAddresses []string `yaml:"exclude_addresses"` // IPs to skip at connection level
+	ExcludePaths     []string `yaml:"exclude_paths"`     // URL path prefixes to drop at span level
+	IncludeServices  []string `yaml:"include_services"`  // Whitelist (empty = export all)
 }
 
 type ProtocolsConfig struct {
@@ -80,13 +88,22 @@ type LogsConfig struct {
 	Sampling  LogSamplingConfig `yaml:"sampling"`
 	RateLimit int               `yaml:"rate_limit"` // Max logs per second (0 = unlimited)
 	Multiline MultilineConfig   `yaml:"multiline"`
+	Filter    LogFilterConfig   `yaml:"filter"`
+}
+
+// LogFilterConfig configures content-based log filtering.
+type LogFilterConfig struct {
+	IncludePatterns []string `yaml:"include_patterns"` // Regex: keep only matching (OR logic)
+	ExcludePatterns []string `yaml:"exclude_patterns"` // Regex: drop matching (checked after include)
+	MinLevel        string   `yaml:"min_level"`        // Drop below this level (TRACE/DEBUG/INFO/WARN/ERROR/FATAL)
 }
 
 // MultilineConfig configures multiline log assembly.
 type MultilineConfig struct {
-	Enabled      bool          `yaml:"enabled"`
-	MaxLines     int           `yaml:"max_lines"`     // Max lines to buffer (default: 100)
-	FlushTimeout time.Duration `yaml:"flush_timeout"` // Flush timeout (default: 100ms)
+	Enabled          bool          `yaml:"enabled"`
+	MaxLines         int           `yaml:"max_lines"`         // Max lines to buffer (default: 100)
+	FlushTimeout     time.Duration `yaml:"flush_timeout"`     // Flush timeout (default: 100ms)
+	FirstLinePattern string        `yaml:"firstline_pattern"` // Regex: lines matching this start a new entry
 }
 
 type SecurityLogConfig struct {
@@ -94,10 +111,11 @@ type SecurityLogConfig struct {
 }
 
 type LogSource struct {
-	Type     string   `yaml:"type"` // "file"
-	Paths    []string `yaml:"paths"`
-	Excludes []string `yaml:"excludes"`
-	Format   string   `yaml:"format"` // "auto", "json", "syslog", "combined"
+	Type      string           `yaml:"type"` // "file", "journald", "audit", "auth"
+	Paths     []string         `yaml:"paths"`
+	Excludes  []string         `yaml:"excludes"`
+	Format    string           `yaml:"format"`    // "auto", "json", "syslog", "combined"
+	Multiline *MultilineConfig `yaml:"multiline"` // Per-source override (nil = use global)
 }
 
 type CorrelationConfig struct {

@@ -44,7 +44,7 @@ cp order-service olly-deploy/
 cp mcp-server olly-deploy/
 cp "$SCRIPT_DIR/configs/"*.yaml olly-deploy/configs/
 cp "$SCRIPT_DIR/otel-collector.yaml" olly-deploy/
-cp -r "$SCRIPT_DIR/demo-app" olly-deploy/
+cp -r "$SCRIPT_DIR/demo-app/." olly-deploy/demo-app/
 tar czf olly-deploy.tar.gz olly-deploy/
 rm -rf olly-deploy
 

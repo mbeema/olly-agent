@@ -185,6 +185,11 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 	// Set protocol-specific attributes
 	p.setProtocolAttributes(span, attrs, pair.IsSSL, connInfo)
 
+	// Set db.namespace from handshake-extracted database name (PG/MySQL)
+	if pair.DBNamespace != "" && span.Attributes["db.namespace"] == "" {
+		span.SetAttribute("db.namespace", pair.DBNamespace)
+	}
+
 	// Set common attributes
 	span.SetAttribute("process.pid", fmt.Sprintf("%d", pair.PID))
 	span.SetAttribute("thread.id", fmt.Sprintf("%d", pair.TID))
@@ -246,6 +251,9 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		if attrs.DBOperation != "" {
 			span.SetAttribute("db.operation.name", attrs.DBOperation)
 		}
+		if attrs.DBTable != "" {
+			span.SetAttribute("db.collection.name", attrs.DBTable)
+		}
 		if attrs.DBName != "" {
 			span.SetAttribute("db.namespace", attrs.DBName)
 		}
@@ -260,6 +268,7 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 
 	case protocol.ProtoRedis:
 		span.SetAttribute("db.system", "redis")
+		span.SetAttribute("db.namespace", "0") // default Redis database index
 		if attrs.RedisCommand != "" {
 			span.SetAttribute("db.operation.name", attrs.RedisCommand)
 		}
@@ -279,8 +288,11 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		if attrs.DBOperation != "" {
 			span.SetAttribute("db.operation.name", attrs.DBOperation)
 		}
+		if attrs.DBTable != "" {
+			span.SetAttribute("db.collection.name", attrs.DBTable)
+		}
 		if attrs.DBName != "" {
-			span.SetAttribute("db.collection.name", attrs.DBName)
+			span.SetAttribute("db.namespace", attrs.DBName)
 		}
 		if connInfo != nil {
 			span.SetAttribute("server.address", connInfo.RemoteAddrStr())

@@ -8,6 +8,8 @@ import urllib.error
 from datetime import datetime
 
 import psycopg2
+import redis
+import pymongo
 from flask import Flask, jsonify, request
 
 ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://localhost:3001")
@@ -38,6 +40,21 @@ DB_CONFIG = {
     "user": os.getenv("DB_USER", "demo"),
     "password": os.getenv("DB_PASSWORD", "demo123"),
 }
+
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+
+MONGO_HOST = os.getenv("MONGO_HOST", "localhost")
+MONGO_PORT = int(os.getenv("MONGO_PORT", "27017"))
+MONGO_DB = os.getenv("MONGO_DB", "demo")
+
+# Redis client (for caching)
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+# MongoDB client (for product reviews)
+mongo_client = pymongo.MongoClient(MONGO_HOST, MONGO_PORT)
+mongo_db = mongo_client[MONGO_DB]
 
 
 def get_db():
@@ -538,6 +555,98 @@ def mcp_agent():
     except Exception as e:
         app.logger.error(f"MCP agent failed: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+### Redis Endpoints ###
+# These use the redis-py client — Olly intercepts Redis wire protocol via eBPF.
+
+
+@app.route("/cache/<key>", methods=["GET"])
+def cache_get(key):
+    """Get a cached value from Redis."""
+    app.logger.info(f"Redis GET: {key}")
+    val = redis_client.get(key)
+    if val is None:
+        return jsonify({"key": key, "value": None, "hit": False})
+    return jsonify({"key": key, "value": val, "hit": True})
+
+
+@app.route("/cache/<key>", methods=["PUT"])
+def cache_set(key):
+    """Set a cached value in Redis (with 300s TTL)."""
+    data = request.get_json(force=True)
+    value = data.get("value", "")
+    app.logger.info(f"Redis SET: {key}={value[:50]}")
+    redis_client.setex(key, 300, value)
+    return jsonify({"key": key, "value": value, "ttl": 300})
+
+
+@app.route("/cache", methods=["GET"])
+def cache_list():
+    """List cached keys from Redis."""
+    app.logger.info("Redis KEYS listing")
+    keys = redis_client.keys("*")
+    result = {}
+    for k in keys[:20]:  # Limit to 20
+        result[k] = redis_client.get(k)
+    return jsonify({"keys": result, "total": len(keys)})
+
+
+@app.route("/cache/counter/<name>", methods=["POST"])
+def cache_incr(name):
+    """Increment a Redis counter — generates INCR + GET commands."""
+    app.logger.info(f"Redis INCR: {name}")
+    new_val = redis_client.incr(f"counter:{name}")
+    return jsonify({"counter": name, "value": new_val})
+
+
+### MongoDB Endpoints ###
+# These use pymongo — Olly intercepts MongoDB wire protocol via eBPF.
+
+
+@app.route("/reviews", methods=["GET"])
+def list_reviews():
+    """List all product reviews from MongoDB."""
+    app.logger.info("MongoDB: listing reviews")
+    reviews = list(mongo_db.reviews.find({}, {"_id": 0}).sort("created_at", -1).limit(50))
+    return jsonify(reviews)
+
+
+@app.route("/reviews", methods=["POST"])
+def create_review():
+    """Create a product review in MongoDB."""
+    data = request.get_json(force=True)
+    review = {
+        "product": data.get("product", "Widget"),
+        "rating": data.get("rating", 5),
+        "comment": data.get("comment", "Great product!"),
+        "user": data.get("user", "anonymous"),
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    app.logger.info(f"MongoDB: creating review for {review['product']}")
+    mongo_db.reviews.insert_one(review)
+    review.pop("_id", None)  # ObjectId not JSON-serializable
+    return jsonify(review), 201
+
+
+@app.route("/reviews/<product>", methods=["GET"])
+def reviews_by_product(product):
+    """Get reviews for a specific product from MongoDB."""
+    app.logger.info(f"MongoDB: reviews for {product}")
+    reviews = list(mongo_db.reviews.find(
+        {"product": product}, {"_id": 0}
+    ).sort("created_at", -1).limit(20))
+    avg_rating = mongo_db.reviews.aggregate([
+        {"$match": {"product": product}},
+        {"$group": {"_id": None, "avg": {"$avg": "$rating"}, "count": {"$sum": 1}}},
+    ])
+    stats = next(avg_rating, {"avg": 0, "count": 0})
+    return jsonify({
+        "product": product,
+        "reviews": reviews,
+        "avg_rating": stats.get("avg", 0),
+        "total": stats.get("count", 0),
+    })
 
 
 @app.route("/slow")

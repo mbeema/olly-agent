@@ -15,9 +15,10 @@ import (
 
 // RequestMetrics tracks RED (Rate, Errors, Duration) metrics per service.
 type RequestMetrics struct {
-	mu       sync.RWMutex
-	services map[string]*serviceMetrics
-	buckets  []float64
+	mu        sync.RWMutex
+	services  map[string]*serviceMetrics
+	buckets   []float64
+	startTime time.Time // OTLP StartTimeUnixNano for cumulative metrics
 }
 
 type serviceMetrics struct {
@@ -25,7 +26,6 @@ type serviceMetrics struct {
 	errorCount     atomic.Uint64
 	latencySum     atomic.Int64 // nanoseconds
 	latencyBuckets []atomic.Uint64
-	overflowCount  atomic.Uint64 // values above largest bucket bound (+Inf)
 }
 
 // DefaultBuckets are the default histogram bucket boundaries in seconds.
@@ -37,8 +37,9 @@ func NewRequestMetrics(buckets []float64) *RequestMetrics {
 		buckets = DefaultBuckets
 	}
 	return &RequestMetrics{
-		services: make(map[string]*serviceMetrics),
-		buckets:  buckets,
+		services:  make(map[string]*serviceMetrics),
+		buckets:   buckets,
+		startTime: time.Now(),
 	}
 }
 
@@ -61,18 +62,13 @@ func (r *RequestMetrics) RecordSpan(span *traces.Span) {
 	sm.latencySum.Add(span.Duration.Nanoseconds())
 
 	// Update histogram buckets (non-cumulative; cumulative computed at export)
-	placed := false
 	for i, bound := range r.buckets {
 		if durationSec <= bound {
 			sm.latencyBuckets[i].Add(1)
-			placed = true
-			break
+			return
 		}
 	}
-	// +Inf overflow: values above the largest bound
-	if !placed {
-		sm.overflowCount.Add(1)
-	}
+	// +Inf overflow: counted via total count minus cumulative at export
 }
 
 func (r *RequestMetrics) getOrCreate(service string) *serviceMetrics {
@@ -132,6 +128,7 @@ func (r *RequestMetrics) Collect(now time.Time) []*Metric {
 				Type:        Histogram,
 				Value:       float64(sumNs) / float64(time.Second),
 				Timestamp:   now,
+				StartTime:   r.startTime,
 				Labels:      labels,
 				Histogram: &HistogramData{
 					Count:   count,

@@ -19,9 +19,10 @@ var DefaultMCPBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2
 
 // MCPMetrics tracks tool call counts, duration, and error rates per tool/method.
 type MCPMetrics struct {
-	mu      sync.RWMutex
-	tools   map[mcpToolKey]*mcpToolMetrics
-	buckets []float64
+	mu        sync.RWMutex
+	tools     map[mcpToolKey]*mcpToolMetrics
+	buckets   []float64
+	startTime time.Time // OTLP StartTimeUnixNano for cumulative metrics
 }
 
 // mcpToolKey identifies a unique MCP tool/method for metric aggregation.
@@ -36,7 +37,6 @@ type mcpToolMetrics struct {
 	errorCount      atomic.Uint64
 	durationSumNs   atomic.Int64
 	durationBuckets []atomic.Uint64
-	overflowCount   atomic.Uint64
 }
 
 // NewMCPMetrics creates a new MCP metrics tracker.
@@ -45,8 +45,9 @@ func NewMCPMetrics(buckets []float64) *MCPMetrics {
 		buckets = DefaultMCPBuckets
 	}
 	return &MCPMetrics{
-		tools:   make(map[mcpToolKey]*mcpToolMetrics),
-		buckets: buckets,
+		tools:     make(map[mcpToolKey]*mcpToolMetrics),
+		buckets:   buckets,
+		startTime: time.Now(),
 	}
 }
 
@@ -90,17 +91,13 @@ func (m *MCPMetrics) RecordSpan(span *traces.Span) {
 	durationSec := span.Duration.Seconds()
 	mm.durationSumNs.Add(span.Duration.Nanoseconds())
 
-	placed := false
 	for i, bound := range m.buckets {
 		if durationSec <= bound {
 			mm.durationBuckets[i].Add(1)
-			placed = true
-			break
+			return
 		}
 	}
-	if !placed {
-		mm.overflowCount.Add(1)
-	}
+	// +Inf overflow: counted via total count minus cumulative at export
 }
 
 func (m *MCPMetrics) getOrCreate(key mcpToolKey) *mcpToolMetrics {
@@ -155,6 +152,7 @@ func (m *MCPMetrics) Collect(now time.Time) []*Metric {
 			Type:        Counter,
 			Value:       float64(count),
 			Timestamp:   now,
+			StartTime:   m.startTime,
 			Labels:      copyLabels(baseLabels),
 		})
 
@@ -168,6 +166,7 @@ func (m *MCPMetrics) Collect(now time.Time) []*Metric {
 				Type:        Counter,
 				Value:       float64(errCount),
 				Timestamp:   now,
+				StartTime:   m.startTime,
 				Labels:      copyLabels(baseLabels),
 			})
 		}
@@ -191,6 +190,7 @@ func (m *MCPMetrics) Collect(now time.Time) []*Metric {
 			Type:        Histogram,
 			Value:       float64(sumNs) / float64(time.Second),
 			Timestamp:   now,
+			StartTime:   m.startTime,
 			Labels:      copyLabels(baseLabels),
 			Histogram: &HistogramData{
 				Count:   count,

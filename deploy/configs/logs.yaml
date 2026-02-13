@@ -9,6 +9,32 @@ logs:
       paths:
         - /var/log/demo-app/*.log
       format: json
+    - type: file
+      paths:
+        - /var/log/myapp/app.log
+      format: auto
+      multiline:
+        enabled: true
+        firstline_pattern: '^\d{4}-\d{2}-\d{2}'
+    - type: journald
+      paths: ["sshd.service", "nginx.service"]  # systemd units
+    - type: audit
+      paths:
+        - /var/log/audit/audit.log
+    - type: auth
+      paths:
+        - /var/log/secure
+        - /var/log/auth.log
+  filter:
+    exclude_patterns: ["^DEBUG ", "healthcheck"]
+    min_level: INFO
+  multiline:
+    enabled: true
+    max_lines: 100
+    flush_timeout: 100ms
+  sampling:
+    rate: 1.0
+  rate_limit: 0
 
 # Hook-based log capture (R6: write() hook)
 # Captures stdout/stderr/file writes at the syscall level via libolly.c.

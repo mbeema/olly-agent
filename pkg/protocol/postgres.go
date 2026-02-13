@@ -95,8 +95,13 @@ func (p *PostgresParser) Parse(request, response []byte) (*SpanAttributes, error
 		p.parseResponse(response, attrs)
 	}
 
-	// Build span name (OTEL: low-cardinality, use operation name)
-	attrs.Name = attrs.DBOperation
+	// Extract table name and build span name per OTEL: "{operation} {table}"
+	attrs.DBTable = extractSQLTable(attrs.DBStatement)
+	if attrs.DBTable != "" {
+		attrs.Name = attrs.DBOperation + " " + attrs.DBTable
+	} else {
+		attrs.Name = attrs.DBOperation
+	}
 
 	return attrs, nil
 }
@@ -354,6 +359,66 @@ func extractCString(data []byte) string {
 		}
 	}
 	return string(data)
+}
+
+// extractSQLTable extracts the target table name from a SQL statement.
+// Used for OTEL span naming: "{operation} {table}".
+func extractSQLTable(query string) string {
+	query = strings.TrimSpace(query)
+	if len(query) == 0 {
+		return ""
+	}
+
+	upper := strings.ToUpper(query)
+	words := strings.Fields(query)
+	upperWords := strings.Fields(upper)
+
+	if len(upperWords) < 2 {
+		return ""
+	}
+
+	switch upperWords[0] {
+	case "SELECT", "DELETE":
+		// SELECT ... FROM table / DELETE FROM table
+		for i, w := range upperWords {
+			if w == "FROM" && i+1 < len(words) {
+				return cleanTableName(words[i+1])
+			}
+		}
+	case "INSERT":
+		// INSERT INTO table
+		if len(upperWords) >= 3 && upperWords[1] == "INTO" {
+			return cleanTableName(words[2])
+		}
+	case "UPDATE":
+		// UPDATE table SET ...
+		return cleanTableName(words[1])
+	case "CREATE", "DROP", "ALTER", "TRUNCATE":
+		// CREATE TABLE table / DROP TABLE table / ALTER TABLE table
+		if len(upperWords) >= 3 && (upperWords[1] == "TABLE" || upperWords[1] == "INDEX") {
+			name := words[2]
+			// Handle IF EXISTS / IF NOT EXISTS
+			if strings.ToUpper(name) == "IF" && len(words) >= 5 {
+				return cleanTableName(words[4])
+			}
+			return cleanTableName(name)
+		}
+	}
+
+	return ""
+}
+
+// cleanTableName strips schema prefix, quotes, and parentheses from a table name.
+func cleanTableName(name string) string {
+	// Remove trailing parentheses, commas, semicolons
+	name = strings.TrimRight(name, "(,;")
+	// Remove quotes
+	name = strings.Trim(name, "`\"'")
+	// Take only the table part from schema.table
+	if idx := strings.LastIndex(name, "."); idx >= 0 {
+		name = name[idx+1:]
+	}
+	return name
 }
 
 func extractSQLOperation(query string) string {

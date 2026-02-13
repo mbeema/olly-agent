@@ -55,6 +55,14 @@ if ! command -v mysql &> /dev/null; then
 MYSQL_SETUP
 fi
 
+# Ensure Redis is running
+sudo systemctl enable redis6
+sudo systemctl start redis6
+
+# Ensure MongoDB is running
+sudo systemctl enable mongod
+sudo systemctl start mongod
+
 # Unpack
 cd /tmp
 tar xzf olly-deploy.tar.gz

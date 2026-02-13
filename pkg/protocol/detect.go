@@ -40,6 +40,7 @@ type SpanAttributes struct {
 	DBSystem    string
 	DBStatement string
 	DBOperation string
+	DBTable     string // table/collection name extracted from query
 	DBName      string
 	DBUser      string
 

@@ -124,7 +124,7 @@ func (c *Collector) collectTCPStates(now time.Time) {
 
 	for state, count := range states {
 		c.emit(&Metric{
-			Name:        "system.network.tcp.connections",
+			Name:        "system.network.connection.count",
 			Description: "TCP connections by state",
 			Unit:        "{connections}",
 			Type:        Gauge,
@@ -145,55 +145,64 @@ func (c *Collector) collectDiskIO(now time.Time) {
 	for device, stats := range counters {
 		labels := map[string]string{"device": device}
 
+		// OTEL semconv: system.disk.io with disk.io.direction attr
 		c.emit(&Metric{
-			Name:      "system.disk.io.read",
+			Name:      "system.disk.io",
 			Unit:      "By",
 			Type:      Counter,
 			Value:     float64(stats.ReadBytes),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"disk.io.direction": "read"}),
 		})
 		c.emit(&Metric{
-			Name:      "system.disk.io.write",
+			Name:      "system.disk.io",
 			Unit:      "By",
 			Type:      Counter,
 			Value:     float64(stats.WriteBytes),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"disk.io.direction": "write"}),
 		})
+
+		// OTEL semconv: system.disk.operations with disk.io.direction attr
 		c.emit(&Metric{
-			Name:      "system.disk.operations.read",
+			Name:      "system.disk.operations",
 			Unit:      "{operations}",
 			Type:      Counter,
 			Value:     float64(stats.ReadCount),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"disk.io.direction": "read"}),
 		})
 		c.emit(&Metric{
-			Name:      "system.disk.operations.write",
+			Name:      "system.disk.operations",
 			Unit:      "{operations}",
 			Type:      Counter,
 			Value:     float64(stats.WriteCount),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"disk.io.direction": "write"}),
 		})
 
-		// Disk IO time (what Datadog/Dynatrace collect for latency analysis)
+		// Disk IO time
 		c.emit(&Metric{
-			Name:      "system.disk.io.time.read",
+			Name:      "system.disk.io.time",
 			Unit:      "ms",
 			Type:      Counter,
 			Value:     float64(stats.ReadTime),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"disk.io.direction": "read"}),
 		})
 		c.emit(&Metric{
-			Name:      "system.disk.io.time.write",
+			Name:      "system.disk.io.time",
 			Unit:      "ms",
 			Type:      Counter,
 			Value:     float64(stats.WriteTime),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"disk.io.direction": "write"}),
 		})
 		c.emit(&Metric{
 			Name:        "system.disk.io.time.io",
@@ -202,6 +211,7 @@ func (c *Collector) collectDiskIO(now time.Time) {
 			Type:        Counter,
 			Value:       float64(stats.IoTime),
 			Timestamp:   now,
+			StartTime:   c.startTime,
 			Labels:      labels,
 		})
 		c.emit(&Metric{
@@ -211,23 +221,26 @@ func (c *Collector) collectDiskIO(now time.Time) {
 			Type:        Counter,
 			Value:       float64(stats.WeightedIO),
 			Timestamp:   now,
+			StartTime:   c.startTime,
 			Labels:      labels,
 		})
 		c.emit(&Metric{
-			Name:      "system.disk.merged.read",
+			Name:      "system.disk.merged",
 			Unit:      "{operations}",
 			Type:      Counter,
 			Value:     float64(stats.MergedReadCount),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"disk.io.direction": "read"}),
 		})
 		c.emit(&Metric{
-			Name:      "system.disk.merged.write",
+			Name:      "system.disk.merged",
 			Unit:      "{operations}",
 			Type:      Counter,
 			Value:     float64(stats.MergedWriteCount),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: c.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"disk.io.direction": "write"}),
 		})
 	}
 }
@@ -262,6 +275,7 @@ func (c *Collector) collectSystemStats(now time.Time) {
 			Type:        Counter,
 			Value:       float64(misc.Ctxt),
 			Timestamp:   now,
+			StartTime:   c.startTime,
 		})
 		c.emit(&Metric{
 			Name:        "system.processes.running",
@@ -286,6 +300,7 @@ func (c *Collector) collectSystemStats(now time.Time) {
 			Type:        Counter,
 			Value:       float64(misc.ProcsCreated),
 			Timestamp:   now,
+			StartTime:   c.startTime,
 		})
 	}
 

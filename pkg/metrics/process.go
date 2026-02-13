@@ -18,22 +18,25 @@ import (
 // This is what Datadog (system.processes.*), Dynatrace (process.*),
 // and New Relic (ProcessSample) collect for individual processes.
 type ProcessCollector struct {
-	logger *zap.Logger
+	logger    *zap.Logger
+	startTime time.Time // OTLP StartTimeUnixNano for cumulative metrics
 
 	mu        sync.RWMutex
 	callbacks []func(*Metric)
 	pids      map[uint32]struct{} // PIDs to observe
 
-	wg     sync.WaitGroup
-	stopCh chan struct{}
+	wg       sync.WaitGroup
+	stopCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // NewProcessCollector creates a new per-process metrics collector.
 func NewProcessCollector(logger *zap.Logger) *ProcessCollector {
 	return &ProcessCollector{
-		logger: logger,
-		pids:   make(map[uint32]struct{}),
-		stopCh: make(chan struct{}),
+		logger:    logger,
+		startTime: time.Now(),
+		pids:      make(map[uint32]struct{}),
+		stopCh:    make(chan struct{}),
 	}
 }
 
@@ -80,6 +83,9 @@ func (pc *ProcessCollector) Start(ctx context.Context, interval time.Duration) e
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
+		// Collect once immediately
+		pc.collect()
+
 		for {
 			select {
 			case <-ticker.C:
@@ -98,7 +104,7 @@ func (pc *ProcessCollector) Start(ctx context.Context, interval time.Duration) e
 
 // Stop halts process metric collection.
 func (pc *ProcessCollector) Stop() error {
-	close(pc.stopCh)
+	pc.stopOnce.Do(func() { close(pc.stopCh) })
 	pc.wg.Wait()
 	return nil
 }
@@ -133,24 +139,24 @@ func (pc *ProcessCollector) collectPID(pid uint32, now time.Time) {
 		"process_name": name,
 	}
 
-	// CPU percent
+	// CPU percent (OTEL semconv: 0-1 ratio)
 	cpuPct, err := proc.CPUPercent()
 	if err == nil {
 		pc.emit(&Metric{
 			Name:      "process.cpu.utilization",
-			Unit:      "%",
+			Unit:      "1",
 			Type:      Gauge,
-			Value:     cpuPct,
+			Value:     cpuPct / 100,
 			Timestamp: now,
 			Labels:    labels,
 		})
 	}
 
-	// Memory info: RSS, VMS
+	// Memory info: RSS, VMS (OTEL semconv names)
 	memInfo, err := proc.MemoryInfo()
 	if err == nil {
 		pc.emit(&Metric{
-			Name:      "process.memory.physical",
+			Name:      "process.memory.usage",
 			Unit:      "By",
 			Type:      Gauge,
 			Value:     float64(memInfo.RSS),
@@ -172,19 +178,19 @@ func (pc *ProcessCollector) collectPID(pid uint32, now time.Time) {
 	if err == nil {
 		pc.emit(&Metric{
 			Name:      "process.memory.utilization",
-			Unit:      "%",
+			Unit:      "1",
 			Type:      Gauge,
-			Value:     float64(memPct),
+			Value:     float64(memPct) / 100,
 			Timestamp: now,
 			Labels:    labels,
 		})
 	}
 
-	// Thread count
+	// Thread count (OTEL semconv: process.thread.count)
 	threads, err := proc.NumThreads()
 	if err == nil {
 		pc.emit(&Metric{
-			Name:      "process.threads",
+			Name:      "process.thread.count",
 			Unit:      "{threads}",
 			Type:      Gauge,
 			Value:     float64(threads),
@@ -193,11 +199,11 @@ func (pc *ProcessCollector) collectPID(pid uint32, now time.Time) {
 		})
 	}
 
-	// File descriptors (Linux)
+	// File descriptors (OTEL semconv: process.unix.file_descriptor.count)
 	fds, err := proc.NumFDs()
 	if err == nil {
 		pc.emit(&Metric{
-			Name:      "process.open_file_descriptors",
+			Name:      "process.unix.file_descriptor.count",
 			Unit:      "{descriptors}",
 			Type:      Gauge,
 			Value:     float64(fds),
@@ -206,61 +212,67 @@ func (pc *ProcessCollector) collectPID(pid uint32, now time.Time) {
 		})
 	}
 
-	// I/O counters
+	// I/O counters (with disk.io.direction attr)
 	ioCounters, err := proc.IOCounters()
 	if err == nil {
 		pc.emit(&Metric{
-			Name:      "process.disk.io.read",
+			Name:      "process.disk.io",
 			Unit:      "By",
 			Type:      Counter,
 			Value:     float64(ioCounters.ReadBytes),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: pc.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"disk.io.direction": "read"}),
 		})
 		pc.emit(&Metric{
-			Name:      "process.disk.io.write",
+			Name:      "process.disk.io",
 			Unit:      "By",
 			Type:      Counter,
 			Value:     float64(ioCounters.WriteBytes),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: pc.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"disk.io.direction": "write"}),
 		})
 		pc.emit(&Metric{
-			Name:      "process.disk.operations.read",
+			Name:      "process.disk.operations",
 			Unit:      "{operations}",
 			Type:      Counter,
 			Value:     float64(ioCounters.ReadCount),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: pc.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"disk.io.direction": "read"}),
 		})
 		pc.emit(&Metric{
-			Name:      "process.disk.operations.write",
+			Name:      "process.disk.operations",
 			Unit:      "{operations}",
 			Type:      Counter,
 			Value:     float64(ioCounters.WriteCount),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: pc.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"disk.io.direction": "write"}),
 		})
 	}
 
-	// Context switches (voluntary + involuntary)
+	// Context switches (merged with process.context_switch.type attr)
 	ctxSwitches, err := proc.NumCtxSwitches()
 	if err == nil {
 		pc.emit(&Metric{
-			Name:      "process.context_switches.voluntary",
+			Name:      "process.context_switches",
 			Unit:      "{switches}",
 			Type:      Counter,
 			Value:     float64(ctxSwitches.Voluntary),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: pc.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"process.context_switch.type": "voluntary"}),
 		})
 		pc.emit(&Metric{
-			Name:      "process.context_switches.involuntary",
+			Name:      "process.context_switches",
 			Unit:      "{switches}",
 			Type:      Counter,
 			Value:     float64(ctxSwitches.Involuntary),
 			Timestamp: now,
-			Labels:    labels,
+			StartTime: pc.startTime,
+			Labels:    mergeMaps(labels, map[string]string{"process.context_switch.type": "involuntary"}),
 		})
 	}
 }

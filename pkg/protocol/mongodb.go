@@ -77,9 +77,9 @@ func (p *MongoDBParser) Parse(request, response []byte) (*SpanAttributes, error)
 		attrs.Handshake = true
 	}
 
-	// Build span name (OTEL: low-cardinality, operation + collection)
-	if attrs.DBName != "" {
-		attrs.Name = fmt.Sprintf("%s %s", attrs.DBOperation, attrs.DBName)
+	// Build span name (OTEL: "{operation} {collection}")
+	if attrs.DBTable != "" {
+		attrs.Name = fmt.Sprintf("%s %s", attrs.DBOperation, attrs.DBTable)
 	} else {
 		attrs.Name = attrs.DBOperation
 	}
@@ -127,7 +127,7 @@ func (p *MongoDBParser) parseOpQuery(data []byte, attrs *SpanAttributes) {
 		fullName := string(data[offset:nameEnd])
 		parts := strings.SplitN(fullName, ".", 2)
 		if len(parts) >= 1 {
-			attrs.DBName = parts[0]
+			attrs.DBName = parts[0] // database name → db.namespace
 		}
 		if len(parts) >= 2 {
 			// Collection is after the dot
@@ -135,6 +135,7 @@ func (p *MongoDBParser) parseOpQuery(data []byte, attrs *SpanAttributes) {
 				attrs.DBOperation = "command"
 			} else {
 				attrs.DBOperation = "find"
+				attrs.DBTable = parts[1] // collection → db.collection.name
 				attrs.DBStatement = fullName
 			}
 		}
@@ -187,29 +188,30 @@ func (p *MongoDBParser) extractCommandFromBSON(data []byte, attrs *SpanAttribute
 				attrs.Handshake = true
 			}
 
-			// Extract collection name from value (string type)
+			// Extract collection name from command value (string type)
+			// This is the collection/table name (e.g., "find" → "reviews")
 			if elemType == 0x02 && offset+4 < len(data) {
 				strLen := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
 				if strLen > 0 && strLen < 256 && offset+4+strLen <= len(data) {
 					val := string(data[offset+4 : offset+4+strLen-1]) // -1 for null terminator
 					if val != "" && val != "1" && val != "admin" {
-						attrs.DBName = val
+						attrs.DBTable = val // collection name → db.collection.name
 						attrs.DBStatement = fmt.Sprintf("%s %s", cmd, val)
 					}
 				}
 			}
 		}
 
-		// Look for $db field (standard in OP_MSG commands)
+		// Look for $db field (standard in OP_MSG commands) → db.namespace
 		if name == "$db" && elemType == 0x02 && offset+4 < len(data) {
 			strLen := int(binary.LittleEndian.Uint32(data[offset : offset+4]))
 			if strLen > 0 && strLen < 256 && offset+4+strLen <= len(data) {
 				db := string(data[offset+4 : offset+4+strLen-1])
-				if db != "" && attrs.DBName == "" {
-					// Only use $db if we didn't get a collection name from the command value
+				if db != "" {
+					attrs.DBName = db // database name → db.namespace
 				}
 				// Mark admin database commands as handshake
-				if db == "admin" && attrs.DBName == "" {
+				if db == "admin" && attrs.DBTable == "" {
 					attrs.Handshake = true
 				}
 			}
