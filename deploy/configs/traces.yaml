@@ -4,9 +4,12 @@
 # Traces signal configuration
 tracing:
   enabled: true
+  max_request_duration: 5m
+  stitch_window: 2s
   filter:
     exclude_addresses:
       - "169.254.169.254"   # EC2 instance metadata
+      - "0.0.0.0"           # SSL auto-register garbage (no connect kprobe)
     include_services:
       - "app"
       - "order-service"
@@ -28,7 +31,7 @@ tracing:
     mongodb:
       enabled: true
     dns:
-      enabled: true
+      enabled: false        # DNS spans are noise (unknown service name)
     genai:
       enabled: true
     mcp:

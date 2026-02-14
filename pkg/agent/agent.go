@@ -65,6 +65,9 @@ type Agent struct {
 	serviceMap      *servicemap.Generator
 	profiler        profiling.Profiler
 
+	// Configurable trace context lifetime (replaces hardcoded 30s)
+	maxRequestDuration time.Duration
+
 	// Decoupled channels (C9 fix) - prevent callback deadlocks
 	pairCh chan *reassembly.RequestPair
 	logCh  chan *logs.LogRecord
@@ -154,11 +157,21 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 	// Initialize reassembler
 	a.reassembler = reassembly.NewReassembler(logger)
 
+	// Initialize configurable max request duration
+	a.maxRequestDuration = cfg.Tracing.MaxRequestDuration
+	if a.maxRequestDuration == 0 {
+		a.maxRequestDuration = 5 * time.Minute
+	}
+
 	// Initialize trace processor
 	a.traceProc = traces.NewProcessor(logger)
 
 	// Initialize cross-service trace stitcher
-	a.traceStitcher = traces.NewStitcher(cfg.Correlation.Window, logger)
+	stitchWindow := cfg.Tracing.StitchWindow
+	if stitchWindow == 0 {
+		stitchWindow = 2 * time.Second
+	}
+	a.traceStitcher = traces.NewStitcher(stitchWindow, logger)
 
 	// Initialize correlation engine
 	a.correlation = correlation.NewEngine(cfg.Correlation.Window, logger)
@@ -327,9 +340,11 @@ func (a *Agent) Start(ctx context.Context) error {
 				}
 			}
 
-			// Connection-level filter: skip excluded addresses early
+			// Connection-level filter: skip excluded addresses for OUTBOUND only.
+			// Inbound connections may have addr=0 when accept(addr=NULL) is used
+			// (Node.js/libuv pattern) — these are valid SERVER connections.
 			remoteAddr := conn.RemoteAddrStr()
-			if a.excludedAddrs[remoteAddr] {
+			if conn.Direction != conntrack.ConnInbound && a.excludedAddrs[remoteAddr] {
 				return
 			}
 
@@ -366,9 +381,9 @@ func (a *Agent) Start(ctx context.Context) error {
 				conn.IsSSL = true
 			}
 
-			// Connection-level filter: skip excluded addresses early
+			// Connection-level filter: skip excluded addresses for OUTBOUND only.
 			remoteAddr := conn.RemoteAddrStr()
-			if a.excludedAddrs[remoteAddr] {
+			if conn.Direction != conntrack.ConnInbound && a.excludedAddrs[remoteAddr] {
 				return
 			}
 
@@ -414,8 +429,10 @@ func (a *Agent) Start(ctx context.Context) error {
 					// inject traceparent into outbound HTTP. The CLIENT span's SpanID
 					// must match what BPF injects, so downstream SERVERs reference
 					// the correct parent. TraceID only used if Priority 1 didn't set it.
+					var bpfEventTraceID string
 					if etp, ok := a.hookProvider.(hook.EventTraceProvider); ok {
 						if evtTraceID, evtSpanID, evtOK := etp.GetEventTraceContext(pid, tid); evtOK {
+							bpfEventTraceID = evtTraceID
 							if tctx.TraceID == "" {
 								tctx.TraceID = evtTraceID
 							}
@@ -452,6 +469,27 @@ func (a *Agent) Start(ctx context.Context) error {
 					if tctx.SpanID == "" {
 						tctx.SpanID = traces.GenerateSpanID()
 					}
+					// BPF traceID → canonical traceID merge.
+					// BPF kretprobe_read generates a fresh traceID at each service hop.
+					// sk_msg injects this BPF traceID into outbound HTTP connections.
+					// But the Go agent knows the correct traceID from the extracted
+					// upstream traceparent (Priority 1). When these differ, register a
+					// merge so downstream spans (arriving with the BPF traceID via
+					// sk_msg injection) get redirected to the canonical trace.
+					if traceCtx.TraceID != "" && bpfEventTraceID != "" && traceCtx.TraceID != bpfEventTraceID {
+						canonical := tctx.TraceID
+						if a.traceStitcher != nil {
+							if resolved, ok := a.traceStitcher.TraceMerge(canonical); ok {
+								canonical = resolved
+							}
+							a.traceStitcher.AddTraceMerge(bpfEventTraceID, canonical)
+							a.logger.Debug("registered BPF→canonical trace merge",
+								zap.String("bpfTraceID", bpfEventTraceID),
+								zap.String("canonical", canonical))
+						}
+						tctx.TraceID = canonical
+					}
+
 					tctx.ServerSpanID = traces.GenerateSpanID()
 					tctx.ReadTID = tid
 					a.connCtx.Store(connKey, tctx)
@@ -481,7 +519,7 @@ func (a *Agent) Start(ctx context.Context) error {
 			// connCtx must survive briefly after close so that outbound
 			// CLIENT pairs still in flight can look up the inbound trace
 			// context via enrichPairContext Layer 3 (pidActiveCtx → connCtx).
-			// The 30-second stale check in enrichPairContext prevents using
+			// The maxRequestDuration stale check in enrichPairContext prevents using
 			// truly old context, and FD reuse naturally overwrites entries.
 			connKey := uint64(pid)<<32 | uint64(uint32(fd))
 			a.fdCausal.Delete(connKey)
@@ -533,6 +571,11 @@ func (a *Agent) Start(ctx context.Context) error {
 	// same trace with proper parent links.
 	if a.traceStitcher != nil {
 		a.traceStitcher.OnStitchedSpan(func(span *traces.Span) {
+			// Resolve stale traceIDs: deferred spans may have been stored before
+			// a TraceMerge entry was created by a later stitch on the same service.
+			if newTraceID, ok := a.traceStitcher.TraceMerge(span.TraceID); ok {
+				span.TraceID = newTraceID
+			}
 			// Enrich with service name (clone may not have it yet)
 			if a.discoverer != nil && span.ServiceName == "" {
 				span.ServiceName = a.discoverer.GetServiceName(span.PID)
@@ -799,7 +842,7 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 			return
 		}
 		tctx, ok := val.(*connTraceCtx)
-		if !ok || time.Since(tctx.Created) > 30*time.Second {
+		if !ok || time.Since(tctx.Created) > a.maxRequestDuration {
 			return
 		}
 		pair.ParentTraceID = tctx.TraceID
@@ -821,9 +864,22 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 	causalKey := uint64(pair.PID)<<32 | uint64(uint32(pair.FD))
 	if val, ok := a.fdCausal.Load(causalKey); ok {
 		ce := val.(*causalEntry)
-		if time.Since(ce.Timestamp) <= 30*time.Second {
-			inboundFD = ce.InboundFD
-			found = true
+		if time.Since(ce.Timestamp) <= a.maxRequestDuration {
+			// Verify the causal entry is from the CURRENT request on that
+			// inbound FD. Persistent connections (Redis, pooled HTTP) reuse
+			// FDs across requests: a stale causal entry from a previous
+			// request would map to the wrong connCtx (overwritten by the
+			// new request). Skip to Layer 2/3 if the connCtx is newer.
+			inboundKey := uint64(pair.PID)<<32 | uint64(uint32(ce.InboundFD))
+			if ctxVal, ctxOK := a.connCtx.Load(inboundKey); ctxOK {
+				tctx := ctxVal.(*connTraceCtx)
+				if !ce.Timestamp.Before(tctx.Created) {
+					inboundFD = ce.InboundFD
+					found = true
+				}
+			}
+			// If connCtx doesn't exist or is newer than the causal entry,
+			// fall through to Layer 2/3.
 		}
 	}
 
@@ -856,7 +912,7 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 		return
 	}
 	tctx, ok := val.(*connTraceCtx)
-	if !ok || time.Since(tctx.Created) > 30*time.Second {
+	if !ok || time.Since(tctx.Created) > a.maxRequestDuration {
 		return
 	}
 
@@ -866,13 +922,18 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 	// Outbound CLIENT span: pass the sk_msg-injected spanID so the
 	// CLIENT span uses it as its own spanID (matching what downstream sees).
 	// Only for HTTP/gRPC: sk_msg only injects traceparent into HTTP traffic.
-	// Only set InjectedSpanID when the outbound write TID matches the inbound
-	// read TID — sk_msg uses thread_trace_ctx keyed by PID+TID, so if the
-	// goroutine migrated to a different OS thread, sk_msg won't find the
-	// context and won't inject traceparent. In that case, the CLIENT span
-	// gets a regular SpanID and goes through the stitcher for cross-service linking.
+	//
+	// Two paths for InjectedSpanID:
+	// 1. TID match: outbound write is on the same OS thread as inbound read.
+	//    sk_msg finds thread_trace_ctx[PID+TID] directly. Always correct.
+	// 2. TID mismatch (Go goroutine migration): BPF's maybe_forward_trace_ctx
+	//    copies pid_trace_ctx[PID] → thread_trace_ctx[PID+write_TID] in
+	//    kprobe_write, enabling sk_msg injection even across thread migration.
+	//    The BPF concurrency guard prevents wrong injection when multiple
+	//    inbound requests are active. Under concurrency, sk_msg won't inject
+	//    and these spans fall back to the stitcher.
 	if pair.Protocol == "http" || pair.Protocol == "grpc" || pair.Protocol == "genai" || pair.Protocol == "mcp" {
-		if tctx.ReadTID != 0 && pair.TID == tctx.ReadTID {
+		if tctx.ReadTID != 0 {
 			pair.InjectedSpanID = tctx.SpanID
 		}
 		// Consume: generate a new SpanID for subsequent CLIENT spans on
@@ -1173,6 +1234,12 @@ func (a *Agent) Reload(cfg *config.Config) error {
 	oldCfg := a.cfg.Load()
 	a.cfg.Store(cfg)
 
+	// Update configurable trace context lifetime
+	a.maxRequestDuration = cfg.Tracing.MaxRequestDuration
+	if a.maxRequestDuration == 0 {
+		a.maxRequestDuration = 5 * time.Minute
+	}
+
 	// Recompile trace filter maps
 	a.buildFilterMaps(cfg)
 
@@ -1346,15 +1413,27 @@ func (a *Agent) cleanupLoop(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
+	// Fast stitcher cleanup: SERVER spans are deferred (not exported until
+	// matched or expired). Run Cleanup every 2s so unmatched SERVER spans
+	// are exported within ~2s instead of waiting for the 30s main ticker.
+	stitchTicker := time.NewTicker(2 * time.Second)
+	defer stitchTicker.Stop()
+
 	for {
 		select {
+		case <-stitchTicker.C:
+			if a.traceStitcher != nil {
+				a.traceStitcher.Cleanup()
+			}
+
 		case <-ticker.C:
 			// Clean stale connections and streams. Use 30s for streams so
 			// SSL connections (no BPF CLOSE events) emit pairs promptly.
 			staleConns := a.connTracker.CleanStale(5 * time.Minute)
 			staleStreams := a.reassembler.CleanStale(30 * time.Second)
 
-			// Clean stale stitching entries
+			// Clean stale stitching entries (also handled by fast ticker above,
+			// but included here for the log message)
 			staleStitched := 0
 			if a.traceStitcher != nil {
 				staleStitched = a.traceStitcher.Cleanup()
@@ -1368,7 +1447,7 @@ func (a *Agent) cleanupLoop(ctx context.Context) {
 					a.connCtx.Delete(key)
 					return true
 				}
-				if time.Since(tctx.Created) > 30*time.Second {
+				if time.Since(tctx.Created) > a.maxRequestDuration {
 					a.connCtx.Delete(key)
 					staleConnCtx++
 				}
@@ -1378,7 +1457,7 @@ func (a *Agent) cleanupLoop(ctx context.Context) {
 			// Clean stale causal entries
 			a.fdCausal.Range(func(key, value any) bool {
 				ce, ok := value.(*causalEntry)
-				if !ok || time.Since(ce.Timestamp) > 30*time.Second {
+				if !ok || time.Since(ce.Timestamp) > a.maxRequestDuration {
 					a.fdCausal.Delete(key)
 				}
 				return true

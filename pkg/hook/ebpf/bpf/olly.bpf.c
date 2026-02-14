@@ -150,6 +150,38 @@ struct {
     __type(value, struct trace_ctx);
 } thread_trace_ctx SEC(".maps");
 
+// PID-level trace context for cross-thread forwarding.
+// When Go goroutines migrate between OS threads, the TID at read time differs
+// from the TID at write time. This map stores the most recent inbound trace
+// context per PID, allowing kprobe_write to forward it to the writing thread's
+// thread_trace_ctx so sk_msg can find it.
+//
+// Concurrency guard: if two distinct inbound FDs generate trace context within
+// 2 seconds, the concurrent flag is set and kprobe_write skips forwarding to
+// prevent injecting the wrong traceparent into an unrelated request.
+struct pid_ctx {
+    struct trace_ctx ctx;       // pre-formatted traceparent header
+    __u64 timestamp_ns;         // when context was generated
+    __u32 inbound_fd;           // which inbound FD generated this context
+    __u8  concurrent;           // 1 if multiple inbound FDs active
+    __u8  _pad2[3];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);         // PID
+    __type(value, struct pid_ctx);
+} pid_trace_ctx SEC(".maps");
+
+// Per-CPU scratch space for pid_ctx to avoid 512-byte BPF stack limit.
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct pid_ctx);
+} pid_ctx_scratch SEC(".maps");
+
 // Sockhash for sk_msg attachment: 4-tuple → socket
 // Uses 128-bit IP fields to support both IPv4 and IPv6 sockets in the same map.
 // For IPv4: src_ip[0]=ip, src_ip[1..3]=0. For IPv6: full 128-bit address.
@@ -189,6 +221,7 @@ struct rw_args {
     __u64 buf;    // void* stored as u64 for bpf2go compatibility
     __s32 fd;
     __u32 count;
+    __u32 flags;  // recvfrom flags (MSG_PEEK=0x2); 0 for read()
 };
 
 struct {
@@ -480,6 +513,28 @@ static __always_inline void maybe_generate_trace_ctx(
 
     bpf_map_update_elem(&thread_trace_ctx, &tkey, &tctx, BPF_ANY);
 
+    // Store PID-level context for cross-thread forwarding (Go goroutine TID mismatch).
+    // Uses per-CPU scratch map to avoid exceeding 512-byte BPF stack limit.
+    {
+        __u32 zero = 0;
+        struct pid_ctx *scratch = bpf_map_lookup_elem(&pid_ctx_scratch, &zero);
+        if (scratch) {
+            scratch->ctx = tctx;
+            scratch->timestamp_ns = bpf_ktime_get_ns();
+            scratch->inbound_fd = (__u32)fd;
+            scratch->concurrent = 0;
+
+            struct pid_ctx *existing_pctx = bpf_map_lookup_elem(&pid_trace_ctx, &pid);
+            if (existing_pctx && existing_pctx->inbound_fd != (__u32)fd) {
+                __u64 age = scratch->timestamp_ns - existing_pctx->timestamp_ns;
+                if (age < 2000000000ULL) { // 2 seconds
+                    scratch->concurrent = 1;
+                }
+            }
+            bpf_map_update_elem(&pid_trace_ctx, &pid, scratch, BPF_ANY);
+        }
+    }
+
     // Return trace context via result for embedding in ring buffer event.
     // trace_id is at h[16..48], span_id is at h[49..65].
     if (result) {
@@ -667,9 +722,11 @@ int BPF_KRETPROBE(kretprobe_accept4, int ret) {
 
     __s32 new_fd = ret;
 
-    // Read sockaddr — handles AF_INET, AF_INET6, and AF_UNSPEC
+    // Read sockaddr — handles AF_INET, AF_INET6, AF_UNSPEC, and NULL addr.
+    // Node.js/libuv passes addr=NULL to accept4 (doesn't need peer address).
+    // We must still register the connection for SERVER span creation.
     struct addr_info ainfo = read_sockaddr(addr);
-    if (!ainfo.valid)
+    if (!ainfo.valid && addr != NULL)
         return 0;
 
     // Add to connection map
@@ -740,9 +797,9 @@ int BPF_KRETPROBE(kretprobe_accept, int ret) {
 
     __s32 new_fd = ret;
 
-    // Read sockaddr — handles AF_INET, AF_INET6, and AF_UNSPEC
+    // Read sockaddr — handles AF_INET, AF_INET6, AF_UNSPEC, and NULL addr.
     struct addr_info ainfo = read_sockaddr(addr);
-    if (!ainfo.valid)
+    if (!ainfo.valid && addr != NULL)
         return 0;
 
     struct conn_key ckey = {.pid = pid, .fd = new_fd};
@@ -775,6 +832,74 @@ int BPF_KRETPROBE(kretprobe_accept, int ret) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
+// Cross-thread trace context forwarding
+// ──────────────────────────────────────────────────────────────────────
+//
+// Go goroutines migrate between OS threads, so the TID that reads an
+// inbound HTTP request may differ from the TID that writes the outbound
+// HTTP request. sk_msg looks up thread_trace_ctx[PID+TID] and finds
+// nothing if the TIDs differ.
+//
+// maybe_forward_trace_ctx bridges this gap: called from kprobe_write
+// (which fires SYNCHRONOUSLY before sk_msg on the same TID), it copies
+// the PID-level trace context to the writing thread's thread_trace_ctx
+// so sk_msg can find it.
+//
+// Concurrency guard: skips forwarding when concurrent inbound requests
+// are detected (concurrent flag in pid_trace_ctx) to prevent injecting
+// the wrong traceparent into an unrelated outbound request.
+static __always_inline void maybe_forward_trace_ctx(
+    __u32 pid, __u32 tid, const void *buf, __u32 count)
+{
+    // Skip if this thread already has trace context (TID matched correctly).
+    struct thread_key tkey = {.pid = pid, .tid = tid};
+    struct trace_ctx *existing = bpf_map_lookup_elem(&thread_trace_ctx, &tkey);
+    if (existing && existing->valid)
+        return;
+
+    // Look up PID-level context
+    struct pid_ctx *pctx = bpf_map_lookup_elem(&pid_trace_ctx, &pid);
+    if (!pctx || !pctx->ctx.valid)
+        return;
+
+    // Concurrency guard: don't forward if multiple inbound FDs are active.
+    if (pctx->concurrent)
+        return;
+
+    // Freshness check: context must be recent
+    __u64 age = bpf_ktime_get_ns() - pctx->timestamp_ns;
+    if (age > 5000000000ULL) // 5 seconds
+        return;
+
+    // Only forward for HTTP requests — non-HTTP outbound writes (Redis,
+    // MySQL, etc.) should not get trace context that sk_msg might pick up
+    // on a subsequent HTTP write from a different goroutine on this TID.
+    if (count < 5)
+        return;
+
+    __u8 peek[5] = {};
+    if (bpf_probe_read_user(peek, 5, buf) != 0)
+        return;
+
+    int is_http = 0;
+    if ((peek[0] == 'G' && peek[1] == 'E' && peek[2] == 'T' && peek[3] == ' ') ||
+        (peek[0] == 'P' && peek[1] == 'O' && peek[2] == 'S' && peek[3] == 'T') ||
+        (peek[0] == 'P' && peek[1] == 'U' && peek[2] == 'T' && peek[3] == ' ') ||
+        (peek[0] == 'D' && peek[1] == 'E' && peek[2] == 'L' && peek[3] == 'E') ||
+        (peek[0] == 'P' && peek[1] == 'A' && peek[2] == 'T' && peek[3] == 'C') ||
+        (peek[0] == 'H' && peek[1] == 'E' && peek[2] == 'A' && peek[3] == 'D'))
+        is_http = 1;
+
+    if (!is_http)
+        return;
+
+    // Forward PID-level trace context to this thread's thread_trace_ctx.
+    // sk_msg fires immediately after kprobe_write on the same TID, so it
+    // will find this context and inject the traceparent header.
+    bpf_map_update_elem(&thread_trace_ctx, &tkey, &pctx->ctx, BPF_ANY);
+}
+
+// ──────────────────────────────────────────────────────────────────────
 // sys_write kprobe — outbound data + log capture
 // ──────────────────────────────────────────────────────────────────────
 
@@ -798,6 +923,11 @@ int BPF_KPROBE(kprobe_write, struct pt_regs *regs) {
     struct conn_key ckey = {.pid = pid, .fd = fd};
     struct conn_val *conn = bpf_map_lookup_elem(&conn_map, &ckey);
     if (conn) {
+        // Forward PID-level trace context for outbound HTTP writes when
+        // the thread doesn't have context (Go goroutine TID mismatch).
+        if (conn->dir == DIR_OUTBOUND) {
+            maybe_forward_trace_ctx(pid, tid, buf, (__u32)count);
+        }
         return emit_data_event(EVENT_DATA_OUT, pid, tid, fd, buf, (__u32)count);
     }
 
@@ -830,8 +960,15 @@ int BPF_KPROBE(kprobe_sendto, struct pt_regs *regs) {
     const void *buf = (const void *)PT_REGS_PARM2_CORE(regs);
     size_t len = PT_REGS_PARM3_CORE(regs);
 
-    if (!is_tracked_conn(pid, fd))
+    struct conn_key ckey = {.pid = pid, .fd = fd};
+    struct conn_val *conn = bpf_map_lookup_elem(&conn_map, &ckey);
+    if (!conn)
         return 0;
+
+    // Forward PID-level trace context for outbound HTTP sends
+    if (conn->dir == DIR_OUTBOUND) {
+        maybe_forward_trace_ctx(pid, tid, buf, (__u32)len);
+    }
 
     return emit_data_event(EVENT_DATA_OUT, pid, tid, fd, buf, (__u32)len);
 }
@@ -917,6 +1054,9 @@ int BPF_KPROBE(kprobe_recvfrom, struct pt_regs *regs) {
     int fd = PT_REGS_PARM1_CORE(regs);
     void *buf = (void *)PT_REGS_PARM2_CORE(regs);
     size_t len = PT_REGS_PARM3_CORE(regs);
+    // 4th syscall arg is in r10 (not rcx) on x86_64.
+    // PT_REGS_PARM4_CORE reads rcx which is clobbered by SYSCALL instruction.
+    unsigned int flags = (__u32)BPF_CORE_READ(regs, r10);
 
     if (!is_tracked_conn(pid, fd))
         return 0;
@@ -925,6 +1065,7 @@ int BPF_KPROBE(kprobe_recvfrom, struct pt_regs *regs) {
     args.fd = fd;
     args.buf = (__u64)buf;
     args.count = (__u32)len;
+    args.flags = flags;
     bpf_map_update_elem(&rw_args_map, &pid_tgid, &args, BPF_ANY);
     return 0;
 }
@@ -938,7 +1079,14 @@ int BPF_KRETPROBE(kretprobe_recvfrom, ssize_t ret) {
 
     __s32 fd = args->fd;
     void *buf = (void *)args->buf;
+    __u32 flags = args->flags;
     bpf_map_delete_elem(&rw_args_map, &pid_tgid);
+
+    // Skip MSG_PEEK reads — .NET Kestrel does recvfrom(fd, buf, 1, MSG_PEEK)
+    // before the actual read. Without this filter, the peek byte gets appended
+    // to sendBuf alongside the full read, producing "GGET" instead of "GET".
+    if (flags & 2)  // MSG_PEEK = 0x2
+        return 0;
 
     if (ret <= 0)
         return 0;
@@ -1011,6 +1159,15 @@ int BPF_KPROBE(kprobe_close, struct pt_regs *regs) {
 // ──────────────────────────────────────────────────────────────────────
 // SSL uprobes — plaintext capture before encryption / after decryption
 // ──────────────────────────────────────────────────────────────────────
+
+// BPF_UPROBE/BPF_URETPROBE may not be defined in older libbpf headers.
+// On x86_64, uprobes use the same pt_regs as kprobes.
+#ifndef BPF_UPROBE
+#define BPF_UPROBE(name, args...) BPF_KPROBE(name, ##args)
+#endif
+#ifndef BPF_URETPROBE
+#define BPF_URETPROBE(name, args...) BPF_KRETPROBE(name, ##args)
+#endif
 
 // SSL_set_fd(SSL *ssl, int fd) — maps SSL* → fd
 SEC("uprobe/SSL_set_fd")

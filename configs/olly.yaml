@@ -7,12 +7,13 @@ log_level: info
 # eBPF hook configuration
 hook:
   enabled: true
-  http_ports: [80, 443, 8080, 8443, 3000, 5000, 8000]
   debug: false
 
 # Protocol tracing
 tracing:
   enabled: true
+  max_request_duration: 5m  # Max time to keep trace context (supports long DB queries, LLM calls)
+  stitch_window: 2s         # Cross-service CLIENT↔SERVER matching window
   protocols:
     http:
       enabled: true

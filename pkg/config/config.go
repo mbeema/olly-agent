@@ -36,7 +36,6 @@ type Config struct {
 
 type HookConfig struct {
 	Enabled    bool  `yaml:"enabled"`
-	HTTPPorts  []int `yaml:"http_ports"`
 	Debug      bool  `yaml:"debug"`
 	OnDemand   bool  `yaml:"on_demand"`   // Start dormant; activate via BPF map toggle
 	LogCapture *bool `yaml:"log_capture"` // Capture log writes via write() hook (default: true)
@@ -52,10 +51,12 @@ func (h *HookConfig) LogCaptureEnabled() bool {
 }
 
 type TracingConfig struct {
-	Enabled   bool             `yaml:"enabled"`
-	Protocols ProtocolsConfig  `yaml:"protocols"`
-	Sampling  SamplingConfig   `yaml:"sampling"`
-	Filter    FilterConfig     `yaml:"filter"`
+	Enabled            bool             `yaml:"enabled"`
+	Protocols          ProtocolsConfig  `yaml:"protocols"`
+	Sampling           SamplingConfig   `yaml:"sampling"`
+	Filter             FilterConfig     `yaml:"filter"`
+	MaxRequestDuration time.Duration    `yaml:"max_request_duration"` // Max time to keep trace context for a request (default: 5m)
+	StitchWindow       time.Duration    `yaml:"stitch_window"`       // Cross-service CLIENT↔SERVER matching window (default: 2s)
 }
 
 // FilterConfig configures trace filtering to reduce noise.
@@ -265,12 +266,13 @@ func DefaultConfig() *Config {
 		ServiceName: "auto",
 		LogLevel:    "info",
 		Hook: HookConfig{
-			Enabled:   true,
-			HTTPPorts: []int{80, 443, 8080, 8443, 3000, 5000, 8000},
+			Enabled: true,
 		},
 		Tracing: TracingConfig{
-			Enabled: true,
-			Sampling: SamplingConfig{Rate: 1.0},
+			Enabled:            true,
+			MaxRequestDuration: 5 * time.Minute,
+			StitchWindow:       2 * time.Second,
+			Sampling:           SamplingConfig{Rate: 1.0},
 			Protocols: ProtocolsConfig{
 				HTTP:     ProtocolToggle{Enabled: true},
 				GRPC:     ProtocolToggle{Enabled: true},

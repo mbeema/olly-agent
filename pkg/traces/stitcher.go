@@ -88,12 +88,30 @@ func (s *Stitcher) OnStitchedSpan(fn func(*Span)) {
 }
 
 // TraceMerge looks up whether a traceID has been replaced by stitching.
-// Returns the new traceID and true if a merge exists.
+// Follows the merge chain transitively (BPF generates a new traceID at each
+// service hop; each hop creates a merge entry, so chains like T3→T2→T1 form).
+// Returns the canonical traceID and true if a merge exists.
 func (s *Stitcher) TraceMerge(traceID string) (string, bool) {
-	if val, ok := s.traceMerge.Load(traceID); ok {
-		return val.(string), true
+	current := traceID
+	changed := false
+	for i := 0; i < 10; i++ { // bounded depth to prevent loops
+		if val, ok := s.traceMerge.Load(current); ok {
+			current = val.(string)
+			changed = true
+		} else {
+			break
+		}
 	}
-	return "", false
+	return current, changed
+}
+
+// AddTraceMerge registers a traceID replacement. Used by the agent to map
+// BPF-generated traceIDs to the canonical traceID from the upstream chain.
+// sk_msg injects the BPF traceID into outbound HTTP, but the Go agent knows
+// the correct traceID from the extracted upstream traceparent. This mapping
+// allows downstream spans (which arrive with the BPF traceID) to be redirected.
+func (s *Stitcher) AddTraceMerge(oldTraceID, newTraceID string) {
+	s.traceMerge.Store(oldTraceID, newTraceID)
 }
 
 // ProcessSpan examines a completed span for stitching opportunities.
@@ -136,18 +154,17 @@ func (s *Stitcher) processClientSpan(span *Span) bool {
 		return false
 	}
 
-	// Skip if the span already has confirmed cross-service linking via traceparent.
-	// "traceparent" means the span extracted a traceparent header from the request data,
-	// confirming both sender and receiver have the same trace context.
+	// Skip if the span already has confirmed cross-service linking.
+	// "traceparent" = extracted upstream traceparent → link confirmed.
 	traceSource := span.Attributes["olly.trace_source"]
 	if span.ParentSpanID != "" && traceSource == "traceparent" {
 		return false
 	}
-	// For HTTP/gRPC, sk_msg injection is reliable: the traceparent header fits within
-	// the 256-byte eBPF capture window, so the receiver will extract it. Skip these.
-	// For MCP, Python's requests library adds many headers (~200 bytes), pushing the
-	// traceparent beyond 256 bytes. The receiver often fails to extract it, so MCP
-	// "injected" CLIENT spans must go through the stitcher for cross-service linking.
+	// "injected" = sk_msg injected traceparent into outbound HTTP (TID matched).
+	// For HTTP/gRPC: downstream extracts traceparent (within 256-byte capture)
+	// → deterministic link → skip stitcher to avoid ambiguity errors.
+	// For MCP: headers push traceparent beyond 256-byte capture → downstream
+	// often fails to extract → keep in stitcher for heuristic matching.
 	if span.ParentSpanID != "" && traceSource == "injected" && span.Protocol != "mcp" {
 		return false
 	}
@@ -240,11 +257,28 @@ func (s *Stitcher) processClientSpan(span *Span) bool {
 		// hierarchy — SERVER should join CLIENT's trace to preserve the chain.
 		// When CLIENT has no parent, it adopts SERVER's traceID to preserve
 		// SERVER's intra-process children which share that traceID.
+		// Resolve stale traceIDs via TraceMerge before stitching.
+		// Deferred spans may have been stored before a merge entry was created
+		// (e.g., CLIENT deferred, then its SERVICE's SERVER was stitched creating
+		// a merge). Resolving now ensures the stitch uses the canonical traceID.
+		if resolved, ok := s.TraceMerge(span.TraceID); ok {
+			span.TraceID = resolved
+		}
+		if resolved, ok := s.TraceMerge(bestMatch.span.TraceID); ok {
+			bestMatch.span.TraceID = resolved
+		}
+
 		if span.ParentSpanID != "" {
 			// CLIENT has parent → SERVER joins CLIENT's trace
 			oldTraceID := bestMatch.span.TraceID
 			bestMatch.span.TraceID = span.TraceID
-			bestMatch.span.ParentSpanID = span.SpanID
+			// Preserve traceparent-extracted parent: if SERVER already has a
+			// valid parent from sk_msg injection, don't overwrite it. The
+			// traceparent parent is the canonical link; the stitcher's spanID
+			// may differ due to SpanID regeneration in enrichPairContext.
+			if bestMatch.span.Attributes["olly.trace_source"] != "traceparent" {
+				bestMatch.span.ParentSpanID = span.SpanID
+			}
 			if oldTraceID != span.TraceID {
 				s.traceMerge.Store(oldTraceID, span.TraceID)
 			}
@@ -325,12 +359,11 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 		return false
 	}
 
-	// SERVER spans with traceparent parents still go through stitching.
-	// The traceparent may have been auto-injected by the upstream application
-	// framework (.NET Activity, Spring context) rather than by sk_msg, creating
-	// orphan parentSpanIDs that reference internal framework spans. Stitching
-	// overwrites these with the correct CLIENT→SERVER link. For sk_msg-injected
-	// traceparent, stitching produces the same correct result.
+	// Traceparent-confirmed SERVER spans already have valid traceID + parentSpanID
+	// from upstream sk_msg injection. They should still TRY to match pending CLIENTs
+	// (which creates TraceMerge entries for multi-hop chains), but should NOT be
+	// deferred (stored) if no match is found — they already have correct linking.
+	hasTraceparent := span.Attributes["olly.trace_source"] == "traceparent" && span.ParentSpanID != ""
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -405,11 +438,22 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 
 		// Stitch direction depends on whether the CLIENT already has a parent.
 		// H1 fix: bestMatch.span is already a clone (safe to mutate).
+		// Resolve stale traceIDs via TraceMerge before stitching (see processClientSpan).
+		if resolved, ok := s.TraceMerge(span.TraceID); ok {
+			span.TraceID = resolved
+		}
+		if resolved, ok := s.TraceMerge(bestMatch.span.TraceID); ok {
+			bestMatch.span.TraceID = resolved
+		}
+
 		if bestMatch.span.ParentSpanID != "" {
 			// CLIENT has parent → SERVER joins CLIENT's trace
 			oldTraceID := span.TraceID
 			span.TraceID = bestMatch.span.TraceID
-			span.ParentSpanID = bestMatch.span.SpanID
+			// Preserve traceparent-extracted parent (see processClientSpan).
+			if span.Attributes["olly.trace_source"] != "traceparent" {
+				span.ParentSpanID = bestMatch.span.SpanID
+			}
 			if oldTraceID != bestMatch.span.TraceID {
 				s.traceMerge.Store(oldTraceID, bestMatch.span.TraceID)
 			}
@@ -419,7 +463,10 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 				bestMatch.span.ParentSpanID = ""
 			}
 			bestMatch.span.TraceID = span.TraceID
-			span.ParentSpanID = bestMatch.span.SpanID
+			// Preserve traceparent-extracted parent (see symmetric check above).
+			if span.Attributes["olly.trace_source"] != "traceparent" {
+				span.ParentSpanID = bestMatch.span.SpanID
+			}
 		}
 
 		bestMatch.span.SetAttribute("olly.stitched", "true")
@@ -449,11 +496,18 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 	}
 
 storeServer:
+	// Don't defer traceparent-confirmed SERVER spans — they already have valid
+	// cross-service linking from sk_msg injection. Export immediately instead
+	// of waiting for a CLIENT that may never arrive (or already skipped).
+	if hasTraceparent {
+		return false
+	}
 	// No unambiguous match — store a clone for future matching (with cap).
 	// H1 fix: clone prevents mutation of the original span in the export pipeline.
-	// SERVER spans are NOT deferred — they're exported immediately because
-	// they carry intra-process children (DB queries, outbound calls) that
-	// share the same traceID. Deferring would delay the entire trace subtree.
+	// SERVER spans are deferred: the caller does NOT export them. When a CLIENT
+	// later matches this clone, it's re-exported via OnStitchedSpan with the
+	// correct traceID. Unmatched SERVER clones are exported by Cleanup after
+	// 2*window (~1s), triggered by the agent's fast stitcher cleanup ticker (2s).
 	if s.pendingCount() < maxPendingSpans {
 		key := fmt.Sprintf("server:%s:%s", mk.method, mk.path)
 		ps := &pendingSpan{
@@ -466,8 +520,9 @@ storeServer:
 			createdAt:  time.Now(),
 		}
 		s.pendingServers[key] = append(s.pendingServers[key], ps)
+		return true // deferred — do NOT export
 	}
-	return false // SERVER is never deferred
+	return false
 }
 
 // matchKey holds all fields used for span matching.
@@ -481,11 +536,21 @@ type matchKey struct {
 // extractMatchKey returns matching fields from a span's attributes.
 // For HTTP: uses method, path, query string, and response status code.
 // For gRPC: uses rpc.method and rpc.service.
+// For MCP: uses mcp.method.name instead of url.path to disambiguate
+// calls that all share POST /mcp (e.g., tools/call vs initialize).
 func extractMatchKey(span *Span) matchKey {
 	if span.Protocol == "grpc" {
 		return matchKey{
 			method: span.Attributes["rpc.method"],
 			path:   span.Attributes["rpc.service"],
+		}
+	}
+	if span.Protocol == "mcp" {
+		return matchKey{
+			method:     span.Attributes["http.request.method"],
+			path:       span.Attributes["mcp.method.name"],
+			query:      span.Attributes["url.query"],
+			statusCode: span.Attributes["http.response.status_code"],
 		}
 	}
 	return matchKey{
@@ -531,7 +596,7 @@ func (s *Stitcher) Cleanup() int {
 
 	removed := 0
 	cutoff := time.Now().Add(-2 * s.window)
-	var expiredClients []*Span
+	var expiredSpans []*Span
 
 	for key, spans := range s.pendingClients {
 		kept := spans[:0]
@@ -540,7 +605,7 @@ func (s *Stitcher) Cleanup() int {
 				kept = append(kept, ps)
 			} else {
 				// CLIENT clones were deferred — export them now unmatched.
-				expiredClients = append(expiredClients, ps.span)
+				expiredSpans = append(expiredSpans, ps.span)
 				removed++
 			}
 		}
@@ -557,6 +622,8 @@ func (s *Stitcher) Cleanup() int {
 			if ps.createdAt.After(cutoff) {
 				kept = append(kept, ps)
 			} else {
+				// SERVER clones were deferred — export them now unmatched.
+				expiredSpans = append(expiredSpans, ps.span)
 				removed++
 			}
 		}
@@ -572,8 +639,8 @@ func (s *Stitcher) Cleanup() int {
 	cbs := s.callbacks
 	s.mu.Unlock()
 
-	// Export expired CLIENT clones so they don't get lost.
-	for _, span := range expiredClients {
+	// Export expired CLIENT and SERVER clones so they don't get lost.
+	for _, span := range expiredSpans {
 		for _, cb := range cbs {
 			cb(span)
 		}

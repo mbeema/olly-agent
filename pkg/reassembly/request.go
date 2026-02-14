@@ -567,8 +567,21 @@ func frameHTTP(buf []byte, isRequest bool) int {
 			return headerEnd // malformed or out of range, treat as headers-only
 		}
 		totalLen := headerEnd + contentLen
-		if totalLen < headerEnd || totalLen > len(buf) {
-			return 0 // overflow or body incomplete
+		if totalLen < headerEnd {
+			return headerEnd // overflow protection
+		}
+		if totalLen > len(buf) {
+			// eBPF truncation: each read/write syscall captures at most
+			// MAX_CAPTURE (256) bytes. On keep-alive connections, if the
+			// response body exceeds MAX_CAPTURE, the body data beyond one
+			// capture is invisible. Subsequent buffer growth comes from
+			// NEW HTTP messages, not the truncated body. If we've already
+			// accumulated more than headerEnd+MAX_CAPTURE of data and CL
+			// still isn't satisfied, emit headers-only to unblock the stream.
+			if !isRequest && contentLen > ebpfMaxCapture && len(buf) > headerEnd+ebpfMaxCapture {
+				return headerEnd
+			}
+			return 0 // body incomplete, wait for more data
 		}
 		return totalLen
 	}
@@ -576,7 +589,13 @@ func frameHTTP(buf []byte, isRequest bool) int {
 	// Check for Transfer-Encoding: chunked
 	te := extractHeaderValue(headers, "transfer-encoding")
 	if strings.Contains(strings.ToLower(te), "chunked") {
-		return frameChunked(buf, headerEnd)
+		n := frameChunked(buf, headerEnd)
+		if n == 0 && !isRequest && len(buf) > headerEnd+ebpfMaxCapture {
+			// eBPF truncation: chunk terminator 0\r\n\r\n is beyond
+			// MAX_CAPTURE. Return headers-only to unblock the stream.
+			return headerEnd
+		}
+		return n
 	}
 
 	// No Content-Length and not chunked:

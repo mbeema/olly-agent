@@ -213,10 +213,11 @@ func TestProcessHookLogChannelFull(t *testing.T) {
 // for testing enrichPairContext.
 func newTestAgentWithConnTracker() *Agent {
 	a := &Agent{
-		logParser:   logs.NewParser(),
-		logCh:       make(chan *logs.LogRecord, 100),
-		logger:      zap.NewNop(),
-		connTracker: conntrack.NewTracker(),
+		logParser:          logs.NewParser(),
+		logCh:              make(chan *logs.LogRecord, 100),
+		logger:             zap.NewNop(),
+		connTracker:        conntrack.NewTracker(),
+		maxRequestDuration: 5 * time.Minute,
 	}
 	cfg := config.DefaultConfig()
 	a.cfg.Store(cfg)
@@ -370,10 +371,11 @@ func TestEnrichPairContext_TIDMismatch_NoInjectedSpanID(t *testing.T) {
 	if pair.ParentSpanID != "server-ghi" {
 		t.Errorf("ParentSpanID = %q, want %q", pair.ParentSpanID, "server-ghi")
 	}
-	// HTTP should NOT get InjectedSpanID when TID doesn't match ReadTID
-	// (goroutine migrated → sk_msg won't inject traceparent)
-	if pair.InjectedSpanID != "" {
-		t.Errorf("InjectedSpanID = %q, want empty (TID mismatch)", pair.InjectedSpanID)
+	// With BPF PID-level trace context forwarding, kprobe_write bridges
+	// the TID gap by copying pid_trace_ctx[PID] → thread_trace_ctx[PID+write_TID].
+	// So InjectedSpanID IS set even with TID mismatch.
+	if pair.InjectedSpanID != "span-def" {
+		t.Errorf("InjectedSpanID = %q, want %q (PID-level forwarding bridges TID mismatch)", pair.InjectedSpanID, "span-def")
 	}
 }
 
@@ -409,6 +411,7 @@ func TestEnrichPairContext_PIDFallback(t *testing.T) {
 
 func TestEnrichPairContext_Stale(t *testing.T) {
 	a := newTestAgentWithConnTracker()
+	a.maxRequestDuration = 30 * time.Second // Use short duration for stale test
 
 	// Register an inbound connection (SERVER)
 	a.connTracker.RegisterInbound(100, 5, 0, 8080)
@@ -439,6 +442,7 @@ func TestEnrichPairContext_Stale(t *testing.T) {
 
 func TestEnrichPairContext_StaleCausal(t *testing.T) {
 	a := newTestAgentWithConnTracker()
+	a.maxRequestDuration = 30 * time.Second // Use short duration for stale test
 
 	// Register outbound connection (CLIENT)
 	a.connTracker.Register(100, 10, 0, 5432)

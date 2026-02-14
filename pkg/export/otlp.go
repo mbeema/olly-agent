@@ -265,7 +265,7 @@ func (e *OTLPExporter) convertSpan(s *traces.Span) (*tracepb.Span, error) {
 	ps := &tracepb.Span{
 		TraceId:           traceID,
 		SpanId:            spanID,
-		TraceState:        s.TraceState,
+		TraceState:        sanitizeUTF8(s.TraceState),
 		Name:              sanitizeUTF8(s.Name),
 		Kind:              convertSpanKind(s.Kind),
 		StartTimeUnixNano: uint64(s.StartTime.UnixNano()),
@@ -322,7 +322,7 @@ func (e *OTLPExporter) convertLogRecord(l *LogRecord) *logspb.LogRecord {
 	pl := &logspb.LogRecord{
 		TimeUnixNano: uint64(l.Timestamp.UnixNano()),
 		Body: &commonpb.AnyValue{
-			Value: &commonpb.AnyValue_StringValue{StringValue: l.Body},
+			Value: &commonpb.AnyValue_StringValue{StringValue: sanitizeUTF8(l.Body)},
 		},
 		SeverityText:   l.Level,
 		SeverityNumber: logspb.SeverityNumber(l.SeverityNumber), // R3.1
