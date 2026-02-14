@@ -367,23 +367,26 @@ static __always_inline void u32_to_hex(__u32 val, char *dst) {
 // or -1 if not found. Requires at least offset+49 bytes for full traceparent.
 // "traceparent: 00-" is 16 chars, then 32 hex (traceID) + "-" + 16 hex (spanID).
 static __always_inline __s32 find_traceparent(const __u8 *payload, __u32 len) {
-    // "traceparent: 00-" = 16 chars, need 16 + 32 + 1 + 16 = 65 chars minimum
-    if (len < 65)
+    // "traceparent: 00-" = 16 chars prefix, then 32 hex chars of traceID.
+    // We only need the traceID (48 bytes total from '\n'), not the full
+    // traceparent value (65 bytes). This allows extraction even when the
+    // spanID portion is truncated by MAX_CAPTURE.
+    if (len < 48)
         return -1;
 
-    __u32 scan_end = len - 65;
-    if (scan_end > 200) // cap scan range for verifier
-        scan_end = 200;
+    __u32 scan_end = len - 48;
+    if (scan_end > 240) // cap scan range for verifier
+        scan_end = 240;
 
     // Scan for '\ntraceparent: ' (after first header line) or
     // 'traceparent: ' at start (unlikely but handle it)
     #pragma clang loop unroll(disable)
-    for (__u32 i = 0; i < scan_end && i < 200; i++) {
+    for (__u32 i = 0; i < scan_end && i < 240; i++) {
         // Check for "\ntraceparent: 00-" or "\r\ntraceparent: 00-"
         if (payload[i] != '\n')
             continue;
         __u32 start = i + 1;
-        if (start + 16 + 32 + 1 + 16 > len)
+        if (start + 16 + 32 > len)
             break;
         // Verify "traceparent: 00-" at start
         if (payload[start]     == 't' && payload[start+1]  == 'r' &&
@@ -468,12 +471,12 @@ static __always_inline void maybe_generate_trace_ctx(
 
     __builtin_memcpy(h, "traceparent: 00-", 16);
 
-    if (tp_offset >= 0 && tp_offset + 32 + 1 + 16 <= (__s32)len) {
+    if (tp_offset >= 0 && tp_offset + 32 <= (__s32)len) {
         // Extract existing trace ID from the incoming traceparent header.
         // This preserves cross-service trace continuity.
-        // Copy 32 hex chars of trace ID from payload
+        // Copy 32 hex chars of trace ID from payload (spanID is always regenerated)
         __u32 safe_off = (__u32)tp_offset;
-        if (safe_off + 49 <= MAX_CAPTURE) {
+        if (safe_off + 32 <= MAX_CAPTURE) {
             #pragma clang loop unroll(full)
             for (int j = 0; j < 32; j++)
                 h[16 + j] = payload[safe_off + j];
@@ -1441,19 +1444,23 @@ int olly_sk_msg(struct sk_msg_md *msg) {
     data = (void *)(long)msg->data;
     data_end = (void *)(long)msg->data_end;
 
-    // Search for \r\n\r\n with per-iteration constant-offset bounds check.
-    // The verifier tracks bounded loop + per-iteration check.
+    // Search for the FIRST \r\n (end of HTTP request line) and inject
+    // traceparent as the first header. This ensures the traceparent is
+    // always within the first ~90 bytes of the request, well within the
+    // receiver's MAX_CAPTURE=256 byte BPF capture window. Injecting at
+    // the end of headers (before \r\n\r\n) caused the traceparent to be
+    // at position 200+ where it gets truncated by the capture limit.
     __s32 insert_pos = -1;
 
     #pragma clang loop unroll(disable)
     for (__u32 i = 0; i < SCAN_MAX; i++) {
-        // Constant offset 4 from a variable base — verifier can track
+        // Constant offset 2 from a variable base — verifier can track
         // this because the loop is bounded and i is provably < SCAN_MAX
-        if ((void *)((__u8 *)data + i + 4) > data_end)
+        if ((void *)((__u8 *)data + i + 2) > data_end)
             break;
         __u8 *c = (__u8 *)data + i;
-        if (c[0] == '\r' && c[1] == '\n' && c[2] == '\r' && c[3] == '\n') {
-            // Insert after the last header's \r\n, before blank line's \r\n
+        if (c[0] == '\r' && c[1] == '\n') {
+            // Insert after the request line's \r\n, before the first header
             insert_pos = (__s32)(i + 2);
             break;
         }

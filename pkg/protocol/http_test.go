@@ -147,6 +147,19 @@ func TestExtractTraceContextCaseInsensitive(t *testing.T) {
 		}
 	})
 
+	// Verify partial traceparent (truncated by BPF MAX_CAPTURE) extracts traceID
+	t.Run("truncated traceparent", func(t *testing.T) {
+		// Simulates BPF capture truncating the value after traceID
+		request := []byte("GET / HTTP/1.1\r\ntraceparent: 00-" + wantTraceID + "-b7ad6b71\r\n\r\n")
+		ctx := ExtractTraceContext(request)
+		if ctx.TraceID != wantTraceID {
+			t.Errorf("TraceID = %q, want %q", ctx.TraceID, wantTraceID)
+		}
+		if ctx.SpanID != "" {
+			t.Errorf("SpanID = %q, want empty (truncated)", ctx.SpanID)
+		}
+	})
+
 	// Verify tracestate is also extracted case-insensitively
 	t.Run("mixed case tracestate", func(t *testing.T) {
 		request := []byte("GET / HTTP/1.1\r\nTRACEPARENT: " + traceparentValue + "\r\nTraceState: congo=t61rcWkgMzE\r\n\r\n")

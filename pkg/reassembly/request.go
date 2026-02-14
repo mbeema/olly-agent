@@ -42,6 +42,14 @@ type RequestPair struct {
 
 	// Database name extracted from protocol handshake (PG startup, MySQL COM_INIT_DB)
 	DBNamespace string
+
+	// CausalInboundFD is the inbound FD that was being served when this
+	// outbound request was written. Captured at AppendSend time via a FIFO
+	// queue to handle pipelined protocols (Redis, HTTP keep-alive) where
+	// multiple requests share the same outbound FD. Used by enrichPairContext
+	// as the highest-priority lookup for parent linking.
+	// 0 means not set (inbound or no causal mapping available).
+	CausalInboundFD int32
 }
 
 // streamKey uniquely identifies a stream.
@@ -59,6 +67,12 @@ type streamState struct {
 	respFramer *httpFramer // framing state for response direction
 	lastTID    atomic.Uint32 // H2 fix: atomic to prevent data race
 	direction  atomic.Int32  // H2b fix: atomic to prevent data race; 0=outbound, 1=inbound
+
+	// causalFDQueue tracks which inbound FD caused each outbound request.
+	// Pushed at PushCausalFD time (before AppendSend), popped at pair creation.
+	// FIFO order matches request-response pairing for pipelined protocols
+	// (Redis, HTTP keep-alive). Protected by stream.mu.
+	causalFDQueue []int32
 
 	// PostgreSQL: true after auth handshake is consumed. Before this,
 	// all data (startup, SSL negotiation, auth) is discarded to prevent
@@ -120,6 +134,18 @@ func (r *Reassembler) getOrCreate(pid uint32, fd int32, remoteAddr string, remot
 	r.mu.Unlock()
 
 	return ss
+}
+
+// PushCausalFD records which inbound FD caused the next outbound request on
+// this stream. Must be called BEFORE AppendSend for the same stream. The
+// FIFO queue handles pipelined protocols (Redis, HTTP keep-alive) where
+// multiple requests share the same outbound FD — each request gets the
+// inbound FD that was active when it was written, not when its response arrived.
+func (r *Reassembler) PushCausalFD(pid uint32, fd int32, causalFD int32) {
+	ss := r.getOrCreate(pid, fd, "", 0)
+	ss.stream.mu.Lock()
+	ss.causalFDQueue = append(ss.causalFDQueue, causalFD)
+	ss.stream.mu.Unlock()
 }
 
 // SetDirection sets the connection direction for a stream (0=outbound, 1=inbound).
@@ -292,20 +318,28 @@ func (r *Reassembler) tryExtractPairs(ss *streamState) {
 			reqTime = time.Now()
 			duration = 0
 		}
+		// Pop causal inbound FD from queue (set at AppendSend time).
+		// FIFO order matches request-response pairing.
+		var causalFD int32
+		if len(ss.causalFDQueue) > 0 {
+			causalFD = ss.causalFDQueue[0]
+			ss.causalFDQueue = ss.causalFDQueue[1:]
+		}
 		pair := &RequestPair{
-			PID:         s.PID,
-			TID:         ss.lastTID.Load(),
-			FD:          s.FD,
-			RemoteAddr:  s.RemoteAddr,
-			RemotePort:  s.RemotePort,
-			IsSSL:       s.IsSSL,
-			Protocol:    ss.protocol,
-			Request:     make([]byte, reqLen),
-			Response:    make([]byte, respLen),
-			RequestTime: reqTime,
-			Duration:    duration,
-			Direction:   int(ss.direction.Load()),
-			DBNamespace: ss.dbNamespace,
+			PID:             s.PID,
+			TID:             ss.lastTID.Load(),
+			FD:              s.FD,
+			RemoteAddr:      s.RemoteAddr,
+			RemotePort:      s.RemotePort,
+			IsSSL:           s.IsSSL,
+			Protocol:        ss.protocol,
+			Request:         make([]byte, reqLen),
+			Response:        make([]byte, respLen),
+			RequestTime:     reqTime,
+			Duration:        duration,
+			Direction:       int(ss.direction.Load()),
+			DBNamespace:     ss.dbNamespace,
+			CausalInboundFD: causalFD,
 		}
 		copy(pair.Request, s.sendBuf[:reqLen])
 		copy(pair.Response, s.recvBuf[:respLen])
@@ -414,20 +448,26 @@ func (r *Reassembler) RemoveStream(pid uint32, fd int32, tid uint32) {
 		if pairTID == 0 {
 			pairTID = tid // fallback if no data was sent
 		}
+		var causalFD int32
+		if len(ss.causalFDQueue) > 0 {
+			causalFD = ss.causalFDQueue[0]
+			ss.causalFDQueue = ss.causalFDQueue[1:]
+		}
 		pair := &RequestPair{
-			PID:         s.PID,
-			TID:         pairTID,
-			FD:          s.FD,
-			RemoteAddr:  s.RemoteAddr,
-			RemotePort:  s.RemotePort,
-			IsSSL:       s.IsSSL,
-			Protocol:    ss.protocol,
-			Request:     make([]byte, len(s.sendBuf)),
-			Response:    make([]byte, len(s.recvBuf)),
-			RequestTime: reqTime,
-			Duration:    duration,
-			Direction:   int(ss.direction.Load()),
-			DBNamespace: ss.dbNamespace,
+			PID:             s.PID,
+			TID:             pairTID,
+			FD:              s.FD,
+			RemoteAddr:      s.RemoteAddr,
+			RemotePort:      s.RemotePort,
+			IsSSL:           s.IsSSL,
+			Protocol:        ss.protocol,
+			Request:         make([]byte, len(s.sendBuf)),
+			Response:        make([]byte, len(s.recvBuf)),
+			RequestTime:     reqTime,
+			Duration:        duration,
+			Direction:       int(ss.direction.Load()),
+			DBNamespace:     ss.dbNamespace,
+			CausalInboundFD: causalFD,
 		}
 		copy(pair.Request, s.sendBuf)
 		copy(pair.Response, s.recvBuf)
@@ -492,20 +532,26 @@ func (r *Reassembler) CleanStale(maxIdle time.Duration) int {
 			duration = 0
 		}
 		pairTID := e.ss.lastTID.Load()
+		var causalFD int32
+		if len(e.ss.causalFDQueue) > 0 {
+			causalFD = e.ss.causalFDQueue[0]
+			e.ss.causalFDQueue = e.ss.causalFDQueue[1:]
+		}
 		pair := &RequestPair{
-			PID:         s.PID,
-			TID:         pairTID,
-			FD:          s.FD,
-			RemoteAddr:  s.RemoteAddr,
-			RemotePort:  s.RemotePort,
-			IsSSL:       s.IsSSL,
-			Protocol:    e.ss.protocol,
-			Request:     make([]byte, len(s.sendBuf)),
-			Response:    make([]byte, len(s.recvBuf)),
-			RequestTime: reqTime,
-			Duration:    duration,
-			Direction:   int(e.ss.direction.Load()),
-			DBNamespace: e.ss.dbNamespace,
+			PID:             s.PID,
+			TID:             pairTID,
+			FD:              s.FD,
+			RemoteAddr:      s.RemoteAddr,
+			RemotePort:      s.RemotePort,
+			IsSSL:           s.IsSSL,
+			Protocol:        e.ss.protocol,
+			Request:         make([]byte, len(s.sendBuf)),
+			Response:        make([]byte, len(s.recvBuf)),
+			RequestTime:     reqTime,
+			Duration:        duration,
+			Direction:       int(e.ss.direction.Load()),
+			DBNamespace:     e.ss.dbNamespace,
+			CausalInboundFD: causalFD,
 		}
 		copy(pair.Request, s.sendBuf)
 		copy(pair.Response, s.recvBuf)

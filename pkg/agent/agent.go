@@ -359,13 +359,23 @@ func (a *Agent) Start(ctx context.Context) error {
 			} else {
 				// Record causal mapping: this outbound write was caused by
 				// whichever inbound FD this thread is currently serving.
+				// Push to FIFO queue BEFORE AppendSend so pipelined protocols
+				// (Redis, HTTP keep-alive) get per-request causal tracking
+				// instead of last-writer-wins on the fdCausal map.
 				tidKey := uint64(pid)<<32 | uint64(tid)
 				if inboundFD, ok := a.threadInboundFD.Load(tidKey); ok {
+					iFD := inboundFD.(int32)
+					a.reassembler.PushCausalFD(pid, fd, iFD)
 					causalKey := uint64(pid)<<32 | uint64(uint32(fd))
 					a.fdCausal.Store(causalKey, &causalEntry{
-						InboundFD: inboundFD.(int32),
+						InboundFD: iFD,
 						Timestamp: time.Now(),
 					})
+				} else if pidFD, ok := a.pidActiveCtx.Load(pid); ok {
+					// PID-level fallback: Go goroutine TID mismatch.
+					// threadInboundFD has no entry for this TID, but
+					// pidActiveCtx knows the most recent inbound FD.
+					a.reassembler.PushCausalFD(pid, fd, pidFD.(int32))
 				}
 				a.reassembler.AppendSend(pid, tid, fd, data, remoteAddr, remotePort, conn.IsSSL)
 			}
@@ -854,32 +864,43 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 		return
 	}
 
-	// CLIENT pairs: 3-layer FD-based lookup to find the inbound context
+	// CLIENT pairs: 4-layer FD-based lookup to find the inbound context
 	// that caused this outbound request.
 	var inboundFD int32
 	var found bool
 
-	// Layer 1: FD causal mapping (most accurate).
+	// Layer 0: Per-request causal FD from FIFO queue (most accurate for
+	// pipelined protocols). Captured at AppendSend time, before concurrent
+	// requests can overwrite the fdCausal map. Handles Redis, HTTP keep-alive,
+	// and other persistent-connection protocols correctly.
+	if pair.CausalInboundFD != 0 {
+		inboundFD = pair.CausalInboundFD
+		found = true
+	}
+
+	// Layer 1: FD causal mapping (fallback when queue wasn't populated).
 	// OnDataOut recorded which inbound FD caused this outbound write.
-	causalKey := uint64(pair.PID)<<32 | uint64(uint32(pair.FD))
-	if val, ok := a.fdCausal.Load(causalKey); ok {
-		ce := val.(*causalEntry)
-		if time.Since(ce.Timestamp) <= a.maxRequestDuration {
-			// Verify the causal entry is from the CURRENT request on that
-			// inbound FD. Persistent connections (Redis, pooled HTTP) reuse
-			// FDs across requests: a stale causal entry from a previous
-			// request would map to the wrong connCtx (overwritten by the
-			// new request). Skip to Layer 2/3 if the connCtx is newer.
-			inboundKey := uint64(pair.PID)<<32 | uint64(uint32(ce.InboundFD))
-			if ctxVal, ctxOK := a.connCtx.Load(inboundKey); ctxOK {
-				tctx := ctxVal.(*connTraceCtx)
-				if !ce.Timestamp.Before(tctx.Created) {
-					inboundFD = ce.InboundFD
-					found = true
+	if !found {
+		causalKey := uint64(pair.PID)<<32 | uint64(uint32(pair.FD))
+		if val, ok := a.fdCausal.Load(causalKey); ok {
+			ce := val.(*causalEntry)
+			if time.Since(ce.Timestamp) <= a.maxRequestDuration {
+				// Verify the causal entry is from the CURRENT request on that
+				// inbound FD. Persistent connections (Redis, pooled HTTP) reuse
+				// FDs across requests: a stale causal entry from a previous
+				// request would map to the wrong connCtx (overwritten by the
+				// new request). Skip to Layer 2/3 if the connCtx is newer.
+				inboundKey := uint64(pair.PID)<<32 | uint64(uint32(ce.InboundFD))
+				if ctxVal, ctxOK := a.connCtx.Load(inboundKey); ctxOK {
+					tctx := ctxVal.(*connTraceCtx)
+					if !ce.Timestamp.Before(tctx.Created) {
+						inboundFD = ce.InboundFD
+						found = true
+					}
 				}
+				// If connCtx doesn't exist or is newer than the causal entry,
+				// fall through to Layer 2/3.
 			}
-			// If connCtx doesn't exist or is newer than the causal entry,
-			// fall through to Layer 2/3.
 		}
 	}
 

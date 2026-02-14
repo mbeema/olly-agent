@@ -152,15 +152,21 @@ func ExtractTraceContext(request []byte) TraceContext {
 	value := strings.TrimSpace(string(request[start : start+end]))
 
 	// Parse: 00-<traceID>-<spanID>-<flags>
+	// Accept partial values (at least version + traceID) to handle BPF
+	// MAX_CAPTURE truncation where spanID/flags may be cut off.
 	parts := strings.Split(value, "-")
-	if len(parts) != 4 {
+	if len(parts) < 2 || len(parts[1]) != 32 {
 		return ctx
 	}
 
 	ctx.TraceID = parts[1]
-	ctx.SpanID = parts[2]
-	flags, _ := strconv.ParseInt(parts[3], 16, 64)
-	ctx.Sampled = (flags & 0x01) != 0
+	if len(parts) >= 3 && len(parts[2]) == 16 {
+		ctx.SpanID = parts[2]
+	}
+	if len(parts) >= 4 {
+		flags, _ := strconv.ParseInt(parts[3], 16, 64)
+		ctx.Sampled = (flags & 0x01) != 0
+	}
 
 	// R1.2: Look for tracestate header
 	tsNeedle := []byte("tracestate: ")

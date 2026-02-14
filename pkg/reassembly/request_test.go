@@ -821,3 +821,98 @@ func TestPairTID_UsesRequestNotResponseTID(t *testing.T) {
 			pairs[0].TID, sendTID, recvTID)
 	}
 }
+
+func TestCausalFDQueue_FIFO(t *testing.T) {
+	// Verify that PushCausalFD + pair creation preserves FIFO ordering.
+	// Scenario: Redis persistent connection. Two concurrent inbound requests
+	// (FD 23, FD 25) each trigger an outbound Redis command on the same FD 10.
+	// The FIFO queue ensures request A gets FD 23 and request B gets FD 25,
+	// even though both share the same outbound FD.
+	r := NewReassembler(zap.NewNop())
+
+	var pairs []*RequestPair
+	r.OnPair(func(p *RequestPair) {
+		pairs = append(pairs, p)
+	})
+
+	pid := uint32(100)
+	tid := uint32(200)
+	fd := int32(10)
+	addr := "127.0.0.1"
+	port := uint16(6379)
+
+	// Push causal FDs in order: request A (inbound FD=23), then B (inbound FD=25)
+	r.PushCausalFD(pid, fd, 23)
+	r.PushCausalFD(pid, fd, 25)
+
+	// Send two Redis commands (pipelined)
+	r.AppendSend(pid, tid, fd, []byte("*2\r\n$3\r\nGET\r\n$5\r\nkey_a\r\n"), addr, port, false)
+	r.AppendSend(pid, tid, fd, []byte("*2\r\n$3\r\nGET\r\n$5\r\nkey_b\r\n"), addr, port, false)
+
+	// Receive two Redis responses
+	r.AppendRecv(pid, tid, fd, []byte("$5\r\nval_a\r\n"), addr, port, false)
+	r.AppendRecv(pid, tid, fd, []byte("$5\r\nval_b\r\n"), addr, port, false)
+
+	if len(pairs) != 2 {
+		t.Fatalf("expected 2 pairs, got %d", len(pairs))
+	}
+
+	// First pair should have CausalInboundFD=23 (request A)
+	if pairs[0].CausalInboundFD != 23 {
+		t.Errorf("pairs[0].CausalInboundFD = %d, want 23", pairs[0].CausalInboundFD)
+	}
+	// Second pair should have CausalInboundFD=25 (request B)
+	if pairs[1].CausalInboundFD != 25 {
+		t.Errorf("pairs[1].CausalInboundFD = %d, want 25", pairs[1].CausalInboundFD)
+	}
+}
+
+func TestCausalFDQueue_EmptyQueue(t *testing.T) {
+	// When no PushCausalFD was called, CausalInboundFD should be 0.
+	r := NewReassembler(zap.NewNop())
+
+	var pairs []*RequestPair
+	r.OnPair(func(p *RequestPair) {
+		pairs = append(pairs, p)
+	})
+
+	pid := uint32(100)
+	tid := uint32(200)
+	fd := int32(10)
+
+	r.AppendSend(pid, tid, fd, []byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"), "10.0.0.1", 80, false)
+	r.AppendRecv(pid, tid, fd, []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"), "10.0.0.1", 80, false)
+
+	if len(pairs) != 1 {
+		t.Fatalf("expected 1 pair, got %d", len(pairs))
+	}
+	if pairs[0].CausalInboundFD != 0 {
+		t.Errorf("CausalInboundFD = %d, want 0 (empty queue)", pairs[0].CausalInboundFD)
+	}
+}
+
+func TestCausalFDQueue_RemoveStream(t *testing.T) {
+	// When RemoveStream emits a partial pair, it should pop from the queue.
+	r := NewReassembler(zap.NewNop())
+
+	var pairs []*RequestPair
+	r.OnPair(func(p *RequestPair) {
+		pairs = append(pairs, p)
+	})
+
+	pid := uint32(100)
+	tid := uint32(200)
+	fd := int32(10)
+
+	r.PushCausalFD(pid, fd, 42)
+	r.AppendSend(pid, tid, fd, []byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"), "10.0.0.1", 80, false)
+	// No response — connection closes with partial data
+	r.RemoveStream(pid, fd, tid)
+
+	if len(pairs) != 1 {
+		t.Fatalf("expected 1 pair from RemoveStream, got %d", len(pairs))
+	}
+	if pairs[0].CausalInboundFD != 42 {
+		t.Errorf("CausalInboundFD = %d, want 42", pairs[0].CausalInboundFD)
+	}
+}

@@ -513,6 +513,92 @@ func TestOnClose_CleansContextMaps(t *testing.T) {
 	}
 }
 
+func TestEnrichPairContext_CausalFDQueue(t *testing.T) {
+	// Verify Layer 0 (CausalInboundFD from FIFO queue) takes priority over
+	// Layer 1 (fdCausal map). This tests the pipelining scenario: two concurrent
+	// outbound requests on the same FD (e.g., Redis persistent connection) get
+	// the correct parent context from the queue, not the last-writer-wins map.
+	a := newTestAgentWithConnTracker()
+
+	// Register outbound connection (Redis persistent connection, same FD=10)
+	a.connTracker.Register(100, 10, 0, 6379)
+
+	// Two inbound connections handling different requests
+	storeTestConnCtx(a, 100, 5, "trace-reqA", "span-A", "server-spanA")
+	storeTestConnCtx(a, 100, 7, "trace-reqB", "span-B", "server-spanB")
+
+	// fdCausal map has last-writer (request B) — this is the BUG scenario
+	causalKey := uint64(100)<<32 | uint64(uint32(int32(10)))
+	a.fdCausal.Store(causalKey, &causalEntry{
+		InboundFD: 7, // B overwrote A's entry
+		Timestamp: time.Now(),
+	})
+
+	// Request A's pair has CausalInboundFD=5 (captured at AppendSend time via queue)
+	pairA := &reassembly.RequestPair{
+		PID:             100,
+		TID:             200,
+		FD:              10,
+		Protocol:        "redis",
+		CausalInboundFD: 5, // from FIFO queue — correct for request A
+	}
+	a.enrichPairContext(pairA)
+
+	if pairA.ParentTraceID != "trace-reqA" {
+		t.Errorf("pairA.ParentTraceID = %q, want %q (Layer 0 should use CausalInboundFD=5)", pairA.ParentTraceID, "trace-reqA")
+	}
+	if pairA.ParentSpanID != "server-spanA" {
+		t.Errorf("pairA.ParentSpanID = %q, want %q", pairA.ParentSpanID, "server-spanA")
+	}
+
+	// Request B's pair has CausalInboundFD=7 (also from queue)
+	pairB := &reassembly.RequestPair{
+		PID:             100,
+		TID:             200,
+		FD:              10,
+		Protocol:        "redis",
+		CausalInboundFD: 7,
+	}
+	a.enrichPairContext(pairB)
+
+	if pairB.ParentTraceID != "trace-reqB" {
+		t.Errorf("pairB.ParentTraceID = %q, want %q (Layer 0 should use CausalInboundFD=7)", pairB.ParentTraceID, "trace-reqB")
+	}
+	if pairB.ParentSpanID != "server-spanB" {
+		t.Errorf("pairB.ParentSpanID = %q, want %q", pairB.ParentSpanID, "server-spanB")
+	}
+}
+
+func TestEnrichPairContext_CausalFDQueueZeroFallsToLayer1(t *testing.T) {
+	// When CausalInboundFD is 0 (not set), Layer 1 fdCausal map should be used.
+	a := newTestAgentWithConnTracker()
+
+	a.connTracker.Register(100, 10, 0, 5432)
+	storeTestConnCtx(a, 100, 5, "trace-pg", "span-pg", "server-pg")
+
+	causalKey := uint64(100)<<32 | uint64(uint32(int32(10)))
+	a.fdCausal.Store(causalKey, &causalEntry{
+		InboundFD: 5,
+		Timestamp: time.Now(),
+	})
+
+	pair := &reassembly.RequestPair{
+		PID:             100,
+		TID:             300,
+		FD:              10,
+		Protocol:        "postgres",
+		CausalInboundFD: 0, // not set — should fall to Layer 1
+	}
+	a.enrichPairContext(pair)
+
+	if pair.ParentTraceID != "trace-pg" {
+		t.Errorf("ParentTraceID = %q, want %q (Layer 1 fallback)", pair.ParentTraceID, "trace-pg")
+	}
+	if pair.ParentSpanID != "server-pg" {
+		t.Errorf("ParentSpanID = %q, want %q", pair.ParentSpanID, "server-pg")
+	}
+}
+
 func TestEnrichPairContext_LayerPriority(t *testing.T) {
 	// Verify Layer 1 (causal) takes priority over Layer 2 (thread) and Layer 3 (PID)
 	a := newTestAgentWithConnTracker()
