@@ -353,13 +353,18 @@ func TestEnrichPairContext_TIDMismatch_NoInjectedSpanID(t *testing.T) {
 	}
 
 	// Store pidActiveCtx fallback (Layer 3)
-	a.pidActiveCtx.Store(uint32(100), int32(5))
+	{
+		set := &pidInboundSet{}
+		set.Add(5, time.Now())
+		a.pidActiveCtx.Store(uint32(100), set)
+	}
 
 	pair := &reassembly.RequestPair{
-		PID:      100,
-		TID:      999, // Different TID — goroutine migrated
-		FD:       10,
-		Protocol: "http",
+		PID:         100,
+		TID:         999, // Different TID — goroutine migrated
+		FD:          10,
+		Protocol:    "http",
+		RequestTime: time.Now(),
 	}
 
 	a.enrichPairContext(pair)
@@ -388,15 +393,20 @@ func TestEnrichPairContext_PIDFallback(t *testing.T) {
 	// Store inbound context on FD 5
 	storeTestConnCtx(a, 100, 5, "trace-pid", "span-pid", "server-pid")
 
-	// Store pidActiveCtx: most recent inbound FD for PID 100 is FD 5
+	// Store pidActiveCtx: active inbound FDs for PID 100 includes FD 5
 	// (no fdCausal, no threadInboundFD for this TID — simulates Go goroutine TID mismatch)
-	a.pidActiveCtx.Store(uint32(100), int32(5))
+	{
+		set := &pidInboundSet{}
+		set.Add(5, time.Now())
+		a.pidActiveCtx.Store(uint32(100), set)
+	}
 
 	pair := &reassembly.RequestPair{
-		PID:      100,
-		TID:      999, // different TID — goroutine migrated
-		FD:       10,
-		Protocol: "postgres",
+		PID:         100,
+		TID:         999, // different TID — goroutine migrated
+		FD:          10,
+		Protocol:    "postgres",
+		RequestTime: time.Now(),
 	}
 
 	a.enrichPairContext(pair)
@@ -458,13 +468,18 @@ func TestEnrichPairContext_StaleCausal(t *testing.T) {
 	})
 
 	// But also store pidActiveCtx as fallback
-	a.pidActiveCtx.Store(uint32(100), int32(5))
+	{
+		set := &pidInboundSet{}
+		set.Add(5, time.Now())
+		a.pidActiveCtx.Store(uint32(100), set)
+	}
 
 	pair := &reassembly.RequestPair{
-		PID:      100,
-		TID:      999,
-		FD:       10,
-		Protocol: "postgres",
+		PID:         100,
+		TID:         999,
+		FD:          10,
+		Protocol:    "postgres",
+		RequestTime: time.Now(),
 	}
 
 	a.enrichPairContext(pair)
@@ -622,13 +637,18 @@ func TestEnrichPairContext_LayerPriority(t *testing.T) {
 	a.threadInboundFD.Store(tidKey, int32(7))
 
 	// Layer 3: PID says FD 7 (wrong one)
-	a.pidActiveCtx.Store(uint32(100), int32(7))
+	{
+		set := &pidInboundSet{}
+		set.Add(7, time.Now())
+		a.pidActiveCtx.Store(uint32(100), set)
+	}
 
 	pair := &reassembly.RequestPair{
-		PID:      100,
-		TID:      200,
-		FD:       10,
-		Protocol: "http",
+		PID:         100,
+		TID:         200,
+		FD:          10,
+		Protocol:    "http",
+		RequestTime: time.Now(),
 	}
 
 	a.enrichPairContext(pair)
@@ -636,5 +656,165 @@ func TestEnrichPairContext_LayerPriority(t *testing.T) {
 	// Should use Layer 1 (causal) → FD 5 → "trace-correct"
 	if pair.ParentTraceID != "trace-correct" {
 		t.Errorf("ParentTraceID = %q, want %q (Layer 1 should have priority)", pair.ParentTraceID, "trace-correct")
+	}
+}
+
+func TestEnrichPairContext_ConcurrentInbound(t *testing.T) {
+	a := newTestAgentWithConnTracker()
+
+	// Register outbound connection (CLIENT)
+	a.connTracker.Register(100, 10, 0, 80)
+
+	now := time.Now()
+
+	// Two concurrent inbound FDs for PID 100
+	storeTestConnCtx(a, 100, 5, "trace-old", "span-old", "server-old")
+	// Backdate FD 5's connCtx
+	connKey5 := uint64(100)<<32 | uint64(uint32(int32(5)))
+	if val, ok := a.connCtx.Load(connKey5); ok {
+		val.(*connTraceCtx).Created = now.Add(-10 * time.Millisecond)
+	}
+
+	storeTestConnCtx(a, 100, 7, "trace-new", "span-new", "server-new")
+	// FD 7 created 2ms ago
+	connKey7 := uint64(100)<<32 | uint64(uint32(int32(7)))
+	if val, ok := a.connCtx.Load(connKey7); ok {
+		val.(*connTraceCtx).Created = now.Add(-2 * time.Millisecond)
+	}
+
+	// Track both inbound FDs in pidActiveCtx
+	set := &pidInboundSet{}
+	set.Add(5, now.Add(-10*time.Millisecond))
+	set.Add(7, now.Add(-2*time.Millisecond))
+	a.pidActiveCtx.Store(uint32(100), set)
+
+	pair := &reassembly.RequestPair{
+		PID:         100,
+		TID:         999, // no threadInboundFD, no fdCausal → falls to Layer 3
+		FD:          10,
+		Protocol:    "http",
+		RequestTime: now,
+	}
+
+	a.enrichPairContext(pair)
+
+	// Temporal match should pick FD 7 (most recent before pair.RequestTime)
+	if pair.ParentTraceID != "trace-new" {
+		t.Errorf("ParentTraceID = %q, want %q (should pick most recent inbound FD)", pair.ParentTraceID, "trace-new")
+	}
+	if pair.ParentSpanID != "server-new" {
+		t.Errorf("ParentSpanID = %q, want %q", pair.ParentSpanID, "server-new")
+	}
+}
+
+func TestPidInboundSet_AddRemove(t *testing.T) {
+	s := &pidInboundSet{}
+	now := time.Now()
+
+	s.Add(5, now)
+	s.Add(7, now.Add(time.Millisecond))
+
+	if s.Count() != 2 {
+		t.Fatalf("Count = %d, want 2", s.Count())
+	}
+
+	s.Remove(5)
+	if s.Count() != 1 {
+		t.Fatalf("Count = %d, want 1 after Remove", s.Count())
+	}
+
+	fd, ok := s.BestMatch(now.Add(2 * time.Millisecond))
+	if !ok || fd != 7 {
+		t.Errorf("BestMatch = (%d, %v), want (7, true)", fd, ok)
+	}
+}
+
+func TestPidInboundSet_BestMatchSingle(t *testing.T) {
+	s := &pidInboundSet{}
+	s.Add(5, time.Now())
+
+	fd, ok := s.BestMatch(time.Now())
+	if !ok || fd != 5 {
+		t.Errorf("BestMatch single = (%d, %v), want (5, true)", fd, ok)
+	}
+}
+
+func TestPidInboundSet_BestMatchMulti(t *testing.T) {
+	s := &pidInboundSet{}
+	now := time.Now()
+	s.Add(5, now.Add(-10*time.Millisecond))
+	s.Add(7, now.Add(-2*time.Millisecond))
+	s.Add(9, now.Add(5*time.Millisecond)) // in the future
+
+	// Query at 'now': should pick FD 7 (closest before now)
+	fd, ok := s.BestMatch(now)
+	if !ok || fd != 7 {
+		t.Errorf("BestMatch = (%d, %v), want (7, true)", fd, ok)
+	}
+}
+
+func TestPidInboundSet_Eviction(t *testing.T) {
+	s := &pidInboundSet{}
+	base := time.Now()
+
+	// Fill to capacity (16 entries)
+	for i := 0; i < 16; i++ {
+		s.Add(int32(i), base.Add(time.Duration(i)*time.Millisecond))
+	}
+	if s.Count() != 16 {
+		t.Fatalf("Count = %d, want 16", s.Count())
+	}
+
+	// Adding one more should evict the oldest (FD 0)
+	s.Add(99, base.Add(20*time.Millisecond))
+	if s.Count() != 16 {
+		t.Fatalf("Count after evict = %d, want 16", s.Count())
+	}
+
+	// FD 0 should be gone, FD 99 should exist
+	fd, ok := s.BestMatch(base.Add(21 * time.Millisecond))
+	if !ok {
+		t.Fatal("BestMatch should succeed")
+	}
+	if fd == 0 {
+		t.Error("FD 0 should have been evicted")
+	}
+}
+
+func TestPidInboundSet_FDReuse(t *testing.T) {
+	s := &pidInboundSet{}
+	now := time.Now()
+
+	s.Add(5, now)
+	s.Add(5, now.Add(time.Second)) // reuse same FD
+
+	if s.Count() != 1 {
+		t.Errorf("Count = %d, want 1 (FD reuse should update, not add)", s.Count())
+	}
+}
+
+func TestPidInboundSet_CleanStale(t *testing.T) {
+	s := &pidInboundSet{}
+	now := time.Now()
+
+	s.Add(5, now.Add(-2*time.Minute))
+	s.Add(7, now)
+
+	s.CleanStale(time.Minute)
+
+	if s.Count() != 1 {
+		t.Fatalf("Count = %d, want 1 after CleanStale", s.Count())
+	}
+	fd, ok := s.BestMatch(now.Add(time.Second))
+	if !ok || fd != 7 {
+		t.Errorf("remaining FD = %d, want 7", fd)
+	}
+}
+
+func TestPidInboundSet_Empty(t *testing.T) {
+	s := &pidInboundSet{}
+	_, ok := s.BestMatch(time.Now())
+	if ok {
+		t.Error("BestMatch on empty set should return false")
 	}
 }

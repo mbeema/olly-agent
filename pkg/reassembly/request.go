@@ -378,6 +378,15 @@ func (r *Reassembler) RemoveStream(pid uint32, fd int32, tid uint32) {
 	if s.HasData() && r.onPair != nil {
 		s.mu.Lock()
 
+		// Skip HTTP/unknown pairs with no request data — connection closed
+		// with only response data (e.g., SSL handshake, health check).
+		// Emitting these produces garbage "HTTP" spans with no method/path.
+		// Only for HTTP/unknown: PG/MySQL/Redis have their own cleanup below.
+		if len(s.sendBuf) == 0 && (ss.protocol == "" || ss.protocol == "http") {
+			s.mu.Unlock()
+			return
+		}
+
 		// PG cleanup on close: skip noise spans from auth or admin messages.
 		if ss.protocol == "postgres" {
 			if !ss.pgReady {
@@ -518,6 +527,11 @@ func (r *Reassembler) CleanStale(maxIdle time.Duration) int {
 	for _, e := range stale {
 		s := e.ss.stream
 		s.mu.Lock()
+		// Skip HTTP/unknown stale streams with no request data — same guard as RemoveStream.
+		if len(s.sendBuf) == 0 && (e.ss.protocol == "" || e.ss.protocol == "http") {
+			s.mu.Unlock()
+			continue
+		}
 		// Guard against zero lastSend (stale stream with only recv data).
 		reqTime := s.lastSend
 		if reqTime.IsZero() {

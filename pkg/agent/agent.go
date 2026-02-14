@@ -84,7 +84,7 @@ type Agent struct {
 	connCtx         sync.Map // key: uint64(PID)<<32|uint64(uint32(FD)) -> *connTraceCtx
 	threadInboundFD sync.Map // key: uint64(PID)<<32|uint64(TID)        -> int32 (inbound FD)
 	fdCausal        sync.Map // key: uint64(PID)<<32|uint64(uint32(FD)) -> *causalEntry
-	pidActiveCtx    sync.Map // key: uint32(PID)                        -> int32 (most recent inbound FD)
+	pidActiveCtx    sync.Map // key: uint32(PID)                        -> *pidInboundSet (active inbound FDs)
 
 	mu            sync.Mutex
 	ctx           context.Context
@@ -110,6 +110,119 @@ type connTraceCtx struct {
 type causalEntry struct {
 	InboundFD int32
 	Timestamp time.Time
+}
+
+// pidInboundEntry tracks a single active inbound FD with its creation timestamp.
+type pidInboundEntry struct {
+	FD      int32
+	Created time.Time
+}
+
+// pidInboundSet is a fixed-size ring buffer tracking all active inbound FDs
+// for a single PID. Under concurrent requests, multiple inbound FDs may be
+// active simultaneously. BestMatch uses a temporal heuristic to pick the FD
+// whose creation time is closest to (but before) the query time.
+type pidInboundSet struct {
+	mu      sync.Mutex
+	entries [16]pidInboundEntry
+	count   int
+}
+
+// Add registers an inbound FD. If the FD already exists, its timestamp is
+// updated. If the ring is full, the oldest entry is evicted.
+func (s *pidInboundSet) Add(fd int32, t time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Update existing entry if FD is reused
+	for i := 0; i < s.count; i++ {
+		if s.entries[i].FD == fd {
+			s.entries[i].Created = t
+			return
+		}
+	}
+	if s.count < len(s.entries) {
+		s.entries[s.count] = pidInboundEntry{FD: fd, Created: t}
+		s.count++
+	} else {
+		// Evict oldest entry
+		oldest := 0
+		for i := 1; i < s.count; i++ {
+			if s.entries[i].Created.Before(s.entries[oldest].Created) {
+				oldest = i
+			}
+		}
+		s.entries[oldest] = pidInboundEntry{FD: fd, Created: t}
+	}
+}
+
+// Remove removes an inbound FD from the set.
+func (s *pidInboundSet) Remove(fd int32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := 0; i < s.count; i++ {
+		if s.entries[i].FD == fd {
+			s.entries[i] = s.entries[s.count-1]
+			s.count--
+			return
+		}
+	}
+}
+
+// BestMatch returns the inbound FD whose creation time is closest to (but
+// not after) the query time. With a single entry this is O(1). With multiple
+// entries it picks the most recently created FD that predates the query.
+func (s *pidInboundSet) BestMatch(queryTime time.Time) (int32, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.count == 0 {
+		return 0, false
+	}
+	if s.count == 1 {
+		return s.entries[0].FD, true
+	}
+	// Find closest FD created at or before queryTime
+	bestIdx := -1
+	for i := 0; i < s.count; i++ {
+		if !s.entries[i].Created.After(queryTime) {
+			if bestIdx == -1 || s.entries[i].Created.After(s.entries[bestIdx].Created) {
+				bestIdx = i
+			}
+		}
+	}
+	if bestIdx >= 0 {
+		return s.entries[bestIdx].FD, true
+	}
+	// All entries are after queryTime (clock skew): pick closest regardless
+	bestIdx = 0
+	for i := 1; i < s.count; i++ {
+		if s.entries[i].Created.Before(s.entries[bestIdx].Created) {
+			bestIdx = i
+		}
+	}
+	return s.entries[bestIdx].FD, true
+}
+
+// CleanStale removes entries older than maxAge.
+func (s *pidInboundSet) CleanStale(maxAge time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cutoff := time.Now().Add(-maxAge)
+	i := 0
+	for i < s.count {
+		if s.entries[i].Created.Before(cutoff) {
+			s.entries[i] = s.entries[s.count-1]
+			s.count--
+		} else {
+			i++
+		}
+	}
+}
+
+// Count returns the number of active entries.
+func (s *pidInboundSet) Count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count
 }
 
 // New creates a new agent from configuration.
@@ -371,11 +484,13 @@ func (a *Agent) Start(ctx context.Context) error {
 						InboundFD: iFD,
 						Timestamp: time.Now(),
 					})
-				} else if pidFD, ok := a.pidActiveCtx.Load(pid); ok {
+				} else if val, ok := a.pidActiveCtx.Load(pid); ok {
 					// PID-level fallback: Go goroutine TID mismatch.
 					// threadInboundFD has no entry for this TID, but
-					// pidActiveCtx knows the most recent inbound FD.
-					a.reassembler.PushCausalFD(pid, fd, pidFD.(int32))
+					// pidActiveCtx tracks active inbound FDs.
+					if bestFD, found := val.(*pidInboundSet).BestMatch(time.Now()); found {
+						a.reassembler.PushCausalFD(pid, fd, bestFD)
+					}
 				}
 				a.reassembler.AppendSend(pid, tid, fd, data, remoteAddr, remotePort, conn.IsSSL)
 			}
@@ -412,8 +527,11 @@ func (a *Agent) Start(ctx context.Context) error {
 				tidKey := uint64(pid)<<32 | uint64(tid)
 				a.threadInboundFD.Store(tidKey, fd)
 
-				// Update PID-level fallback (O(1) replacement for O(N) Range scan)
-				a.pidActiveCtx.Store(pid, fd)
+				// Update PID-level multi-entry tracking (handles concurrent inbound)
+				{
+					val, _ := a.pidActiveCtx.LoadOrStore(pid, &pidInboundSet{})
+					val.(*pidInboundSet).Add(fd, time.Now())
+				}
 
 				{
 					tctx := &connTraceCtx{Created: time.Now()}
@@ -533,6 +651,10 @@ func (a *Agent) Start(ctx context.Context) error {
 			// truly old context, and FD reuse naturally overwrites entries.
 			connKey := uint64(pid)<<32 | uint64(uint32(fd))
 			a.fdCausal.Delete(connKey)
+			// Do NOT remove from pidActiveCtx here — connCtx must survive
+			// briefly after close so that outbound CLIENT pairs still in
+			// flight can look up the inbound trace context via Layer 3.
+			// CleanStale handles purging old entries.
 			a.connTracker.Remove(pid, fd)
 		},
 
@@ -913,12 +1035,15 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 		}
 	}
 
-	// Layer 3: PID-level most-recent inbound FD (O(1) fallback).
-	// Replaces O(N) threadCtx.Range() scan. Works for Go goroutine TID mismatch.
+	// Layer 3: PID-level temporal match (handles concurrent inbound FDs).
+	// Uses BestMatch to pick the inbound FD whose creation time is closest
+	// to the pair's request time, fixing the single-FD overwrite bug.
 	if !found {
 		if val, ok := a.pidActiveCtx.Load(pair.PID); ok {
-			inboundFD = val.(int32)
-			found = true
+			if bestFD, matched := val.(*pidInboundSet).BestMatch(pair.RequestTime); matched {
+				inboundFD = bestFD
+				found = true
+			}
 		}
 	}
 
@@ -1509,20 +1634,20 @@ func (a *Agent) cleanupLoop(ctx context.Context) {
 				return true
 			})
 
-			// Clean stale pidActiveCtx entries (whose connCtx no longer exists)
+			// Clean stale pidActiveCtx entries
 			a.pidActiveCtx.Range(func(key, value any) bool {
-				pid, ok := key.(uint32)
+				_, ok := key.(uint32)
 				if !ok {
 					a.pidActiveCtx.Delete(key)
 					return true
 				}
-				fd, ok := value.(int32)
+				set, ok := value.(*pidInboundSet)
 				if !ok {
 					a.pidActiveCtx.Delete(key)
 					return true
 				}
-				connKey := uint64(pid)<<32 | uint64(uint32(fd))
-				if _, exists := a.connCtx.Load(connKey); !exists {
+				set.CleanStale(a.maxRequestDuration)
+				if set.Count() == 0 {
 					a.pidActiveCtx.Delete(key)
 				}
 				return true

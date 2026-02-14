@@ -916,3 +916,26 @@ func TestCausalFDQueue_RemoveStream(t *testing.T) {
 		t.Errorf("CausalInboundFD = %d, want 42", pairs[0].CausalInboundFD)
 	}
 }
+
+func TestRemoveStream_SkipsEmptyRequest(t *testing.T) {
+	// When only recv data exists (no AppendSend), RemoveStream should NOT
+	// emit a pair, because it would produce a garbage span with no method/path.
+	r := NewReassembler(zap.NewNop())
+
+	var pairs []*RequestPair
+	r.OnPair(func(p *RequestPair) {
+		pairs = append(pairs, p)
+	})
+
+	pid := uint32(100)
+	tid := uint32(200)
+	fd := int32(10)
+
+	// Only receive data, no send
+	r.AppendRecv(pid, tid, fd, []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"), "10.0.0.1", 80, false)
+	r.RemoveStream(pid, fd, tid)
+
+	if len(pairs) != 0 {
+		t.Errorf("expected 0 pairs from RemoveStream with empty request, got %d", len(pairs))
+	}
+}
