@@ -98,6 +98,7 @@ type connTraceCtx struct {
 	SpanID       string // injected via sk_msg → becomes CLIENT span's own spanID
 	ServerSpanID string // SERVER span's own spanID (CLIENT spans reference this as parent)
 	ParentSpanID string // from incoming traceparent header (cross-service linking)
+	ReadTID      uint32 // TID that read the inbound request (for sk_msg injection validation)
 	Created      time.Time
 }
 
@@ -452,7 +453,20 @@ func (a *Agent) Start(ctx context.Context) error {
 						tctx.SpanID = traces.GenerateSpanID()
 					}
 					tctx.ServerSpanID = traces.GenerateSpanID()
+					tctx.ReadTID = tid
 					a.connCtx.Store(connKey, tctx)
+
+					// Early registration: make trace context available for log
+					// correlation BEFORE the app writes any logs during request
+					// processing. Without this, logs are exported without trace
+					// context because spans complete after log writes.
+					if a.correlation != nil {
+						svcName := ""
+						if a.discoverer != nil {
+							svcName = a.discoverer.GetServiceName(pid)
+						}
+						a.correlation.RegisterSpanStart(pid, tid, tctx.TraceID, tctx.ServerSpanID, tctx.ParentSpanID, svcName, "", time.Now())
+					}
 				}
 				a.reassembler.AppendSend(pid, tid, fd, data, remoteAddr, remotePort, conn.IsSSL)
 				a.reassembler.SetDirection(pid, fd, 1) // 1=inbound; set after AppendSend creates the stream
@@ -463,9 +477,13 @@ func (a *Agent) Start(ctx context.Context) error {
 
 		OnClose: func(pid, tid uint32, fd int32, ts uint64) {
 			a.reassembler.RemoveStream(pid, fd, tid)
-			// Clean up FD-keyed context maps before removing from connTracker
+			// Clean up fdCausal and connTracker, but NOT connCtx.
+			// connCtx must survive briefly after close so that outbound
+			// CLIENT pairs still in flight can look up the inbound trace
+			// context via enrichPairContext Layer 3 (pidActiveCtx → connCtx).
+			// The 30-second stale check in enrichPairContext prevents using
+			// truly old context, and FD reuse naturally overwrites entries.
 			connKey := uint64(pid)<<32 | uint64(uint32(fd))
-			a.connCtx.Delete(connKey)
 			a.fdCausal.Delete(connKey)
 			a.connTracker.Remove(pid, fd)
 		},
@@ -848,8 +866,15 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 	// Outbound CLIENT span: pass the sk_msg-injected spanID so the
 	// CLIENT span uses it as its own spanID (matching what downstream sees).
 	// Only for HTTP/gRPC: sk_msg only injects traceparent into HTTP traffic.
+	// Only set InjectedSpanID when the outbound write TID matches the inbound
+	// read TID — sk_msg uses thread_trace_ctx keyed by PID+TID, so if the
+	// goroutine migrated to a different OS thread, sk_msg won't find the
+	// context and won't inject traceparent. In that case, the CLIENT span
+	// gets a regular SpanID and goes through the stitcher for cross-service linking.
 	if pair.Protocol == "http" || pair.Protocol == "grpc" || pair.Protocol == "genai" || pair.Protocol == "mcp" {
-		pair.InjectedSpanID = tctx.SpanID
+		if tctx.ReadTID != 0 && pair.TID == tctx.ReadTID {
+			pair.InjectedSpanID = tctx.SpanID
+		}
 		// Consume: generate a new SpanID for subsequent CLIENT spans on
 		// this connection. Without this, multiple outbound calls reusing
 		// the same FD would all get the same SpanID.
@@ -909,6 +934,16 @@ func (a *Agent) processSpan(span *traces.Span) {
 		span.Attributes["db.query.text"] = redact.NormalizeSQL(stmt)
 	}
 
+	// Apply trace merge: when stitching changed a SERVER's traceID to match
+	// a CLIENT's trace, propagate the change to future spans from the same
+	// downstream process (e.g., Java CLIENT → .NET spans get the correct
+	// traceID if they arrive after the stitch).
+	if a.traceStitcher != nil {
+		if newTraceID, ok := a.traceStitcher.TraceMerge(span.TraceID); ok {
+			span.TraceID = newTraceID
+		}
+	}
+
 	// Cross-service trace stitching: CLIENT spans may be deferred (stored
 	// for future matching). Deferred spans are NOT exported here — the
 	// stitcher will re-export them via OnStitchedSpan when matched, or
@@ -926,6 +961,7 @@ func (a *Agent) processSpan(span *traces.Span) {
 			span.PID, span.TID,
 			span.TraceID, span.SpanID, span.ParentSpanID,
 			span.ServiceName, span.Name,
+			span.StartTime,
 		)
 	}
 

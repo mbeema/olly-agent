@@ -304,8 +304,13 @@ func TestEnrichPairContext_ThreadFallback(t *testing.T) {
 	// Register outbound connection (CLIENT)
 	a.connTracker.Register(100, 10, 0, 80)
 
-	// Store inbound context on FD 5
+	// Store inbound context on FD 5, with ReadTID=200 (matching pair TID)
 	storeTestConnCtx(a, 100, 5, "trace-abc", "span-def", "server-ghi")
+	// Set ReadTID so TID match check passes (simulating same-thread read+write)
+	connKey := uint64(100)<<32 | uint64(uint32(int32(5)))
+	if val, ok := a.connCtx.Load(connKey); ok {
+		val.(*connTraceCtx).ReadTID = 200
+	}
 
 	// Store threadInboundFD: TID 200 was serving inbound FD 5
 	// (no fdCausal entry — simulates first write before causal is recorded)
@@ -327,9 +332,48 @@ func TestEnrichPairContext_ThreadFallback(t *testing.T) {
 	if pair.ParentSpanID != "server-ghi" {
 		t.Errorf("ParentSpanID = %q, want %q", pair.ParentSpanID, "server-ghi")
 	}
-	// HTTP should get InjectedSpanID
+	// HTTP should get InjectedSpanID when TID matches ReadTID
 	if pair.InjectedSpanID != "span-def" {
 		t.Errorf("InjectedSpanID = %q, want %q", pair.InjectedSpanID, "span-def")
+	}
+}
+
+func TestEnrichPairContext_TIDMismatch_NoInjectedSpanID(t *testing.T) {
+	a := newTestAgentWithConnTracker()
+
+	// Register outbound connection (CLIENT)
+	a.connTracker.Register(100, 10, 0, 80)
+
+	// Store inbound context on FD 5, with ReadTID=200
+	storeTestConnCtx(a, 100, 5, "trace-abc", "span-def", "server-ghi")
+	connKey := uint64(100)<<32 | uint64(uint32(int32(5)))
+	if val, ok := a.connCtx.Load(connKey); ok {
+		val.(*connTraceCtx).ReadTID = 200
+	}
+
+	// Store pidActiveCtx fallback (Layer 3)
+	a.pidActiveCtx.Store(uint32(100), int32(5))
+
+	pair := &reassembly.RequestPair{
+		PID:      100,
+		TID:      999, // Different TID — goroutine migrated
+		FD:       10,
+		Protocol: "http",
+	}
+
+	a.enrichPairContext(pair)
+
+	// Should still get ParentTraceID/ParentSpanID from pidActiveCtx fallback
+	if pair.ParentTraceID != "trace-abc" {
+		t.Errorf("ParentTraceID = %q, want %q", pair.ParentTraceID, "trace-abc")
+	}
+	if pair.ParentSpanID != "server-ghi" {
+		t.Errorf("ParentSpanID = %q, want %q", pair.ParentSpanID, "server-ghi")
+	}
+	// HTTP should NOT get InjectedSpanID when TID doesn't match ReadTID
+	// (goroutine migrated → sk_msg won't inject traceparent)
+	if pair.InjectedSpanID != "" {
+		t.Errorf("InjectedSpanID = %q, want empty (TID mismatch)", pair.InjectedSpanID)
 	}
 }
 

@@ -102,8 +102,13 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 	}
 
 	// Try to extract trace context from HTTP headers (R1.2: include tracestate).
-	// This covers: (a) traceparent injected by upstream sk_msg, (b) app-level headers.
-	if proto == protocol.ProtoHTTP || proto == protocol.ProtoGRPC || proto == protocol.ProtoGenAI || proto == protocol.ProtoMCP {
+	// Only for SERVER spans (inbound direction): the traceparent in the inbound
+	// request was injected by upstream sk_msg and references Olly-generated IDs.
+	// CLIENT spans must NOT extract traceparent from outbound request data:
+	// app frameworks (.NET Activity, Spring context) auto-inject traceparent
+	// with internal span IDs that Olly doesn't know about → orphan parents.
+	// CLIENT trace context comes from enrichPairContext (agent.go) instead.
+	if (proto == protocol.ProtoHTTP || proto == protocol.ProtoGRPC || proto == protocol.ProtoGenAI || proto == protocol.ProtoMCP) && pair.Direction == 1 {
 		traceCtx := protocol.ExtractTraceContext(pair.Request)
 		if traceCtx.TraceID != "" {
 			span.TraceID = traceCtx.TraceID

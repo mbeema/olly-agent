@@ -13,6 +13,7 @@ import pymongo
 from flask import Flask, jsonify, request
 
 ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://localhost:3001")
+CATALOG_SERVICE_URL = os.getenv("CATALOG_SERVICE_URL", "http://localhost:8081")
 MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:3002/mcp")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
@@ -555,6 +556,74 @@ def mcp_agent():
     except Exception as e:
         app.logger.error(f"MCP agent failed: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+### Full-Chain Endpoint ###
+# 5-service linear chain: Python → Go → Java → .NET → Node.js → Redis + PostgreSQL + MySQL
+
+
+@app.route("/fullchain", methods=["POST"])
+def fullchain():
+    """Full 5-service chain: Flask → order-service → catalog(Java) → pricing(.NET) → stock(Node) → Redis+PG.
+    Creates 12+ spans across 5 languages and 3 databases in a single trace."""
+    data = request.get_json(force=True)
+    user_id = data.get("user_id", 1)
+    sku = data.get("sku", "WDG-001")
+    qty = data.get("qty", 1)
+    app.logger.info(f"Fullchain: user={user_id}, sku={sku}, qty={qty}")
+    try:
+        req = urllib.request.Request(
+            f"{ORDER_SERVICE_URL}/api/fullchain",
+            data=json.dumps({"user_id": user_id, "sku": sku, "qty": qty}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req)
+        result = json.loads(resp.read())
+        app.logger.info(f"Fullchain success: order_id={result.get('order_id')}")
+        return jsonify(result), 201
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.fp else ""
+        app.logger.error(f"Fullchain failed: {e.code} {body[:200]}")
+        return jsonify(json.loads(body) if body else {"error": f"HTTP {e.code}"}), e.code
+    except urllib.error.URLError as e:
+        app.logger.error(f"Fullchain call failed: {e}")
+        return jsonify({"error": "order-service unavailable"}), 502
+
+
+### Cross-Language Shop Endpoints ###
+# These create a 4-hop trace chain: Python → Java → .NET → Node.js → Redis + PostgreSQL
+
+
+@app.route("/shop")
+def shop():
+    """Full 4-hop cross-language trace: Flask → Java catalog → .NET pricing → Node stock."""
+    sku = request.args.get("sku", "WDG-001")
+    app.logger.info(f"Shop lookup: sku={sku}")
+    try:
+        resp = urllib.request.urlopen(f"{CATALOG_SERVICE_URL}/api/catalog/{sku}")
+        data = json.loads(resp.read())
+        return jsonify(data)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.fp else ""
+        app.logger.error(f"Catalog lookup failed: {e.code} {body[:200]}")
+        return jsonify(json.loads(body) if body else {"error": f"HTTP {e.code}"}), e.code
+    except urllib.error.URLError as e:
+        app.logger.error(f"catalog-service call failed: {e}")
+        return jsonify({"error": "catalog-service unavailable"}), 502
+
+
+@app.route("/shop/all")
+def shop_all():
+    """List all catalog items with pricing and stock (calls Java catalog-service)."""
+    app.logger.info("Shop: listing all catalog items")
+    try:
+        resp = urllib.request.urlopen(f"{CATALOG_SERVICE_URL}/api/catalog")
+        data = json.loads(resp.read())
+        return jsonify(data)
+    except urllib.error.URLError as e:
+        app.logger.error(f"catalog-service call failed: {e}")
+        return jsonify({"error": "catalog-service unavailable"}), 502
 
 
 ### Redis Endpoints ###

@@ -10,6 +10,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/cilium/ebpf"
@@ -77,6 +81,11 @@ type eventReader struct {
 	// encrypted ciphertext (useless for protocol parsing). Only the SSL
 	// uprobe events carry plaintext.
 	sslFDs map[uint64]struct{}
+
+	// logFDRegistrar registers stdout/stderr FDs in the BPF log_fd_map
+	// for new PIDs, enabling the write() kprobe to emit EVENT_LOG_WRITE.
+	logFDRegistrar func(pid uint32, fd int32) error
+	logFDSeenPIDs  map[uint32]struct{}
 }
 
 // newEventReader creates a ring buffer reader for the given BPF map.
@@ -86,11 +95,12 @@ func newEventReader(eventsMap *ebpf.Map, callbacks hook.Callbacks, logger *zap.L
 		return nil, fmt.Errorf("create ring buffer reader: %w", err)
 	}
 	return &eventReader{
-		reader:       rd,
-		callbacks:    callbacks,
-		logger:       logger,
-		lastTraceCtx: make(map[uint64]*eventTraceCtx),
-		sslFDs:       make(map[uint64]struct{}),
+		reader:        rd,
+		callbacks:     callbacks,
+		logger:        logger,
+		lastTraceCtx:  make(map[uint64]*eventTraceCtx),
+		sslFDs:        make(map[uint64]struct{}),
+		logFDSeenPIDs: make(map[uint32]struct{}),
 	}, nil
 }
 
@@ -172,12 +182,14 @@ func (er *eventReader) dispatch(raw []byte) {
 			return
 		}
 		er.logger.Debug("dispatch CONNECT", zap.Uint32("pid", pid), zap.Int32("fd", fd), zap.Uint32("addr", remoteAddr), zap.Uint16("port", remotePort))
+		er.registerLogFDs(pid)
 		if er.callbacks.OnConnect != nil {
 			er.callbacks.OnConnect(pid, tid, fd, remoteAddr, remotePort, ts)
 		}
 
 	case eventAccept:
 		er.logger.Debug("dispatch ACCEPT", zap.Uint32("pid", pid), zap.Int32("fd", fd))
+		er.registerLogFDs(pid)
 		if er.callbacks.OnAccept != nil {
 			er.callbacks.OnAccept(pid, tid, fd, remoteAddr, remotePort, ts)
 		}
@@ -272,6 +284,71 @@ func (er *eventReader) getEventTraceContext(pid, tid uint32) (traceID, spanID st
 		return "", "", false
 	}
 	return ctx.TraceID, ctx.SpanID, true
+}
+
+// registerLogFDs scans /proc/<pid>/fd to find log file descriptors and
+// registers them in the BPF log_fd_map. This enables the write() kprobe
+// to emit EVENT_LOG_WRITE with PID+TID context for log-trace correlation.
+//
+// Registered FDs:
+//   - fd 1, 2 (stdout/stderr) — always, even if redirected to /dev/null
+//   - Any FD pointing to a *.log file or a file under /var/log/
+func (er *eventReader) registerLogFDs(pid uint32) {
+	if er.logFDRegistrar == nil {
+		return
+	}
+	if _, seen := er.logFDSeenPIDs[pid]; seen {
+		return
+	}
+	er.logFDSeenPIDs[pid] = struct{}{}
+
+	registered := 0
+
+	// Always register stdout and stderr.
+	for _, fd := range []int32{1, 2} {
+		if err := er.logFDRegistrar(pid, fd); err == nil {
+			registered++
+		}
+	}
+
+	// Scan /proc/<pid>/fd for log file FDs.
+	procFDDir := fmt.Sprintf("/proc/%d/fd", pid)
+	entries, err := os.ReadDir(procFDDir)
+	if err != nil {
+		er.logger.Debug("cannot scan proc fd dir", zap.Uint32("pid", pid), zap.Error(err))
+		return
+	}
+
+	for _, entry := range entries {
+		fdNum, err := strconv.Atoi(entry.Name())
+		if err != nil || fdNum <= 2 {
+			continue // skip non-numeric and already-registered 0,1,2
+		}
+
+		target, err := os.Readlink(filepath.Join(procFDDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+
+		// Register FDs pointing to log files: *.log or under /var/log/
+		if strings.HasSuffix(target, ".log") || strings.HasPrefix(target, "/var/log/") {
+			if err := er.logFDRegistrar(pid, int32(fdNum)); err == nil {
+				registered++
+				er.logger.Debug("registered log fd",
+					zap.Uint32("pid", pid),
+					zap.Int("fd", fdNum),
+					zap.String("path", target),
+				)
+			}
+		}
+	}
+
+	if registered > 0 {
+		er.logger.Debug("registered log FDs for pid",
+			zap.Uint32("pid", pid),
+			zap.Int("count", registered),
+		)
+	}
 }
 
 // close closes the ring buffer reader.

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -14,6 +15,8 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
 )
+
+var catalogServiceURL string
 
 var (
 	pgDB    *sql.DB // PostgreSQL — orders
@@ -68,12 +71,15 @@ func main() {
 		}
 	}
 
+	catalogServiceURL = getenv("CATALOG_SERVICE_URL", "http://localhost:8081")
+
 	http.HandleFunc("/api/health", healthHandler)
 	http.HandleFunc("/api/orders", ordersHandler)
 	http.HandleFunc("/api/orders/", orderByIDHandler)
 	http.HandleFunc("/api/inventory", inventoryHandler)
 	http.HandleFunc("/api/inventory/", inventoryBySkuHandler)
 	http.HandleFunc("/api/checkout", checkoutHandler)
+	http.HandleFunc("/api/fullchain", fullchainHandler)
 
 	port := getenv("PORT", "3001")
 	log.Printf("order-service listening on :%s", port)
@@ -397,5 +403,81 @@ func checkoutHandler(w http.ResponseWriter, r *http.Request) {
 		"qty":      req.Qty,
 		"amount":   amount,
 		"status":   "confirmed",
+	})
+}
+
+// --- Full-chain endpoint: Go → Java → .NET → Node.js → Redis + PostgreSQL ---
+
+func fullchainHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+
+	var req struct {
+		UserID int    `json:"user_id"`
+		SKU    string `json:"sku"`
+		Qty    int    `json:"qty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", 400)
+		return
+	}
+	if req.Qty <= 0 {
+		req.Qty = 1
+	}
+
+	// Step 1: Check MySQL inventory
+	var productName string
+	var price float64
+	var stock int
+	if mysqlDB != nil {
+		err := mysqlDB.QueryRow(
+			"SELECT name, price, stock FROM products WHERE sku = ?", req.SKU,
+		).Scan(&productName, &price, &stock)
+		if err != nil {
+			log.Printf("fullchain: MySQL inventory error: %v", err)
+		}
+	}
+
+	// Step 2: Call Java catalog-service → .NET pricing → Node.js stock → Redis + PG
+	catalogURL := fmt.Sprintf("%s/api/catalog/%s", catalogServiceURL, req.SKU)
+	resp, err := http.Get(catalogURL)
+	var catalog json.RawMessage
+	if err != nil {
+		log.Printf("fullchain: catalog-service error: %v", err)
+		catalog = json.RawMessage(`{"error":"catalog-service unreachable"}`)
+	} else {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		catalog = body
+	}
+
+	// Step 3: Create order in PostgreSQL
+	amount := price * float64(req.Qty)
+	var orderID int
+	err = pgDB.QueryRow(
+		"INSERT INTO orders (user_id, product, amount) VALUES ($1, $2, $3) RETURNING id",
+		req.UserID, fmt.Sprintf("%s (fullchain)", productName), amount,
+	).Scan(&orderID)
+	if err != nil {
+		log.Printf("fullchain: PostgreSQL order error: %v", err)
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	log.Printf("fullchain: order=%d user=%d sku=%s amount=%.2f", orderID, req.UserID, req.SKU, amount)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"order_id":  orderID,
+		"user_id":   req.UserID,
+		"sku":       req.SKU,
+		"qty":       req.Qty,
+		"amount":    amount,
+		"inventory": map[string]interface{}{"name": productName, "price": price, "stock": stock},
+		"catalog":   catalog,
+		"status":    "confirmed",
 	})
 }

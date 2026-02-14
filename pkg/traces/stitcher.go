@@ -39,6 +39,13 @@ type Stitcher struct {
 	pendingServers map[string][]*pendingSpan
 
 	callbacks []func(*Span)
+
+	// traceMerge records traceID replacements from stitching.
+	// When a SERVER's traceID is changed to match a CLIENT's trace,
+	// this map propagates the change to future spans from the same
+	// downstream process (e.g., Java CLIENT → .NET spans get the
+	// correct traceID if they arrive after the stitch).
+	traceMerge sync.Map // old traceID → new traceID
 }
 
 // pendingSpan is a span waiting for its matching counterpart.
@@ -78,6 +85,15 @@ func (s *Stitcher) OnStitchedSpan(fn func(*Span)) {
 	s.mu.Lock()
 	s.callbacks = append(s.callbacks, fn)
 	s.mu.Unlock()
+}
+
+// TraceMerge looks up whether a traceID has been replaced by stitching.
+// Returns the new traceID and true if a merge exists.
+func (s *Stitcher) TraceMerge(traceID string) (string, bool) {
+	if val, ok := s.traceMerge.Load(traceID); ok {
+		return val.(string), true
+	}
+	return "", false
 }
 
 // ProcessSpan examines a completed span for stitching opportunities.
@@ -219,16 +235,27 @@ func (s *Stitcher) processClientSpan(span *Span) bool {
 			goto store
 		}
 
-		// Stitch: CLIENT adopts SERVER's traceID (preserving the SERVER's
-		// intra-process children which share that traceID), and SERVER
-		// gets CLIENT as parent for the cross-service hierarchy.
-		// Clear CLIENT's ParentSpanID if traceID changes — the original
-		// parent is in a different trace and would be an orphaned reference.
-		if span.TraceID != bestMatch.span.TraceID {
-			span.ParentSpanID = ""
+		// Stitch direction depends on whether the CLIENT already has a parent.
+		// When CLIENT has a ParentSpanID, it's part of an existing trace
+		// hierarchy — SERVER should join CLIENT's trace to preserve the chain.
+		// When CLIENT has no parent, it adopts SERVER's traceID to preserve
+		// SERVER's intra-process children which share that traceID.
+		if span.ParentSpanID != "" {
+			// CLIENT has parent → SERVER joins CLIENT's trace
+			oldTraceID := bestMatch.span.TraceID
+			bestMatch.span.TraceID = span.TraceID
+			bestMatch.span.ParentSpanID = span.SpanID
+			if oldTraceID != span.TraceID {
+				s.traceMerge.Store(oldTraceID, span.TraceID)
+			}
+		} else {
+			// CLIENT has no parent → adopt SERVER's traceID
+			if span.TraceID != bestMatch.span.TraceID {
+				span.ParentSpanID = ""
+			}
+			span.TraceID = bestMatch.span.TraceID
+			bestMatch.span.ParentSpanID = span.SpanID
 		}
-		span.TraceID = bestMatch.span.TraceID
-		bestMatch.span.ParentSpanID = span.SpanID
 
 		span.SetAttribute("olly.stitched", "true")
 		bestMatch.span.SetAttribute("olly.stitched", "true")
@@ -298,12 +325,12 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 		return false
 	}
 
-	// Skip if the span already has a parent from traceparent header injection.
-	// Spans with parent from intra-process thread context (no olly.trace_source)
-	// should still be stitchable to unify trace IDs with upstream CLIENT spans.
-	if span.ParentSpanID != "" && span.Attributes["olly.trace_source"] == "traceparent" {
-		return false
-	}
+	// SERVER spans with traceparent parents still go through stitching.
+	// The traceparent may have been auto-injected by the upstream application
+	// framework (.NET Activity, Spring context) rather than by sk_msg, creating
+	// orphan parentSpanIDs that reference internal framework spans. Stitching
+	// overwrites these with the correct CLIENT→SERVER link. For sk_msg-injected
+	// traceparent, stitching produces the same correct result.
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -376,17 +403,24 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 			goto storeServer
 		}
 
-		// Stitch: CLIENT adopts SERVER's traceID (preserving the SERVER's
-		// intra-process children which share that traceID), and SERVER
-		// gets CLIENT as parent for the cross-service hierarchy.
+		// Stitch direction depends on whether the CLIENT already has a parent.
 		// H1 fix: bestMatch.span is already a clone (safe to mutate).
-		// Clear CLIENT's ParentSpanID if traceID changes — the original
-		// parent is in a different trace and would be an orphaned reference.
-		if bestMatch.span.TraceID != span.TraceID {
-			bestMatch.span.ParentSpanID = ""
+		if bestMatch.span.ParentSpanID != "" {
+			// CLIENT has parent → SERVER joins CLIENT's trace
+			oldTraceID := span.TraceID
+			span.TraceID = bestMatch.span.TraceID
+			span.ParentSpanID = bestMatch.span.SpanID
+			if oldTraceID != bestMatch.span.TraceID {
+				s.traceMerge.Store(oldTraceID, bestMatch.span.TraceID)
+			}
+		} else {
+			// CLIENT has no parent → CLIENT joins SERVER's trace
+			if bestMatch.span.TraceID != span.TraceID {
+				bestMatch.span.ParentSpanID = ""
+			}
+			bestMatch.span.TraceID = span.TraceID
+			span.ParentSpanID = bestMatch.span.SpanID
 		}
-		bestMatch.span.TraceID = span.TraceID
-		span.ParentSpanID = bestMatch.span.SpanID
 
 		bestMatch.span.SetAttribute("olly.stitched", "true")
 		span.SetAttribute("olly.stitched", "true")
@@ -407,7 +441,7 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 			delete(s.pendingClients, bestKey)
 		}
 
-		// Re-export the CLIENT clone with updated traceID
+		// Re-export the CLIENT clone (unchanged if it had parent, updated if root)
 		for _, cb := range s.callbacks {
 			cb(bestMatch.span)
 		}

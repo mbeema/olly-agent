@@ -11,6 +11,9 @@ tracing:
       - "app"
       - "order-service"
       - "mcp-server"
+      - "catalog-service"
+      - "pricing-service"
+      - "stock-service"
   protocols:
     http:
       enabled: true

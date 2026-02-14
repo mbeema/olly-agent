@@ -263,34 +263,58 @@ The correlation engine (`pkg/correlation/engine.go`) links log records to active
 
 ### How It Works
 
-```
-Span arrives ─> processSpan()
-                  ├─ correlation.RegisterSpanStart(PID, TID, traceID, spanID, ...)
-                  │    └─ activeSpans[PID<<32|TID] = SpanContext
-                  │    └─ correlateWithPendingLogs()  ← retroactive matching
-                  ├─ exporter.ExportSpan()
-                  └─ correlation.RegisterSpanEnd(PID, TID)
-                       └─ sets EndTime, removes from activeSpans, fires callbacks
+Correlation requires two things: (1) capturing application logs with PID+TID context, and (2) having trace context registered before the log is emitted.
 
-Log arrives ──> processLog()
-                  └─ correlation.EnrichLog(record)
-                       ├─ Try exact PID+TID match in activeSpans
-                       ├─ Try PID-only match (fallback for TID=0)
-                       └─ Buffer as pendingLog if no match yet
-                            └─ retroactively correlated when span registers
+#### Log Capture via eBPF
+
+Application logs are captured through the `write()` kprobe. The eBPF program maintains a `log_fd_map` --- an allowlist of file descriptors that should emit `EVENT_LOG_WRITE` events. When a `write()` syscall targets a registered FD, the kprobe emits the log payload with the kernel-provided PID and TID.
+
+FD registration happens automatically when a process first connects or accepts a connection:
+
 ```
+eventConnect/eventAccept ──> registerLogFDs(pid)
+                                ├─ Register fd 1 (stdout) and fd 2 (stderr)
+                                └─ Scan /proc/<pid>/fd via readlink
+                                     ├─ *.log files  → register
+                                     └─ /var/log/*    → register
+```
+
+This catches all common log destinations: stdout/stderr (containers), application log files (`app.log`, `flask.log`), and system log paths (`/var/log/`). Each PID is scanned once and the results are cached.
+
+#### Early Span Registration
+
+Trace context is registered with the correlation engine at **request arrival time** (in the `OnDataIn` callback), not at span completion. This ensures the correlation engine has an active span BEFORE any log writes happen during request processing.
+
+```
+HTTP request arrives
+    │
+    ├─ OnDataIn ──> connCtx created (traceID, serverSpanID)
+    │                 └─ correlation.RegisterSpanStart(PID, TID, traceID, spanID)
+    │                      └─ activeSpans[PID<<32|TID] = SpanContext
+    │
+    ├─ App processes request
+    │     └─ write() syscall ──> EVENT_LOG_WRITE ──> processLog()
+    │                              └─ correlation.EnrichLog(record)
+    │                                   └─ Match! → traceID + spanID attached
+    │
+    └─ Response sent ──> span completes ──> processSpan()
+                           └─ correlation.RegisterSpanStart(PID, TID, ..., span.StartTime)
+                                └─ updates with final span details + operation name
+```
+
+Without early registration, logs would always be exported before trace context was available (spans complete after the response is sent, but logs are written during request processing).
 
 ### Matching Strategies (in priority order)
 
 1. **Exact PID+TID** --- best accuracy; both process and thread match an active span within the time window
-2. **PID-only** --- fallback when TID is unavailable (TID=0); matches any span on the same process
+2. **PID-only** --- fallback when TID is unavailable (TID=0) or different (Go goroutine migration); matches any span on the same process
 3. **Retroactive** --- logs arriving before their span are buffered (up to 1000) and correlated when `RegisterSpanStart()` fires
 
 ### PID/TID Sources
 
 | Log Source | PID | TID | Accuracy |
 |------------|-----|-----|----------|
-| Hook-captured (`write()` syscall) | From kernel | From kernel | Exact |
+| Hook-captured (`write()` kprobe) | From kernel | From kernel | Exact |
 | JSON logs (`"pid":N, "tid":N`) | Parsed from field | Parsed from field | Exact |
 | Syslog (`process[pid]: ...`) | From header | Extracted from body | PID exact, TID best-effort |
 | Plain text (`pid=N tid=N`) | Regex extraction | Regex extraction | Best-effort |
@@ -301,13 +325,16 @@ The parser recognizes common PID/TID patterns in log text: `pid=123`, `PID 123`,
 ### Enrichment Output
 
 When a log is correlated, `SetTraceContext()` populates:
-- `LogRecord.TraceID`, `.SpanID`, `.ServiceName` --- used by OTLP export
-- `Attributes["trace_id"]`, `["span_id"]`, `["service.name"]` --- structured fields for Loki/Elasticsearch/Splunk
+- `LogRecord.TraceID`, `.SpanID`, `.ServiceName` --- used by OTLP export (`traceId`/`spanId` proto fields)
+- `Attributes["trace_id"]`, `["span_id"]` --- log record attributes surfaced as detected fields in Grafana Loki
+- `Attributes["service.name"]` --- links logs to the originating service
 - `Attributes["traceparent"]` --- W3C format `00-{traceID}-{spanID}-01` for downstream systems without OTLP support
+
+The dual export (OTLP proto fields + attributes) ensures trace context is visible across different backends. Grafana Loki stores OTLP `traceId` as structured metadata, but surfaces `trace_id` attributes as detected fields --- enabling "View trace" navigation from Loki to Tempo.
 
 ### Time Window
 
-The correlation window (default: 100ms, configurable via `correlation.window`) defines how far a log's timestamp can be from a span's start/end time and still be considered part of that span. Span lifecycle is tracked precisely: `RegisterSpanEnd()` is called immediately after export, so the `EndTime` is accurate and spans are removed from the active set promptly.
+The correlation window (default: 100ms, configurable via `correlation.window`) defines how far a log's timestamp can be from a span's start/end time and still be considered part of that span. The `startTime` parameter passed to `RegisterSpanStart` uses the actual request arrival time (from eBPF event timestamp), not the registration call time, ensuring the window is accurate even for slow requests.
 
 ## Challenges & Known Limitations
 

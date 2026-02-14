@@ -5,7 +5,7 @@ extensions:
   basicauth/grafana_cloud:
     client_auth:
       username: "780407"
-      password: "glc_eyJvIjoiOTgxNDIzIiwibiI6InN0YWNrLTc4MDQwNy1pbnRlZ3JhdGlvbi0wMjEzIiwiayI6InU4WTdsbDZJSng0QTUxSW5POHE5MTlHSiIsIm0iOnsiciI6InByb2QtdXMtZWFzdC0wIn19"
+      password: "glc_eyJvIjoiOTgxNDIzIiwibiI6InN0YWNrLTc4MDQwNy1pbnRlZ3JhdGlvbi1lZWVlIiwiayI6IjBhc205VTZPODV5TDJ3NmQxT2xjM005UyIsIm0iOnsiciI6InByb2QtdXMtZWFzdC0wIn19"
 
 receivers:
   otlp:

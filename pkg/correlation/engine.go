@@ -72,8 +72,12 @@ func (e *Engine) OnSpanComplete(fn func(*SpanContext)) {
 }
 
 // RegisterSpanStart records the start of a span for correlation.
-func (e *Engine) RegisterSpanStart(pid, tid uint32, traceID, spanID, parentSpanID, serviceName, operation string) {
+func (e *Engine) RegisterSpanStart(pid, tid uint32, traceID, spanID, parentSpanID, serviceName, operation string, startTime time.Time) {
 	key := makeKey(pid, tid)
+
+	if startTime.IsZero() {
+		startTime = time.Now()
+	}
 
 	ctx := &SpanContext{
 		TraceID:      traceID,
@@ -81,7 +85,7 @@ func (e *Engine) RegisterSpanStart(pid, tid uint32, traceID, spanID, parentSpanI
 		ParentSpanID: parentSpanID,
 		PID:          pid,
 		TID:          tid,
-		StartTime:    time.Now(),
+		StartTime:    startTime,
 		ServiceName:  serviceName,
 		Operation:    operation,
 	}

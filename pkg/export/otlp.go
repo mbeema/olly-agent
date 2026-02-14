@@ -348,7 +348,7 @@ func (e *OTLPExporter) convertLogRecord(l *LogRecord) *logspb.LogRecord {
 
 	// R3.4: Add log source attributes
 	// Clone attributes to avoid mutating the input (B4 fix: race between exporters)
-	attrs := make(map[string]interface{}, len(l.Attributes)+3)
+	attrs := make(map[string]interface{}, len(l.Attributes)+5)
 	for k, v := range l.Attributes {
 		attrs[k] = v
 	}
@@ -358,6 +358,15 @@ func (e *OTLPExporter) convertLogRecord(l *LogRecord) *logspb.LogRecord {
 	}
 	if l.Source != "" {
 		attrs["source"] = l.Source
+	}
+	// Also add trace context as attributes for Loki/Grafana compatibility.
+	// The OTLP proto traceId/spanId fields are stored in Loki structured
+	// metadata, but attributes are more reliably surfaced as detected fields.
+	if l.TraceID != "" {
+		attrs["trace_id"] = l.TraceID
+	}
+	if l.SpanID != "" {
+		attrs["span_id"] = l.SpanID
 	}
 
 	for k, v := range attrs {

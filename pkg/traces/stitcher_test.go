@@ -79,7 +79,7 @@ func TestStitcherMatchesClientToServer(t *testing.T) {
 	}
 }
 
-func TestStitcherSkipsAlreadyParented(t *testing.T) {
+func TestStitcherStitchesTraceparentServer(t *testing.T) {
 	logger := zap.NewNop()
 	s := NewStitcher(500*time.Millisecond, logger)
 
@@ -98,11 +98,13 @@ func TestStitcherSkipsAlreadyParented(t *testing.T) {
 		},
 	}
 
-	// SERVER span already has a parent from traceparent header injection
+	// SERVER span has a parent from traceparent header — may be from app framework
+	// (.NET Activity auto-propagation) rather than sk_msg. Stitcher should still
+	// process it to overwrite potentially orphan parentSpanID with correct link.
 	serverSpan := &Span{
 		TraceID:      "aaaa0000aaaa0000aaaa0000aaaa0000",
 		SpanID:       "dddd0000dddd0000",
-		ParentSpanID: "bbbb0000bbbb0000",
+		ParentSpanID: "cccc0000cccc0000", // possibly orphan from .NET Activity
 		Kind:         SpanKindServer,
 		StartTime:    clientSpan.StartTime.Add(5 * time.Millisecond),
 		Protocol:     "http",
@@ -113,13 +115,16 @@ func TestStitcherSkipsAlreadyParented(t *testing.T) {
 	s.ProcessSpan(clientSpan)
 	s.ProcessSpan(serverSpan)
 
-	// Should NOT stitch: parent came from actual traceparent header
-	if serverSpan.Attributes["olly.stitched"] == "true" {
-		t.Error("should not stitch spans that already have a traceparent parent")
+	// SERVER should be stitched: traceparent parent may be from app framework,
+	// stitcher overwrites with correct CLIENT→SERVER link
+	if serverSpan.Attributes["olly.stitched"] != "true" {
+		t.Error("should stitch SERVER span even with traceparent parent")
+	}
+	if serverSpan.ParentSpanID != "bbbb0000bbbb0000" {
+		t.Errorf("expected SERVER parentSpanID=bbbb0000bbbb0000, got %s", serverSpan.ParentSpanID)
 	}
 
-	// But a span with parent from thread context (no olly.trace_source) SHOULD be stitchable.
-	// Use a fresh stitcher to avoid ambiguity with the leftover pending CLIENT above.
+	// SERVER span with parent from thread context (no olly.trace_source) SHOULD also be stitchable.
 	s2 := NewStitcher(500*time.Millisecond, logger)
 	serverSpan2 := &Span{
 		TraceID:      "cccc0000cccc0000cccc0000cccc0000",
@@ -153,12 +158,9 @@ func TestStitcherSkipsAlreadyParented(t *testing.T) {
 	s2.ProcessSpan(clientSpan2)
 	s2.ProcessSpan(serverSpan2)
 
-	// Should be stitched: parent was from thread context, not traceparent
-	// SERVER (arriving span) gets stitched attributes
 	if serverSpan2.Attributes["olly.stitched"] != "true" {
 		t.Error("should stitch spans whose parent came from thread context (no traceparent)")
 	}
-	// SERVER (arriving) gets CLIENT's spanID as parent
 	if serverSpan2.ParentSpanID != "1111000011110000" {
 		t.Errorf("expected SERVER2 parentSpanID=1111000011110000, got %s", serverSpan2.ParentSpanID)
 	}
@@ -1174,26 +1176,31 @@ func TestStitcherMCPClientServerMatching(t *testing.T) {
 		t.Fatal("SERVER spans should never be deferred")
 	}
 
-	// Verify cross-service stitching
+	// Verify cross-service stitching: CLIENT has parent, so SERVER joins CLIENT's trace
 	if serverSpan.ParentSpanID != clientSpan.SpanID {
 		t.Errorf("SERVER.ParentSpanID should be CLIENT.SpanID: got %q, want %q",
 			serverSpan.ParentSpanID, clientSpan.SpanID)
 	}
+	// SERVER should adopt CLIENT's traceID (CLIENT has parent → SERVER joins CLIENT's trace)
+	if serverSpan.TraceID != "aaaa0000aaaa0000aaaa0000aaaa0000" {
+		t.Errorf("SERVER should adopt CLIENT's traceID: got %q, want %q",
+			serverSpan.TraceID, "aaaa0000aaaa0000aaaa0000aaaa0000")
+	}
 
-	// CLIENT should adopt SERVER's traceID
+	// CLIENT clone should be re-exported unchanged (keeps its original traceID + parent)
 	if len(stitchedSpans) != 1 {
 		t.Fatalf("expected 1 stitched span (CLIENT clone), got %d", len(stitchedSpans))
 	}
 	stitchedClient := stitchedSpans[0]
-	if stitchedClient.TraceID != serverSpan.TraceID {
-		t.Errorf("stitched CLIENT should adopt SERVER's traceID: got %q, want %q",
-			stitchedClient.TraceID, serverSpan.TraceID)
+	if stitchedClient.TraceID != "aaaa0000aaaa0000aaaa0000aaaa0000" {
+		t.Errorf("stitched CLIENT should keep original traceID: got %q, want %q",
+			stitchedClient.TraceID, "aaaa0000aaaa0000aaaa0000aaaa0000")
 	}
 
-	// CLIENT's ParentSpanID should be cleared (parent is in a different trace now)
-	if stitchedClient.ParentSpanID != "" {
-		t.Errorf("stitched CLIENT's ParentSpanID should be cleared (cross-trace ref): got %q",
-			stitchedClient.ParentSpanID)
+	// CLIENT's ParentSpanID should be preserved (it's part of the Flask trace)
+	if stitchedClient.ParentSpanID != "cccc0000cccc0000" {
+		t.Errorf("stitched CLIENT's ParentSpanID should be preserved: got %q, want %q",
+			stitchedClient.ParentSpanID, "cccc0000cccc0000")
 	}
 
 	// Both should have stitched attribute
@@ -1203,6 +1210,191 @@ func TestStitcherMCPClientServerMatching(t *testing.T) {
 	if stitchedClient.Attributes["olly.stitched"] != "true" {
 		t.Error("CLIENT should have olly.stitched=true")
 	}
+}
+
+func TestStitcherParentedClientPreservesTrace(t *testing.T) {
+	logger := zap.NewNop()
+
+	t.Run("client_first_server_second", func(t *testing.T) {
+		s := NewStitcher(500*time.Millisecond, logger)
+		var stitched *Span
+		s.OnStitchedSpan(func(span *Span) {
+			stitched = span
+		})
+
+		now := time.Now()
+		// CLIENT span that has a parent (part of Go order-service trace)
+		clientSpan := &Span{
+			TraceID:      "aaaa0000aaaa0000aaaa0000aaaa0000",
+			SpanID:       "bbbb0000bbbb0000",
+			ParentSpanID: "1111000011110000", // Go SERVER's spanID
+			Kind:         SpanKindClient,
+			StartTime:    now,
+			RemoteAddr:   "127.0.0.1",
+			RemotePort:   8081,
+			Protocol:     "http",
+			PID:          1000,
+			Attributes: map[string]string{
+				"http.request.method": "GET",
+				"url.path":            "/api/catalog/WDG-001",
+			},
+			ServiceName: "order-service",
+		}
+
+		// SERVER span from Java catalog-service (no traceparent — sk_msg failed)
+		serverSpan := &Span{
+			TraceID:   "cccc0000cccc0000cccc0000cccc0000",
+			SpanID:    "dddd0000dddd0000",
+			Kind:      SpanKindServer,
+			StartTime: now.Add(2 * time.Millisecond),
+			Protocol:  "http",
+			PID:       2000,
+			Attributes: map[string]string{
+				"http.request.method": "GET",
+				"url.path":            "/api/catalog/WDG-001",
+			},
+			ServiceName: "catalog-service",
+		}
+
+		// CLIENT deferred (no "injected" marker due to TID mismatch)
+		s.ProcessSpan(clientSpan)
+		s.ProcessSpan(serverSpan)
+
+		// SERVER should join CLIENT's trace (CLIENT has parent)
+		if serverSpan.TraceID != "aaaa0000aaaa0000aaaa0000aaaa0000" {
+			t.Errorf("SERVER should adopt CLIENT traceID, got %s", serverSpan.TraceID)
+		}
+		if serverSpan.ParentSpanID != "bbbb0000bbbb0000" {
+			t.Errorf("SERVER parent should be CLIENT spanID, got %s", serverSpan.ParentSpanID)
+		}
+
+		// CLIENT clone should be re-exported with preserved parent
+		if stitched == nil {
+			t.Fatal("expected stitched callback")
+		}
+		if stitched.ParentSpanID != "1111000011110000" {
+			t.Errorf("CLIENT parent should be preserved, got %s", stitched.ParentSpanID)
+		}
+		if stitched.TraceID != "aaaa0000aaaa0000aaaa0000aaaa0000" {
+			t.Errorf("CLIENT traceID should be preserved, got %s", stitched.TraceID)
+		}
+	})
+
+	t.Run("server_first_client_second", func(t *testing.T) {
+		s := NewStitcher(500*time.Millisecond, logger)
+		var stitched *Span
+		s.OnStitchedSpan(func(span *Span) {
+			stitched = span
+		})
+
+		now := time.Now()
+		// SERVER arrives first (Java catalog-service, no traceparent)
+		serverSpan := &Span{
+			TraceID:   "cccc0000cccc0000cccc0000cccc0000",
+			SpanID:    "dddd0000dddd0000",
+			Kind:      SpanKindServer,
+			StartTime: now.Add(2 * time.Millisecond),
+			Protocol:  "http",
+			PID:       2000,
+			Attributes: map[string]string{
+				"http.request.method": "GET",
+				"url.path":            "/api/catalog/WDG-001",
+			},
+			ServiceName: "catalog-service",
+		}
+
+		// CLIENT arrives second (has parent in Go trace)
+		clientSpan := &Span{
+			TraceID:      "aaaa0000aaaa0000aaaa0000aaaa0000",
+			SpanID:       "bbbb0000bbbb0000",
+			ParentSpanID: "1111000011110000",
+			Kind:         SpanKindClient,
+			StartTime:    now,
+			RemoteAddr:   "127.0.0.1",
+			RemotePort:   8081,
+			Protocol:     "http",
+			PID:          1000,
+			Attributes: map[string]string{
+				"http.request.method": "GET",
+				"url.path":            "/api/catalog/WDG-001",
+			},
+			ServiceName: "order-service",
+		}
+
+		s.ProcessSpan(serverSpan)
+		s.ProcessSpan(clientSpan)
+
+		// CLIENT should keep its traceID and parent (not adopt SERVER's traceID)
+		if clientSpan.TraceID != "aaaa0000aaaa0000aaaa0000aaaa0000" {
+			t.Errorf("CLIENT traceID should be preserved, got %s", clientSpan.TraceID)
+		}
+		if clientSpan.ParentSpanID != "1111000011110000" {
+			t.Errorf("CLIENT parent should be preserved, got %s", clientSpan.ParentSpanID)
+		}
+
+		// SERVER clone (re-exported via callback) should adopt CLIENT's traceID
+		if stitched == nil {
+			t.Fatal("expected stitched callback")
+		}
+		if stitched.TraceID != "aaaa0000aaaa0000aaaa0000aaaa0000" {
+			t.Errorf("SERVER clone should adopt CLIENT traceID, got %s", stitched.TraceID)
+		}
+		if stitched.ParentSpanID != "bbbb0000bbbb0000" {
+			t.Errorf("SERVER clone parent should be CLIENT spanID, got %s", stitched.ParentSpanID)
+		}
+	})
+
+	t.Run("rootless_client_adopts_server", func(t *testing.T) {
+		// When CLIENT has NO parent, existing behavior: CLIENT adopts SERVER's traceID
+		s := NewStitcher(500*time.Millisecond, logger)
+		var stitched *Span
+		s.OnStitchedSpan(func(span *Span) {
+			stitched = span
+		})
+
+		now := time.Now()
+		clientSpan := &Span{
+			TraceID:    "aaaa0000aaaa0000aaaa0000aaaa0000",
+			SpanID:     "bbbb0000bbbb0000",
+			Kind:       SpanKindClient,
+			StartTime:  now,
+			RemoteAddr: "127.0.0.1",
+			RemotePort: 8081,
+			Protocol:   "http",
+			PID:        1000,
+			Attributes: map[string]string{
+				"http.request.method": "GET",
+				"url.path":            "/api/catalog/WDG-001",
+			},
+		}
+
+		serverSpan := &Span{
+			TraceID:   "cccc0000cccc0000cccc0000cccc0000",
+			SpanID:    "dddd0000dddd0000",
+			Kind:      SpanKindServer,
+			StartTime: now.Add(2 * time.Millisecond),
+			Protocol:  "http",
+			PID:       2000,
+			Attributes: map[string]string{
+				"http.request.method": "GET",
+				"url.path":            "/api/catalog/WDG-001",
+			},
+		}
+
+		s.ProcessSpan(clientSpan)
+		s.ProcessSpan(serverSpan)
+
+		// CLIENT has no parent → adopts SERVER's traceID (existing behavior)
+		if stitched == nil {
+			t.Fatal("expected stitched callback")
+		}
+		if stitched.TraceID != "cccc0000cccc0000cccc0000cccc0000" {
+			t.Errorf("rootless CLIENT should adopt SERVER traceID, got %s", stitched.TraceID)
+		}
+		if serverSpan.ParentSpanID != "bbbb0000bbbb0000" {
+			t.Errorf("SERVER parent should be CLIENT spanID, got %s", serverSpan.ParentSpanID)
+		}
+	})
 }
 
 func TestStitcherAmbiguityGuardClientSide(t *testing.T) {

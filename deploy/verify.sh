@@ -120,7 +120,7 @@ if [ -f /var/log/otel/logs.json ]; then
     TOTAL_LOGS=$(grep -c '"body"' /var/log/otel/logs.json 2>/dev/null || echo 0)
     HOOK_LOGS=$(grep -c '"source","value":{"stringValue":"hook"}' /var/log/otel/logs.json 2>/dev/null || echo 0)
     FILE_LOGS=$(grep -c '"source","value":{"stringValue":"file"}' /var/log/otel/logs.json 2>/dev/null || echo 0)
-    WITH_TRACE=$(grep -c '"traceId":"[0-9a-f]\{16,\}"' /var/log/otel/logs.json 2>/dev/null || echo 0)
+    WITH_TRACE=$(grep -c '"traceId":"[A-Za-z0-9+/=]\{4,\}"' /var/log/otel/logs.json 2>/dev/null || echo 0)
     echo "Total logs: $TOTAL_LOGS (hook: $HOOK_LOGS, file: $FILE_LOGS)"
     echo "Logs with traceId: $WITH_TRACE"
     if [ "$HOOK_LOGS" -gt 0 ]; then

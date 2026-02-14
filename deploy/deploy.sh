@@ -66,11 +66,30 @@ sudo systemctl start mongod
 # Unpack
 cd /tmp
 tar xzf olly-deploy.tar.gz
+# Install runtimes for cross-language demo services
+if ! command -v javac &> /dev/null; then
+    echo "Installing Java JDK (Corretto 17)..."
+    sudo dnf install -y java-17-amazon-corretto-devel
+fi
+if ! command -v node &> /dev/null; then
+    echo "Installing Node.js..."
+    sudo dnf install -y nodejs npm
+fi
+if ! command -v dotnet &> /dev/null; then
+    echo "Installing .NET 8 SDK..."
+    sudo rpm --import https://packages.microsoft.com/keys/microsoft.asc
+    sudo dnf install -y https://packages.microsoft.com/config/centos/9/packages-microsoft-prod.rpm 2>/dev/null || true
+    sudo dnf install -y dotnet-sdk-8.0 || echo "WARN: .NET SDK install failed — pricing-service will be skipped"
+fi
+
 # Stop existing processes
 sudo pkill -9 -x olly 2>/dev/null || true
 sudo pkill -9 -f 'python3.*app.py' 2>/dev/null || true
 sudo pkill -9 -x order-service 2>/dev/null || true
 sudo pkill -9 -x mcp-server 2>/dev/null || true
+sudo pkill -9 -f 'java.*CatalogService' 2>/dev/null || true
+sudo pkill -9 -f 'pricing-service' 2>/dev/null || true
+sudo pkill -9 -f 'node.*server.js' 2>/dev/null || true
 sleep 3
 
 # Clear old trace data for clean analysis
@@ -104,7 +123,27 @@ sudo mysql -u root inventory < olly-deploy/demo-app/init_mysql.sql || true
 
 # Install Python deps (as root — app runs as root)
 sudo pip3 install -r olly-deploy/demo-app/requirements.txt
-sudo cp -r olly-deploy/demo-app /opt/olly/demo-app
+
+# Prepare cross-language services in tarball dir before copy
+# Node.js: npm install in tarball so node_modules gets copied
+if [ -d olly-deploy/demo-app/stock-service ]; then
+    echo "Installing Node.js deps for stock-service..."
+    cd olly-deploy/demo-app/stock-service
+    npm install --production 2>/dev/null || true
+    cd /tmp
+fi
+
+# Java: always recompile on EC2 to match local JDK version
+if [ -d olly-deploy/demo-app/catalog-service ] && command -v javac &> /dev/null; then
+    echo "Compiling Java catalog-service..."
+    cd olly-deploy/demo-app/catalog-service
+    javac CatalogService.java
+    cd /tmp
+fi
+
+# Copy demo-app contents (use /. to merge into existing dir, not nest)
+sudo rm -rf /opt/olly/demo-app/*
+sudo cp -r olly-deploy/demo-app/. /opt/olly/demo-app/
 
 # Start olly agent (eBPF hooks attach automatically — no LD_PRELOAD needed)
 sudo bash -c 'nohup /opt/olly/olly --config-dir /opt/olly/configs --log-level debug > /var/log/olly.log 2>&1 &'
@@ -126,6 +165,45 @@ if [ -f olly-deploy/mcp-server ]; then
     sleep 1
 fi
 
+# Start cross-language demo services (reverse dependency order)
+
+# Node.js stock-service (leaf — depends on Redis + PostgreSQL)
+if [ -d /opt/olly/demo-app/stock-service ]; then
+    echo "Starting stock-service (Node.js)..."
+    sudo bash -c 'SERVICE_NAME=stock-service nohup node /opt/olly/demo-app/stock-service/server.js > /var/log/demo-app/stock-service.log 2>&1 &'
+    sleep 1
+fi
+
+# .NET pricing-service (depends on stock-service)
+if [ -d olly-deploy/pricing-service-publish ]; then
+    echo "Starting pricing-service (.NET self-contained)..."
+    sudo mkdir -p /opt/olly/pricing-service
+    sudo cp -r olly-deploy/pricing-service-publish/. /opt/olly/pricing-service/
+    sudo chmod +x /opt/olly/pricing-service/pricing-service
+    sudo bash -c 'SERVICE_NAME=pricing-service nohup /opt/olly/pricing-service/pricing-service > /var/log/demo-app/pricing-service.log 2>&1 &'
+    sleep 1
+elif [ -f /opt/olly/demo-app/pricing-service/Program.cs ] && command -v dotnet &> /dev/null; then
+    echo "Building and starting pricing-service (.NET)..."
+    cd /opt/olly/demo-app/pricing-service
+    sudo dotnet publish -c Release -o /opt/olly/pricing-service 2>&1 || true
+    cd /tmp
+    if [ -f /opt/olly/pricing-service/pricing-service ]; then
+        sudo bash -c 'SERVICE_NAME=pricing-service nohup /opt/olly/pricing-service/pricing-service > /var/log/demo-app/pricing-service.log 2>&1 &'
+        sleep 1
+    else
+        echo "WARN: pricing-service build failed"
+    fi
+else
+    echo "WARN: .NET SDK not available — skipping pricing-service"
+fi
+
+# Java catalog-service (depends on pricing-service)
+if [ -f /opt/olly/demo-app/catalog-service/CatalogService.class ]; then
+    echo "Starting catalog-service (Java)..."
+    sudo bash -c 'SERVICE_NAME=catalog-service nohup java -Xmx128m -Xms64m -cp /opt/olly/demo-app/catalog-service CatalogService > /var/log/demo-app/catalog-service.log 2>&1 &'
+    sleep 1
+fi
+
 # Start demo app (no wrapper needed — eBPF observes all processes automatically)
 # Pass OPENAI_API_KEY if set on the host (for GenAI monitoring demo)
 OPENAI_KEY_FILE="/opt/olly/.openai_key"
@@ -139,8 +217,13 @@ sleep 3
 
 echo "=== Deployment complete ==="
 echo "Demo app: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):5000"
-echo "Olly agent PID: $(pgrep -x olly || echo 'not running')"
-echo "Demo app PID:   $(pgrep -f 'python3.*app.py' || echo 'not running')"
+echo "Olly agent PID:     $(pgrep -x olly || echo 'not running')"
+echo "Demo app PID:       $(pgrep -f 'python3.*app.py' || echo 'not running')"
+echo "Order-service PID:  $(pgrep -x order-service || echo 'not running')"
+echo "MCP-server PID:     $(pgrep -x mcp-server || echo 'not running')"
+echo "Catalog-svc PID:    $(pgrep -f 'java.*CatalogService' || echo 'not running')"
+echo "Pricing-svc PID:    $(pgrep -f 'pricing-service' || echo 'not running')"
+echo "Stock-svc PID:      $(pgrep -f 'node.*server.js' || echo 'not running')"
 REMOTE_SCRIPT
 
 echo ""

@@ -55,6 +55,19 @@ for i in $(seq 1 "$ITERATIONS"); do
         -H "Content-Type: application/json" \
         -d "{\"user_id\":1,\"sku\":\"$SKU\",\"qty\":1}" > /dev/null || true
 
+    # Full 5-service chain: Flask → Go → Java → .NET → Node.js → Redis + PG + MySQL
+    curl -s -X POST "$BASE_URL/fullchain" \
+        -H "Content-Type: application/json" \
+        -d "{\"user_id\":1,\"sku\":\"$SKU\",\"qty\":1}" > /dev/null || true
+
+    # Cross-language: 4-hop chain (Flask → Java → .NET → Node.js → Redis + PostgreSQL)
+    curl -s "$BASE_URL/shop?sku=$SKU" > /dev/null || true
+
+    # Cross-language: List all catalog items (every 5th iteration)
+    if [ $((i % 5)) -eq 0 ]; then
+        curl -s "$BASE_URL/shop/all" > /dev/null || true
+    fi
+
     # Cross-service with explicit traceparent (upstream-propagated)
     TRACE_ID=$(openssl rand -hex 16 2>/dev/null || python3 -c 'import secrets; print(secrets.token_hex(16))')
     SPAN_ID=$(openssl rand -hex 8 2>/dev/null || python3 -c 'import secrets; print(secrets.token_hex(8))')

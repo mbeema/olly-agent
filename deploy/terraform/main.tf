@@ -51,6 +51,14 @@ resource "aws_security_group" "olly_demo" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # Cross-language demo services (Java, .NET, Node.js)
+  ingress {
+    from_port   = 8081
+    to_port     = 8083
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   # OTLP gRPC
   ingress {
     from_port   = 4317
@@ -99,7 +107,12 @@ resource "aws_instance" "olly_demo" {
 
     # Install dependencies
     dnf update -y
-    dnf install -y gcc make git postgresql16-server postgresql16 mariadb105-server
+    dnf install -y gcc make git postgresql16-server postgresql16 mariadb105-server java-17-amazon-corretto-devel nodejs npm
+
+    # Install .NET 8 SDK for pricing-service
+    rpm --import https://packages.microsoft.com/keys/microsoft.asc
+    dnf install -y https://packages.microsoft.com/config/centos/9/packages-microsoft-prod.rpm || true
+    dnf install -y dotnet-sdk-8.0 || true
 
     # Install Go 1.23
     curl -Lo /tmp/go.tar.gz https://go.dev/dl/go1.23.4.linux-amd64.tar.gz

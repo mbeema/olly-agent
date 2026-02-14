@@ -82,6 +82,13 @@ func (p *Provider) Start(ctx context.Context, callbacks hook.Callbacks) error {
 		return fmt.Errorf("create event reader: %w", err)
 	}
 
+	// Wire log FD registration: when the event reader sees a new PID from
+	// connect/accept, it registers stdout (fd=1) and stderr (fd=2) in the
+	// BPF log_fd_map so the write() kprobe emits EVENT_LOG_WRITE for app logs.
+	if p.cfg.Hook.LogCaptureEnabled() {
+		p.eventReader.logFDRegistrar = p.loader.addLogFD
+	}
+
 	// Start ring buffer reader goroutine
 	p.wg.Add(1)
 	go func() {
