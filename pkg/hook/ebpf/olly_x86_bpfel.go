@@ -39,6 +39,22 @@ type ollyConnectArgs struct {
 	_    [4]byte
 }
 
+type ollyEphPortKey struct {
+	_          structs.HostLayout
+	Pid        uint32
+	RemoteAddr uint32
+	RemotePort uint16
+	Pad        uint16
+}
+
+type ollyEphPortVal struct {
+	_         structs.HostLayout
+	LocalPort uint16
+	Pad       uint16
+	_         [4]byte
+	Cookie    uint64
+}
+
 type ollyPidCtx struct {
 	_           structs.HostLayout
 	Ctx         ollyTraceCtx
@@ -145,6 +161,7 @@ type ollyProgramSpecs struct {
 	KretprobeRecvfrom          *ebpf.ProgramSpec `ebpf:"kretprobe_recvfrom"`
 	OllySkMsg                  *ebpf.ProgramSpec `ebpf:"olly_sk_msg"`
 	OllySockops                *ebpf.ProgramSpec `ebpf:"olly_sockops"`
+	TracepointInetSockSetState *ebpf.ProgramSpec `ebpf:"tracepoint_inet_sock_set_state"`
 	TracepointSchedProcessExec *ebpf.ProgramSpec `ebpf:"tracepoint_sched_process_exec"`
 	UprobeSslRead              *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read"`
 	UprobeSslSetFd             *ebpf.ProgramSpec `ebpf:"uprobe_ssl_set_fd"`
@@ -160,12 +177,14 @@ type ollyMapSpecs struct {
 	AcceptArgsMap  *ebpf.MapSpec `ebpf:"accept_args_map"`
 	ConnMap        *ebpf.MapSpec `ebpf:"conn_map"`
 	ConnectArgsMap *ebpf.MapSpec `ebpf:"connect_args_map"`
+	EphPortMap     *ebpf.MapSpec `ebpf:"eph_port_map"`
 	Events         *ebpf.MapSpec `ebpf:"events"`
 	LogFdMap       *ebpf.MapSpec `ebpf:"log_fd_map"`
 	PidCtxScratch  *ebpf.MapSpec `ebpf:"pid_ctx_scratch"`
 	PidFilter      *ebpf.MapSpec `ebpf:"pid_filter"`
 	PidTraceCtx    *ebpf.MapSpec `ebpf:"pid_trace_ctx"`
 	RwArgsMap      *ebpf.MapSpec `ebpf:"rw_args_map"`
+	SkPidMap       *ebpf.MapSpec `ebpf:"sk_pid_map"`
 	SockOpsMap     *ebpf.MapSpec `ebpf:"sock_ops_map"`
 	SslFdMap       *ebpf.MapSpec `ebpf:"ssl_fd_map"`
 	SslRwArgsMap   *ebpf.MapSpec `ebpf:"ssl_rw_args_map"`
@@ -202,12 +221,14 @@ type ollyMaps struct {
 	AcceptArgsMap  *ebpf.Map `ebpf:"accept_args_map"`
 	ConnMap        *ebpf.Map `ebpf:"conn_map"`
 	ConnectArgsMap *ebpf.Map `ebpf:"connect_args_map"`
+	EphPortMap     *ebpf.Map `ebpf:"eph_port_map"`
 	Events         *ebpf.Map `ebpf:"events"`
 	LogFdMap       *ebpf.Map `ebpf:"log_fd_map"`
 	PidCtxScratch  *ebpf.Map `ebpf:"pid_ctx_scratch"`
 	PidFilter      *ebpf.Map `ebpf:"pid_filter"`
 	PidTraceCtx    *ebpf.Map `ebpf:"pid_trace_ctx"`
 	RwArgsMap      *ebpf.Map `ebpf:"rw_args_map"`
+	SkPidMap       *ebpf.Map `ebpf:"sk_pid_map"`
 	SockOpsMap     *ebpf.Map `ebpf:"sock_ops_map"`
 	SslFdMap       *ebpf.Map `ebpf:"ssl_fd_map"`
 	SslRwArgsMap   *ebpf.Map `ebpf:"ssl_rw_args_map"`
@@ -220,12 +241,14 @@ func (m *ollyMaps) Close() error {
 		m.AcceptArgsMap,
 		m.ConnMap,
 		m.ConnectArgsMap,
+		m.EphPortMap,
 		m.Events,
 		m.LogFdMap,
 		m.PidCtxScratch,
 		m.PidFilter,
 		m.PidTraceCtx,
 		m.RwArgsMap,
+		m.SkPidMap,
 		m.SockOpsMap,
 		m.SslFdMap,
 		m.SslRwArgsMap,
@@ -259,6 +282,7 @@ type ollyPrograms struct {
 	KretprobeRecvfrom          *ebpf.Program `ebpf:"kretprobe_recvfrom"`
 	OllySkMsg                  *ebpf.Program `ebpf:"olly_sk_msg"`
 	OllySockops                *ebpf.Program `ebpf:"olly_sockops"`
+	TracepointInetSockSetState *ebpf.Program `ebpf:"tracepoint_inet_sock_set_state"`
 	TracepointSchedProcessExec *ebpf.Program `ebpf:"tracepoint_sched_process_exec"`
 	UprobeSslRead              *ebpf.Program `ebpf:"uprobe_ssl_read"`
 	UprobeSslSetFd             *ebpf.Program `ebpf:"uprobe_ssl_set_fd"`
@@ -284,6 +308,7 @@ func (p *ollyPrograms) Close() error {
 		p.KretprobeRecvfrom,
 		p.OllySkMsg,
 		p.OllySockops,
+		p.TracepointInetSockSetState,
 		p.TracepointSchedProcessExec,
 		p.UprobeSslRead,
 		p.UprobeSslSetFd,

@@ -6,6 +6,7 @@ package traces
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -96,6 +97,7 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 		TID:         pair.TID,
 		RemoteAddr:  pair.RemoteAddr,
 		RemotePort:  pair.RemotePort,
+		LocalPort:   pair.LocalPort,
 		IsSSL:       pair.IsSSL,
 		Protocol:    proto,
 		Attributes:  make(map[string]string),
@@ -203,6 +205,23 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 	p.emitSpan(span)
 }
 
+// splitHostPort splits a host:port string. Returns host and port as strings.
+// Handles IPv6 bracket notation (e.g., "[::1]:8080").
+func splitHostPort(hostport string) (host, port string) {
+	// IPv6 with brackets: [::1]:8080
+	if len(hostport) > 0 && hostport[0] == '[' {
+		if i := strings.LastIndex(hostport, "]:"); i >= 0 {
+			return hostport[1:i], hostport[i+2:]
+		}
+		return strings.Trim(hostport, "[]"), ""
+	}
+	// Only split on last colon if there's exactly one (avoid splitting IPv6 bare addresses)
+	if i := strings.LastIndex(hostport, ":"); i >= 0 && strings.Count(hostport, ":") == 1 {
+		return hostport[:i], hostport[i+1:]
+	}
+	return hostport, ""
+}
+
 func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttributes, isSSL bool, connInfo *conntrack.ConnInfo) {
 	switch attrs.Protocol {
 	case protocol.ProtoHTTP:
@@ -220,14 +239,22 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		if attrs.HTTPStatusCode > 0 {
 			span.SetAttribute("http.response.status_code", fmt.Sprintf("%d", attrs.HTTPStatusCode))
 		}
+		// server.address / server.port: split host:port from Host header.
+		// Per OTEL, server.address is the host only (no port).
 		if attrs.HTTPHost != "" {
-			span.SetAttribute("server.address", attrs.HTTPHost)
+			host, portStr := splitHostPort(attrs.HTTPHost)
+			span.SetAttribute("server.address", host)
+			if span.Kind == SpanKindServer && portStr != "" {
+				// SERVER span: server.port is the port the server listens on
+				// (extracted from the Host header, e.g., "app:5000" → 5000).
+				span.SetAttribute("server.port", portStr)
+			}
 		}
 		if attrs.HTTPUserAgent != "" {
 			span.SetAttribute("user_agent.original", attrs.HTTPUserAgent)
 		}
-		// S7 fix: server.port for HTTP spans
-		if connInfo != nil {
+		// CLIENT span: server.port is the remote port we connected to.
+		if span.Kind == SpanKindClient && connInfo != nil {
 			span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
 		}
 		// url.scheme from SSL detection
@@ -262,13 +289,16 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		if attrs.DBName != "" {
 			span.SetAttribute("db.namespace", attrs.DBName)
 		}
-		// Add server address from connection info, fallback to span's remote info
-		if connInfo != nil {
-			span.SetAttribute("server.address", connInfo.RemoteAddrStr())
-			span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
-		} else if span.RemoteAddr != "" {
-			span.SetAttribute("server.address", span.RemoteAddr)
-			span.SetAttribute("server.port", fmt.Sprintf("%d", span.RemotePort))
+		// Add server address/port for CLIENT spans (connInfo.Remote = the DB server).
+		// For SERVER spans, connInfo.Remote is the client, not the server — skip.
+		if span.Kind == SpanKindClient {
+			if connInfo != nil {
+				span.SetAttribute("server.address", connInfo.RemoteAddrStr())
+				span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
+			} else if span.RemoteAddr != "" {
+				span.SetAttribute("server.address", span.RemoteAddr)
+				span.SetAttribute("server.port", fmt.Sprintf("%d", span.RemotePort))
+			}
 		}
 
 	case protocol.ProtoRedis:
@@ -280,12 +310,14 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		if attrs.DBStatement != "" {
 			span.SetAttribute("db.query.text", attrs.DBStatement)
 		}
-		if connInfo != nil {
-			span.SetAttribute("server.address", connInfo.RemoteAddrStr())
-			span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
-		} else if span.RemoteAddr != "" {
-			span.SetAttribute("server.address", span.RemoteAddr)
-			span.SetAttribute("server.port", fmt.Sprintf("%d", span.RemotePort))
+		if span.Kind == SpanKindClient {
+			if connInfo != nil {
+				span.SetAttribute("server.address", connInfo.RemoteAddrStr())
+				span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
+			} else if span.RemoteAddr != "" {
+				span.SetAttribute("server.address", span.RemoteAddr)
+				span.SetAttribute("server.port", fmt.Sprintf("%d", span.RemotePort))
+			}
 		}
 
 	case protocol.ProtoMongoDB:
@@ -299,12 +331,14 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		if attrs.DBName != "" {
 			span.SetAttribute("db.namespace", attrs.DBName)
 		}
-		if connInfo != nil {
-			span.SetAttribute("server.address", connInfo.RemoteAddrStr())
-			span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
-		} else if span.RemoteAddr != "" {
-			span.SetAttribute("server.address", span.RemoteAddr)
-			span.SetAttribute("server.port", fmt.Sprintf("%d", span.RemotePort))
+		if span.Kind == SpanKindClient {
+			if connInfo != nil {
+				span.SetAttribute("server.address", connInfo.RemoteAddrStr())
+				span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
+			} else if span.RemoteAddr != "" {
+				span.SetAttribute("server.address", span.RemoteAddr)
+				span.SetAttribute("server.port", fmt.Sprintf("%d", span.RemotePort))
+			}
 		}
 
 	case protocol.ProtoGRPC:
@@ -318,13 +352,15 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		}
 		// S3 fix: always set status_code, even for OK (0)
 		span.SetAttribute("rpc.grpc.status_code", fmt.Sprintf("%d", attrs.GRPCStatus))
-		// S5 fix: add server.address/port for gRPC
-		if connInfo != nil {
-			span.SetAttribute("server.address", connInfo.RemoteAddrStr())
-			span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
-		} else if span.RemoteAddr != "" {
-			span.SetAttribute("server.address", span.RemoteAddr)
-			span.SetAttribute("server.port", fmt.Sprintf("%d", span.RemotePort))
+		// S5 fix: add server.address/port for gRPC CLIENT spans
+		if span.Kind == SpanKindClient {
+			if connInfo != nil {
+				span.SetAttribute("server.address", connInfo.RemoteAddrStr())
+				span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
+			} else if span.RemoteAddr != "" {
+				span.SetAttribute("server.address", span.RemoteAddr)
+				span.SetAttribute("server.port", fmt.Sprintf("%d", span.RemotePort))
+			}
 		}
 
 	case protocol.ProtoDNS:
@@ -387,9 +423,13 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 			span.SetAttribute("http.response.status_code", fmt.Sprintf("%d", attrs.HTTPStatusCode))
 		}
 		if attrs.HTTPHost != "" {
-			span.SetAttribute("server.address", attrs.HTTPHost)
+			host, portStr := splitHostPort(attrs.HTTPHost)
+			span.SetAttribute("server.address", host)
+			if span.Kind == SpanKindServer && portStr != "" {
+				span.SetAttribute("server.port", portStr)
+			}
 		}
-		if connInfo != nil {
+		if span.Kind == SpanKindClient && connInfo != nil {
 			span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
 		}
 		if isSSL {
@@ -464,9 +504,13 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 			span.SetAttribute("http.response.status_code", fmt.Sprintf("%d", attrs.HTTPStatusCode))
 		}
 		if attrs.HTTPHost != "" {
-			span.SetAttribute("server.address", attrs.HTTPHost)
+			host, portStr := splitHostPort(attrs.HTTPHost)
+			span.SetAttribute("server.address", host)
+			if span.Kind == SpanKindServer && portStr != "" {
+				span.SetAttribute("server.port", portStr)
+			}
 		}
-		if connInfo != nil {
+		if span.Kind == SpanKindClient && connInfo != nil {
 			span.SetAttribute("server.port", fmt.Sprintf("%d", connInfo.RemotePort))
 		}
 		if isSSL {

@@ -67,6 +67,7 @@ type Span struct {
 	// Network info
 	RemoteAddr string
 	RemotePort uint16
+	LocalPort  uint16 // Ephemeral port for outbound connections (same-host trace linking)
 	IsSSL      bool
 	Protocol   string
 

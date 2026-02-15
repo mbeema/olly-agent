@@ -1999,3 +1999,480 @@ func TestStitcherResolvesStaleDeferredTraceID(t *testing.T) {
 		t.Errorf("catalog CLIENT clone traceID: expected %s (canonical), got %s", tCorrect, catalogClone.TraceID)
 	}
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Ephemeral port pairing tests
+// ──────────────────────────────────────────────────────────────────────
+
+func TestStitcherPortMatchingClientFirst(t *testing.T) {
+	logger := zap.NewNop()
+	s := NewStitcher(500*time.Millisecond, logger)
+
+	var stitched *Span
+	s.OnStitchedSpan(func(span *Span) {
+		stitched = span
+	})
+
+	now := time.Now()
+
+	// CLIENT span from service-A: connects from ephemeral port 54321 to service-B:8080
+	clientSpan := &Span{
+		TraceID:     "aaaa0000aaaa0000aaaa0000aaaa0000",
+		SpanID:      "bbbb0000bbbb0000",
+		Kind:        SpanKindClient,
+		StartTime:   now,
+		RemoteAddr:  "10.0.0.2",
+		RemotePort:  8080,
+		LocalPort:   54321,
+		Protocol:    "http",
+		PID:         1000,
+		Attributes: map[string]string{
+			"http.request.method": "GET",
+			"url.path":            "/orders",
+		},
+		ServiceName: "service-a",
+	}
+
+	// SERVER span from service-B: sees RemotePort=54321 from the client connection
+	serverSpan := &Span{
+		TraceID:    "cccc0000cccc0000cccc0000cccc0000",
+		SpanID:     "dddd0000dddd0000",
+		Kind:       SpanKindServer,
+		StartTime:  now.Add(2 * time.Millisecond),
+		RemoteAddr: "10.0.0.1",
+		RemotePort: 54321,
+		Protocol:   "http",
+		PID:        2000,
+		Attributes: map[string]string{
+			"http.request.method": "GET",
+			"url.path":            "/orders",
+		},
+		ServiceName: "service-b",
+	}
+
+	// CLIENT arrives first, stored by port
+	deferred := s.ProcessSpan(clientSpan)
+	if !deferred {
+		t.Fatal("expected CLIENT to be deferred")
+	}
+
+	// SERVER arrives, matches by port
+	deferred = s.ProcessSpan(serverSpan)
+	if deferred {
+		t.Fatal("expected SERVER not to be deferred after port match")
+	}
+
+	// Verify stitching via port
+	if serverSpan.Attributes["olly.stitch_method"] != "port" {
+		t.Errorf("expected stitch_method=port, got %s", serverSpan.Attributes["olly.stitch_method"])
+	}
+	if serverSpan.Attributes["olly.stitched"] != "true" {
+		t.Error("expected olly.stitched=true on SERVER")
+	}
+	if serverSpan.Attributes["olly.stitched.client_service"] != "service-a" {
+		t.Errorf("expected client_service=service-a, got %s", serverSpan.Attributes["olly.stitched.client_service"])
+	}
+
+	// CLIENT has no parent → adopts SERVER's traceID
+	if stitched == nil {
+		t.Fatal("expected stitched callback to fire")
+	}
+	if stitched.TraceID != serverSpan.TraceID {
+		t.Errorf("CLIENT clone should have SERVER's traceID, got %s", stitched.TraceID)
+	}
+	if serverSpan.ParentSpanID != "bbbb0000bbbb0000" {
+		t.Errorf("SERVER parentSpanID should be CLIENT spanID, got %s", serverSpan.ParentSpanID)
+	}
+}
+
+func TestStitcherPortMatchingServerFirst(t *testing.T) {
+	logger := zap.NewNop()
+	s := NewStitcher(500*time.Millisecond, logger)
+
+	var stitched *Span
+	s.OnStitchedSpan(func(span *Span) {
+		stitched = span
+	})
+
+	now := time.Now()
+
+	// SERVER arrives first
+	serverSpan := &Span{
+		TraceID:    "cccc0000cccc0000cccc0000cccc0000",
+		SpanID:     "dddd0000dddd0000",
+		Kind:       SpanKindServer,
+		StartTime:  now,
+		RemoteAddr: "10.0.0.1",
+		RemotePort: 54321,
+		Protocol:   "http",
+		PID:        2000,
+		Attributes: map[string]string{
+			"http.request.method": "POST",
+			"url.path":            "/api/data",
+		},
+		ServiceName: "service-b",
+	}
+
+	deferred := s.ProcessSpan(serverSpan)
+	if !deferred {
+		t.Fatal("expected SERVER to be deferred")
+	}
+
+	// CLIENT arrives later with matching LocalPort
+	clientSpan := &Span{
+		TraceID:      "aaaa0000aaaa0000aaaa0000aaaa0000",
+		SpanID:       "bbbb0000bbbb0000",
+		ParentSpanID: "eeee0000eeee0000", // has parent
+		Kind:         SpanKindClient,
+		StartTime:    now.Add(-1 * time.Millisecond), // CLIENT starts before SERVER
+		RemoteAddr:   "10.0.0.2",
+		RemotePort:   8080,
+		LocalPort:    54321,
+		Protocol:     "http",
+		PID:          1000,
+		Attributes: map[string]string{
+			"http.request.method": "POST",
+			"url.path":            "/api/data",
+		},
+		ServiceName: "service-a",
+	}
+
+	deferred = s.ProcessSpan(clientSpan)
+	if deferred {
+		t.Fatal("expected CLIENT not to be deferred after port match")
+	}
+
+	// Verify stitching via port
+	if clientSpan.Attributes["olly.stitch_method"] != "port" {
+		t.Errorf("expected stitch_method=port, got %s", clientSpan.Attributes["olly.stitch_method"])
+	}
+
+	// CLIENT has parent → SERVER joins CLIENT's trace
+	if stitched == nil {
+		t.Fatal("expected stitched callback to fire")
+	}
+	// SERVER clone should join CLIENT's traceID
+	if stitched.TraceID != "aaaa0000aaaa0000aaaa0000aaaa0000" {
+		t.Errorf("SERVER clone should have CLIENT traceID, got %s", stitched.TraceID)
+	}
+	if stitched.ParentSpanID != "bbbb0000bbbb0000" {
+		t.Errorf("SERVER clone parentSpanID should be CLIENT spanID, got %s", stitched.ParentSpanID)
+	}
+}
+
+func TestStitcherPortMatchingSkipsSameProcess(t *testing.T) {
+	logger := zap.NewNop()
+	s := NewStitcher(500*time.Millisecond, logger)
+
+	now := time.Now()
+
+	// CLIENT from PID 1000
+	clientSpan := &Span{
+		TraceID:    "aaaa0000aaaa0000aaaa0000aaaa0000",
+		SpanID:     "bbbb0000bbbb0000",
+		Kind:       SpanKindClient,
+		StartTime:  now,
+		RemoteAddr: "127.0.0.1",
+		RemotePort: 8080,
+		LocalPort:  54321,
+		Protocol:   "http",
+		PID:        1000,
+		Attributes: map[string]string{
+			"http.request.method": "GET",
+			"url.path":            "/self",
+		},
+		ServiceName: "service-a",
+	}
+
+	// SERVER from same PID 1000 (same process, should not match)
+	serverSpan := &Span{
+		TraceID:    "cccc0000cccc0000cccc0000cccc0000",
+		SpanID:     "dddd0000dddd0000",
+		Kind:       SpanKindServer,
+		StartTime:  now.Add(1 * time.Millisecond),
+		RemoteAddr: "127.0.0.1",
+		RemotePort: 54321,
+		Protocol:   "http",
+		PID:        1000, // same PID
+		Attributes: map[string]string{
+			"http.request.method": "GET",
+			"url.path":            "/self",
+		},
+		ServiceName: "service-a",
+	}
+
+	s.ProcessSpan(clientSpan)
+	s.ProcessSpan(serverSpan)
+
+	// Should NOT be stitched (same PID)
+	if serverSpan.Attributes["olly.stitch_method"] == "port" {
+		t.Error("port matching should skip same-process spans")
+	}
+}
+
+func TestStitcherPortMatchingBeatsAmbiguousHeuristic(t *testing.T) {
+	logger := zap.NewNop()
+	s := NewStitcher(500*time.Millisecond, logger)
+
+	var stitchedSpans []*Span
+	s.OnStitchedSpan(func(span *Span) {
+		stitchedSpans = append(stitchedSpans, span)
+	})
+
+	now := time.Now()
+
+	// Two concurrent CLIENT spans to same endpoint (ambiguous for heuristic)
+	client1 := &Span{
+		TraceID:    "aaaa0000aaaa0000aaaa0000aaaa0001",
+		SpanID:     "bbbb0000bbbb0001",
+		Kind:       SpanKindClient,
+		StartTime:  now,
+		RemoteAddr: "10.0.0.2",
+		RemotePort: 8080,
+		LocalPort:  54321, // unique ephemeral port
+		Protocol:   "http",
+		PID:        1000,
+		Attributes: map[string]string{
+			"http.request.method": "GET",
+			"url.path":            "/orders",
+		},
+		ServiceName: "service-a",
+	}
+	client2 := &Span{
+		TraceID:    "aaaa0000aaaa0000aaaa0000aaaa0002",
+		SpanID:     "bbbb0000bbbb0002",
+		Kind:       SpanKindClient,
+		StartTime:  now.Add(1 * time.Millisecond),
+		RemoteAddr: "10.0.0.2",
+		RemotePort: 8080,
+		LocalPort:  54322, // different ephemeral port
+		Protocol:   "http",
+		PID:        1000,
+		Attributes: map[string]string{
+			"http.request.method": "GET",
+			"url.path":            "/orders",
+		},
+		ServiceName: "service-a",
+	}
+
+	s.ProcessSpan(client1)
+	s.ProcessSpan(client2)
+
+	// Two SERVER spans, each with matching ephemeral port as RemotePort
+	server1 := &Span{
+		TraceID:    "cccc0000cccc0000cccc0000cccc0001",
+		SpanID:     "dddd0000dddd0001",
+		Kind:       SpanKindServer,
+		StartTime:  now.Add(2 * time.Millisecond),
+		RemoteAddr: "10.0.0.1",
+		RemotePort: 54321, // matches client1.LocalPort
+		Protocol:   "http",
+		PID:        2000,
+		Attributes: map[string]string{
+			"http.request.method": "GET",
+			"url.path":            "/orders",
+		},
+		ServiceName: "service-b",
+	}
+	server2 := &Span{
+		TraceID:    "cccc0000cccc0000cccc0000cccc0002",
+		SpanID:     "dddd0000dddd0002",
+		Kind:       SpanKindServer,
+		StartTime:  now.Add(3 * time.Millisecond),
+		RemoteAddr: "10.0.0.1",
+		RemotePort: 54322, // matches client2.LocalPort
+		Protocol:   "http",
+		PID:        2000,
+		Attributes: map[string]string{
+			"http.request.method": "GET",
+			"url.path":            "/orders",
+		},
+		ServiceName: "service-b",
+	}
+
+	s.ProcessSpan(server1)
+	s.ProcessSpan(server2)
+
+	// Both should be matched via port (not skipped by ambiguity guard)
+	if server1.Attributes["olly.stitch_method"] != "port" {
+		t.Errorf("server1 should be matched via port, got stitch_method=%s", server1.Attributes["olly.stitch_method"])
+	}
+	if server2.Attributes["olly.stitch_method"] != "port" {
+		t.Errorf("server2 should be matched via port, got stitch_method=%s", server2.Attributes["olly.stitch_method"])
+	}
+
+	// Verify correct pairing: server1 got client1's trace, server2 got client2's trace
+	if len(stitchedSpans) < 2 {
+		t.Fatalf("expected 2 stitched callbacks, got %d", len(stitchedSpans))
+	}
+}
+
+// TestStitcherPortKeepAliveReuse verifies that multiple requests on the same
+// keep-alive connection (same ephemeral port) are correctly matched in FIFO
+// order. This was a bug: the port index used a single-entry map, so the second
+// CLIENT/SERVER span would overwrite the first, causing cross-trace linking.
+func TestStitcherPortKeepAliveReuse(t *testing.T) {
+	logger := zap.NewNop()
+	s := NewStitcher(500*time.Millisecond, logger)
+
+	var stitchedSpans []*Span
+	s.OnStitchedSpan(func(span *Span) {
+		stitchedSpans = append(stitchedSpans, span)
+	})
+
+	now := time.Now()
+
+	// Two CLIENT spans on the same keep-alive connection (same LocalPort).
+	client1 := &Span{
+		TraceID:      "trace1__________________________",
+		SpanID:       "client1_________",
+		ParentSpanID: "server1_________",
+		Kind:         SpanKindClient,
+		StartTime:    now,
+		RemoteAddr:   "10.0.0.2",
+		RemotePort:   8080,
+		LocalPort:    54321,
+		Protocol:     "http",
+		PID:          1000,
+		Attributes: map[string]string{
+			"http.request.method": "GET",
+			"url.path":            "/api/pricing",
+		},
+		ServiceName: "catalog-service",
+	}
+	client2 := &Span{
+		TraceID:      "trace2__________________________",
+		SpanID:       "client2_________",
+		ParentSpanID: "server2_________",
+		Kind:         SpanKindClient,
+		StartTime:    now.Add(100 * time.Millisecond),
+		RemoteAddr:   "10.0.0.2",
+		RemotePort:   8080,
+		LocalPort:    54321, // same port (keep-alive)
+		Protocol:     "http",
+		PID:          1000,
+		Attributes: map[string]string{
+			"http.request.method": "GET",
+			"url.path":            "/api/pricing",
+		},
+		ServiceName: "catalog-service",
+	}
+
+	// Both CLIENT spans are deferred.
+	if !s.ProcessSpan(client1) {
+		t.Fatal("expected client1 to be deferred")
+	}
+	if !s.ProcessSpan(client2) {
+		t.Fatal("expected client2 to be deferred")
+	}
+
+	// Two SERVER spans from the pricing service (same RemotePort = client's LocalPort).
+	server1 := &Span{
+		TraceID:    "srv_trace1______________________",
+		SpanID:     "srvspan1________",
+		Kind:       SpanKindServer,
+		StartTime:  now.Add(5 * time.Millisecond),
+		RemoteAddr: "10.0.0.1",
+		RemotePort: 54321, // matches client's LocalPort
+		Protocol:   "http",
+		PID:        2000,
+		Attributes: map[string]string{
+			"http.request.method": "GET",
+			"url.path":            "/api/pricing",
+		},
+		ServiceName: "pricing-service",
+	}
+	server2 := &Span{
+		TraceID:    "srv_trace2______________________",
+		SpanID:     "srvspan2________",
+		Kind:       SpanKindServer,
+		StartTime:  now.Add(105 * time.Millisecond),
+		RemoteAddr: "10.0.0.1",
+		RemotePort: 54321, // same port (keep-alive)
+		Protocol:   "http",
+		PID:        2000,
+		Attributes: map[string]string{
+			"http.request.method": "GET",
+			"url.path":            "/api/pricing",
+		},
+		ServiceName: "pricing-service",
+	}
+
+	// SERVER 1 should match CLIENT 1 (FIFO: first stored, first matched).
+	deferred := s.ProcessSpan(server1)
+	if deferred {
+		t.Fatal("expected server1 to be matched (not deferred)")
+	}
+	// Verify server1 joined client1's trace, not client2's.
+	if server1.TraceID != "trace1__________________________" {
+		t.Errorf("server1 should join trace1, got %s", server1.TraceID)
+	}
+	if server1.ParentSpanID != "client1_________" {
+		t.Errorf("server1 should have client1 as parent, got %s", server1.ParentSpanID)
+	}
+
+	// SERVER 2 should match CLIENT 2.
+	deferred = s.ProcessSpan(server2)
+	if deferred {
+		t.Fatal("expected server2 to be matched (not deferred)")
+	}
+	if server2.TraceID != "trace2__________________________" {
+		t.Errorf("server2 should join trace2, got %s", server2.TraceID)
+	}
+	if server2.ParentSpanID != "client2_________" {
+		t.Errorf("server2 should have client2 as parent, got %s", server2.ParentSpanID)
+	}
+
+	// Verify both stitched callbacks fired (for client clones).
+	if len(stitchedSpans) != 2 {
+		t.Fatalf("expected 2 stitched callbacks, got %d", len(stitchedSpans))
+	}
+}
+
+func TestStitcherPortMatchingCleanup(t *testing.T) {
+	logger := zap.NewNop()
+	s := NewStitcher(50*time.Millisecond, logger) // short window for test
+
+	var expiredSpans []*Span
+	s.OnStitchedSpan(func(span *Span) {
+		expiredSpans = append(expiredSpans, span)
+	})
+
+	now := time.Now()
+
+	// CLIENT stored by port
+	clientSpan := &Span{
+		TraceID:    "aaaa0000aaaa0000aaaa0000aaaa0000",
+		SpanID:     "bbbb0000bbbb0000",
+		Kind:       SpanKindClient,
+		StartTime:  now,
+		RemoteAddr: "10.0.0.2",
+		RemotePort: 8080,
+		LocalPort:  54321,
+		Protocol:   "http",
+		PID:        1000,
+		Attributes: map[string]string{
+			"http.request.method": "GET",
+			"url.path":            "/orders",
+		},
+		ServiceName: "service-a",
+	}
+
+	s.ProcessSpan(clientSpan)
+
+	// Wait for cleanup window to expire
+	time.Sleep(150 * time.Millisecond)
+
+	removed := s.Cleanup()
+	if removed == 0 {
+		t.Error("expected expired port-indexed spans to be cleaned up")
+	}
+
+	// Verify the port index is cleaned
+	s.mu.Lock()
+	portCount := len(s.pendingClientsByPort)
+	s.mu.Unlock()
+	if portCount != 0 {
+		t.Errorf("expected pendingClientsByPort to be empty after cleanup, got %d", portCount)
+	}
+}

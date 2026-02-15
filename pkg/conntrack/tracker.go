@@ -35,6 +35,11 @@ type ConnInfo struct {
 	// F3 fix: Adaptive protocol learning.
 	// Once detected, remember the protocol for this connection.
 	Protocol string
+
+	// Ephemeral port for outbound connections (from BPF sockops).
+	// Used for deterministic same-host CLIENT↔SERVER trace linking.
+	LocalPort    uint16
+	SocketCookie uint64
 }
 
 // RemoteAddrStr returns the remote address as a dotted-quad string.

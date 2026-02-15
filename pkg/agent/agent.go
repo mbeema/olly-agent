@@ -85,6 +85,7 @@ type Agent struct {
 	threadInboundFD sync.Map // key: uint64(PID)<<32|uint64(TID)        -> int32 (inbound FD)
 	fdCausal        sync.Map // key: uint64(PID)<<32|uint64(uint32(FD)) -> *causalEntry
 	pidActiveCtx    sync.Map // key: uint32(PID)                        -> *pidInboundSet (active inbound FDs)
+	causalCtxSnap   sync.Map // key: uint64(PID)<<32|uint64(uint32(outbound FD)) -> *causalCtxQueue
 
 	mu            sync.Mutex
 	ctx           context.Context
@@ -110,6 +111,40 @@ type connTraceCtx struct {
 type causalEntry struct {
 	InboundFD int32
 	Timestamp time.Time
+}
+
+// causalCtxSnapshot is a minimal snapshot of trace context captured at
+// PushCausalFD time (OnDataOut). Used by enrichPairContext Layer 0 to avoid
+// stale connCtx lookups when CLIENT pair creation is delayed (response >256
+// bytes causes framing failure → pair created later after connCtx overwrite).
+type causalCtxSnapshot struct {
+	TraceID      string
+	ServerSpanID string
+}
+
+// causalCtxQueue is a FIFO queue of context snapshots for an outbound FD.
+// Parallel to the reassembly's causalFDQueue — both pushed in OnDataOut,
+// popped at pair creation / enrichPairContext time.
+type causalCtxQueue struct {
+	mu      sync.Mutex
+	entries []causalCtxSnapshot
+}
+
+func (q *causalCtxQueue) push(snap causalCtxSnapshot) {
+	q.mu.Lock()
+	q.entries = append(q.entries, snap)
+	q.mu.Unlock()
+}
+
+func (q *causalCtxQueue) pop() (causalCtxSnapshot, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.entries) == 0 {
+		return causalCtxSnapshot{}, false
+	}
+	snap := q.entries[0]
+	q.entries = q.entries[1:]
+	return snap, true
 }
 
 // pidInboundEntry tracks a single active inbound FD with its creation timestamp.
@@ -307,6 +342,11 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 	}
 	a.exporter = exporter
 
+	// Wire up late TraceMerge resolution at export flush time.
+	// Internal spans (e.g., pricing CLIENT→stock) may reach the export
+	// batch before the stitcher creates the TraceMerge entry for their trace.
+	a.exporter.TraceMergeResolver = a.traceStitcher.TraceMerge
+
 	// Initialize log collector
 	if cfg.Logs.Enabled {
 		logsCfg := cfg.Logs
@@ -484,6 +524,20 @@ func (a *Agent) Start(ctx context.Context) error {
 						InboundFD: iFD,
 						Timestamp: time.Now(),
 					})
+					// Snapshot the inbound FD's trace context now. If the
+					// CLIENT pair is created late (response >256 bytes),
+					// connCtx may be overwritten by the next inbound request.
+					// The snapshot preserves the correct TraceID/ServerSpanID.
+					inboundKey := uint64(pid)<<32 | uint64(uint32(iFD))
+					if ctxVal, ctxOK := a.connCtx.Load(inboundKey); ctxOK {
+						tctx := ctxVal.(*connTraceCtx)
+						outKey := uint64(pid)<<32 | uint64(uint32(fd))
+						qVal, _ := a.causalCtxSnap.LoadOrStore(outKey, &causalCtxQueue{})
+						qVal.(*causalCtxQueue).push(causalCtxSnapshot{
+							TraceID:      tctx.TraceID,
+							ServerSpanID: tctx.ServerSpanID,
+						})
+					}
 				} else if val, ok := a.pidActiveCtx.Load(pid); ok {
 					// PID-level fallback: Go goroutine TID mismatch.
 					// threadInboundFD has no entry for this TID, but
@@ -651,6 +705,7 @@ func (a *Agent) Start(ctx context.Context) error {
 			// truly old context, and FD reuse naturally overwrites entries.
 			connKey := uint64(pid)<<32 | uint64(uint32(fd))
 			a.fdCausal.Delete(connKey)
+			a.causalCtxSnap.Delete(connKey)
 			// Do NOT remove from pidActiveCtx here — connCtx must survive
 			// briefly after close so that outbound CLIENT pairs still in
 			// flight can look up the inbound trace context via Layer 3.
@@ -944,6 +999,25 @@ func (a *Agent) pairDispatchLoop(ctx context.Context) {
 			// enrichPairContext already called in OnPair callback (same goroutine
 			// as OnDataIn, avoiding race with thread context overwrites).
 			connInfo := a.connTracker.Lookup(pair.PID, pair.FD)
+
+			// Populate ephemeral port for outbound connections (lazy BPF map lookup).
+			// By pairDispatchLoop time, sockops has always fired (TCP established before data sent).
+			if pair.Direction == 0 && pair.LocalPort == 0 {
+				if epp, ok := a.hookProvider.(hook.EphemeralPortProvider); ok {
+					var remoteAddr uint32
+					if connInfo != nil {
+						remoteAddr = connInfo.RemoteAddr
+					}
+					if lp, cookie, found := epp.GetEphemeralPort(pair.PID, remoteAddr, pair.RemotePort); found {
+						pair.LocalPort = lp
+						if connInfo != nil {
+							connInfo.LocalPort = lp
+							connInfo.SocketCookie = cookie
+						}
+					}
+				}
+			}
+
 			a.traceProc.ProcessPair(pair, connInfo)
 		case <-ctx.Done():
 			// Drain remaining pairs
@@ -995,9 +1069,22 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 	// pipelined protocols). Captured at AppendSend time, before concurrent
 	// requests can overwrite the fdCausal map. Handles Redis, HTTP keep-alive,
 	// and other persistent-connection protocols correctly.
+	//
+	// Also pop the context snapshot (captured at PushCausalFD time in OnDataOut).
+	// If the CLIENT pair was created late (response >256 bytes, framing delay),
+	// connCtx may have been overwritten by a new inbound request on the same FD.
+	// The snapshot preserves the TraceID/ServerSpanID from the original request.
+	var causalSnap *causalCtxSnapshot
 	if pair.CausalInboundFD != 0 {
 		inboundFD = pair.CausalInboundFD
 		found = true
+		// Pop context snapshot parallel to the reassembly's causalFDQueue pop.
+		outKey := uint64(pair.PID)<<32 | uint64(uint32(pair.FD))
+		if qVal, ok := a.causalCtxSnap.Load(outKey); ok {
+			if snap, ok := qVal.(*causalCtxQueue).pop(); ok {
+				causalSnap = &snap
+			}
+		}
 	}
 
 	// Layer 1: FD causal mapping (fallback when queue wasn't populated).
@@ -1055,10 +1142,29 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 	connKey := uint64(pair.PID)<<32 | uint64(uint32(inboundFD))
 	val, ok := a.connCtx.Load(connKey)
 	if !ok {
+		// connCtx was removed — use snapshot if available.
+		if causalSnap != nil && causalSnap.TraceID != "" {
+			pair.ParentTraceID = causalSnap.TraceID
+			pair.ParentSpanID = causalSnap.ServerSpanID
+		}
 		return
 	}
 	tctx, ok := val.(*connTraceCtx)
 	if !ok || time.Since(tctx.Created) > a.maxRequestDuration {
+		return
+	}
+
+	// Check if connCtx was overwritten by a newer request (delayed pair
+	// creation: response >256 bytes caused framing failure, pair created
+	// after next inbound request overwrote connCtx). Use snapshot to
+	// preserve the correct TraceID/ServerSpanID from the original request.
+	if causalSnap != nil && causalSnap.TraceID != "" && causalSnap.TraceID != tctx.TraceID {
+		// connCtx was overwritten — use snapshot for TraceID/ServerSpanID.
+		// Don't set InjectedSpanID since we can't reliably consume from
+		// the wrong connCtx. The CLIENT span gets a generated SpanID and
+		// falls back to stitcher for CLIENT↔SERVER linking.
+		pair.ParentTraceID = causalSnap.TraceID
+		pair.ParentSpanID = causalSnap.ServerSpanID
 		return
 	}
 

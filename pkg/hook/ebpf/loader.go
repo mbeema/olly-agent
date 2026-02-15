@@ -109,7 +109,7 @@ func (l *loader) attachSyscallProbes() error {
 	return nil
 }
 
-// attachTracepoints attaches to tracepoints (process exec).
+// attachTracepoints attaches to tracepoints (process exec, TCP state).
 func (l *loader) attachTracepoints() error {
 	tp, err := link.Tracepoint("sched", "sched_process_exec", l.objs.TracepointSchedProcessExec, nil)
 	if err != nil {
@@ -118,6 +118,18 @@ func (l *loader) attachTracepoints() error {
 	}
 	l.links = append(l.links, tp)
 	l.logger.Debug("attached tracepoint", zap.String("name", "sched/sched_process_exec"))
+
+	// Attach inet_sock_set_state for ephemeral port capture (same-host trace linking).
+	if l.objs.TracepointInetSockSetState != nil {
+		tp2, err := link.Tracepoint("sock", "inet_sock_set_state", l.objs.TracepointInetSockSetState, nil)
+		if err != nil {
+			l.logger.Warn("failed to attach inet_sock_set_state tracepoint (ephemeral port matching disabled)", zap.Error(err))
+		} else {
+			l.links = append(l.links, tp2)
+			l.logger.Debug("attached tracepoint", zap.String("name", "sock/inet_sock_set_state"))
+		}
+	}
+
 	return nil
 }
 
@@ -398,6 +410,41 @@ func (l *loader) getTraceContext(pid, tid uint32) (string, string, bool) {
 	traceID := header[len(prefix) : len(prefix)+32]
 	spanID := header[len(prefix)+32+1 : len(prefix)+32+1+16]
 	return traceID, spanID, true
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Ephemeral port lookup for same-host trace linking
+// ──────────────────────────────────────────────────────────────────────
+
+// ephPortKey mirrors BPF struct eph_port_key.
+type ephPortKey struct {
+	PID        uint32
+	RemoteAddr uint32
+	RemotePort uint16
+	Pad        uint16
+}
+
+// ephPortVal mirrors BPF struct eph_port_val.
+// Note: 4 bytes of padding between Pad and Cookie for uint64 alignment.
+type ephPortVal struct {
+	LocalPort uint16
+	Pad       uint16
+	_         [4]byte
+	Cookie    uint64
+}
+
+// lookupEphPort queries the BPF eph_port_map for the local ephemeral port
+// of an outbound connection identified by (pid, remoteAddr, remotePort).
+func (l *loader) lookupEphPort(pid uint32, remoteAddr uint32, remotePort uint16) (uint16, uint64, bool) {
+	if l.objs.EphPortMap == nil {
+		return 0, 0, false
+	}
+	key := ephPortKey{PID: pid, RemoteAddr: remoteAddr, RemotePort: remotePort}
+	var val ephPortVal
+	if err := l.objs.EphPortMap.Lookup(key, &val); err != nil {
+		return 0, 0, false
+	}
+	return val.LocalPort, val.Cookie, true
 }
 
 // Helper to convert IP uint32 to byte order.

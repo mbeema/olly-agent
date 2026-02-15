@@ -23,8 +23,8 @@ import (
 //   - SERVER arrives first → stored, matched when CLIENT arrives
 //
 // Matching criteria:
-//  1. Timestamps overlap within a configurable window
-//  2. HTTP method and path match (when available)
+//  1. Ephemeral port pairing (deterministic, same-host only)
+//  2. Timestamps overlap within a configurable window + method/path match (heuristic)
 //
 // The stitcher operates as a post-processor: it receives completed spans and
 // enriches them with parent-child relationships before export.
@@ -37,6 +37,13 @@ type Stitcher struct {
 	pendingClients map[string][]*pendingSpan
 	// Pending SERVER spans waiting for matching CLIENT spans.
 	pendingServers map[string][]*pendingSpan
+
+	// Port-based matching for deterministic same-host pairing.
+	// FIFO queues per port: keep-alive connections reuse the same ephemeral
+	// port for multiple sequential requests, so we need a queue (not a single
+	// entry) to correctly match requests in order.
+	pendingClientsByPort map[uint16][]*pendingSpan
+	pendingServersByPort map[uint16][]*pendingSpan
 
 	callbacks []func(*Span)
 
@@ -71,10 +78,12 @@ func NewStitcher(window time.Duration, logger *zap.Logger) *Stitcher {
 		window = 500 * time.Millisecond
 	}
 	return &Stitcher{
-		logger:         logger,
-		window:         window,
-		pendingClients: make(map[string][]*pendingSpan),
-		pendingServers: make(map[string][]*pendingSpan),
+		logger:               logger,
+		window:               window,
+		pendingClients:       make(map[string][]*pendingSpan),
+		pendingServers:       make(map[string][]*pendingSpan),
+		pendingClientsByPort: make(map[uint16][]*pendingSpan),
+		pendingServersByPort: make(map[uint16][]*pendingSpan),
 	}
 }
 
@@ -188,6 +197,70 @@ func (s *Stitcher) processClientSpan(span *Span) bool {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Fast path: deterministic ephemeral port matching (same-host only).
+	// CLIENT.LocalPort == SERVER.RemotePort is unique per TCP connection.
+	// FIFO queue: keep-alive connections reuse the same port for sequential
+	// requests, so we pop the oldest pending SERVER (matching request order).
+	if span.LocalPort != 0 {
+		if queue, ok := s.pendingServersByPort[span.LocalPort]; ok && len(queue) > 0 {
+			// Pop oldest entry (FIFO: first stored, first matched).
+			ps := queue[0]
+			// Verify cross-process (not same PID)
+			if ps.pid != span.PID {
+				// Resolve stale traceIDs before stitching.
+				if resolved, ok := s.TraceMerge(span.TraceID); ok {
+					span.TraceID = resolved
+				}
+				if resolved, ok := s.TraceMerge(ps.span.TraceID); ok {
+					ps.span.TraceID = resolved
+				}
+
+				if span.ParentSpanID != "" {
+					oldTraceID := ps.span.TraceID
+					ps.span.TraceID = span.TraceID
+					if ps.span.Attributes["olly.trace_source"] != "traceparent" {
+						ps.span.ParentSpanID = span.SpanID
+					}
+					if oldTraceID != span.TraceID {
+						s.traceMerge.Store(oldTraceID, span.TraceID)
+					}
+				} else {
+					if span.TraceID != ps.span.TraceID {
+						span.ParentSpanID = ""
+					}
+					span.TraceID = ps.span.TraceID
+					ps.span.ParentSpanID = span.SpanID
+				}
+
+				span.SetAttribute("olly.stitched", "true")
+				span.SetAttribute("olly.stitch_method", "port")
+				ps.span.SetAttribute("olly.stitched", "true")
+				ps.span.SetAttribute("olly.stitch_method", "port")
+				ps.span.SetAttribute("olly.stitched.client_service", span.ServiceName)
+
+				s.logger.Debug("stitched via ephemeral port (client→server)",
+					zap.String("trace_id", span.TraceID),
+					zap.Uint16("port", span.LocalPort),
+					zap.String("client_span", span.SpanID),
+					zap.String("server_span", ps.span.SpanID),
+				)
+
+				// Remove from FIFO queue.
+				s.pendingServersByPort[span.LocalPort] = queue[1:]
+				if len(s.pendingServersByPort[span.LocalPort]) == 0 {
+					delete(s.pendingServersByPort, span.LocalPort)
+				}
+				s.removeFromPendingServers(ps)
+
+				for _, cb := range s.callbacks {
+					cb(ps.span)
+				}
+				return false // matched, caller should export
+			}
+		}
+		// No match yet — will be stored by port below at `store` label.
+	}
 
 	// Try to match against pending SERVER spans.
 	// Track match count to detect ambiguity at high volume.
@@ -303,12 +376,14 @@ func (s *Stitcher) processClientSpan(span *Span) bool {
 			zap.String("path", mk.path),
 		)
 
-		// Remove matched SERVER span
+		// Remove matched SERVER span from heuristic index.
 		pending := s.pendingServers[bestKey]
 		s.pendingServers[bestKey] = append(pending[:bestIdx], pending[bestIdx+1:]...)
 		if len(s.pendingServers[bestKey]) == 0 {
 			delete(s.pendingServers, bestKey)
 		}
+		// Also remove from port index if it was stored there.
+		s.removeFromPortQueue(&s.pendingServersByPort, bestMatch)
 
 		for _, cb := range s.callbacks {
 			cb(bestMatch.span)
@@ -334,6 +409,11 @@ store:
 			createdAt:  time.Now(),
 		}
 		s.pendingClients[key] = append(s.pendingClients[key], ps)
+		// Also store by port for deterministic same-host matching (FIFO queue).
+		// Same pointer ensures removeFromPendingClients works by identity.
+		if span.LocalPort != 0 {
+			s.pendingClientsByPort[span.LocalPort] = append(s.pendingClientsByPort[span.LocalPort], ps)
+		}
 		return true // deferred — do NOT export
 	}
 	return false
@@ -374,6 +454,70 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 	// degrades to timestamp-only which has high false-positive risk.
 	if mk.method == "" {
 		return false
+	}
+
+	// Fast path: deterministic ephemeral port matching (same-host only).
+	// SERVER.RemotePort == CLIENT.LocalPort is unique per TCP connection.
+	// FIFO queue: keep-alive connections reuse the same port for sequential
+	// requests, so we pop the oldest pending CLIENT (matching request order).
+	if span.RemotePort != 0 {
+		if queue, ok := s.pendingClientsByPort[span.RemotePort]; ok && len(queue) > 0 {
+			ps := queue[0]
+			if ps.pid != span.PID {
+				// Resolve stale traceIDs before stitching.
+				if resolved, ok := s.TraceMerge(span.TraceID); ok {
+					span.TraceID = resolved
+				}
+				if resolved, ok := s.TraceMerge(ps.span.TraceID); ok {
+					ps.span.TraceID = resolved
+				}
+
+				if ps.span.ParentSpanID != "" {
+					oldTraceID := span.TraceID
+					span.TraceID = ps.span.TraceID
+					if span.Attributes["olly.trace_source"] != "traceparent" {
+						span.ParentSpanID = ps.span.SpanID
+					}
+					if oldTraceID != ps.span.TraceID {
+						s.traceMerge.Store(oldTraceID, ps.span.TraceID)
+					}
+				} else {
+					if ps.span.TraceID != span.TraceID {
+						ps.span.ParentSpanID = ""
+					}
+					ps.span.TraceID = span.TraceID
+					if span.Attributes["olly.trace_source"] != "traceparent" {
+						span.ParentSpanID = ps.span.SpanID
+					}
+				}
+
+				ps.span.SetAttribute("olly.stitched", "true")
+				ps.span.SetAttribute("olly.stitch_method", "port")
+				span.SetAttribute("olly.stitched", "true")
+				span.SetAttribute("olly.stitch_method", "port")
+				span.SetAttribute("olly.stitched.client_service", ps.span.ServiceName)
+
+				s.logger.Debug("stitched via ephemeral port (server←client)",
+					zap.String("trace_id", span.TraceID),
+					zap.Uint16("port", span.RemotePort),
+					zap.String("client_span", ps.span.SpanID),
+					zap.String("server_span", span.SpanID),
+				)
+
+				// Remove from FIFO queue.
+				s.pendingClientsByPort[span.RemotePort] = queue[1:]
+				if len(s.pendingClientsByPort[span.RemotePort]) == 0 {
+					delete(s.pendingClientsByPort, span.RemotePort)
+				}
+				s.removeFromPendingClients(ps)
+
+				for _, cb := range s.callbacks {
+					cb(ps.span)
+				}
+				return false // matched, caller should export
+			}
+		}
+		// No match yet — will be stored by port below at `storeServer` label.
 	}
 
 	// Try to match against pending CLIENT spans.
@@ -481,12 +625,14 @@ func (s *Stitcher) processServerSpan(span *Span) bool {
 			zap.String("path", mk.path),
 		)
 
-		// Remove the matched CLIENT span
+		// Remove the matched CLIENT span from heuristic index.
 		pending := s.pendingClients[bestKey]
 		s.pendingClients[bestKey] = append(pending[:bestIdx], pending[bestIdx+1:]...)
 		if len(s.pendingClients[bestKey]) == 0 {
 			delete(s.pendingClients, bestKey)
 		}
+		// Also remove from port index if it was stored there.
+		s.removeFromPortQueue(&s.pendingClientsByPort, bestMatch)
 
 		// Re-export the CLIENT clone (unchanged if it had parent, updated if root)
 		for _, cb := range s.callbacks {
@@ -520,6 +666,11 @@ storeServer:
 			createdAt:  time.Now(),
 		}
 		s.pendingServers[key] = append(s.pendingServers[key], ps)
+		// Also store by port for deterministic same-host matching (FIFO queue).
+		// Same pointer ensures removeFromPendingServers works by identity.
+		if span.RemotePort != 0 {
+			s.pendingServersByPort[span.RemotePort] = append(s.pendingServersByPort[span.RemotePort], ps)
+		}
 		return true // deferred — do NOT export
 	}
 	return false
@@ -576,9 +727,47 @@ func cloneSpan(s *Span) *Span {
 	return &clone
 }
 
+// removeFromPendingServers removes a pendingSpan from the heuristic index by pointer identity.
+// Must be called under s.mu.
+func (s *Stitcher) removeFromPendingServers(target *pendingSpan) {
+	for key, spans := range s.pendingServers {
+		for i, ps := range spans {
+			if ps == target {
+				s.pendingServers[key] = append(spans[:i], spans[i+1:]...)
+				if len(s.pendingServers[key]) == 0 {
+					delete(s.pendingServers, key)
+				}
+				return
+			}
+		}
+	}
+}
+
+// removeFromPendingClients removes a pendingSpan from the heuristic index by pointer identity.
+// Must be called under s.mu.
+func (s *Stitcher) removeFromPendingClients(target *pendingSpan) {
+	for key, spans := range s.pendingClients {
+		for i, ps := range spans {
+			if ps == target {
+				s.pendingClients[key] = append(spans[:i], spans[i+1:]...)
+				if len(s.pendingClients[key]) == 0 {
+					delete(s.pendingClients, key)
+				}
+				return
+			}
+		}
+	}
+}
+
 // pendingCount returns the total pending spans (must be called under s.mu).
 func (s *Stitcher) pendingCount() int {
 	count := 0
+	for _, queue := range s.pendingClientsByPort {
+		count += len(queue)
+	}
+	for _, queue := range s.pendingServersByPort {
+		count += len(queue)
+	}
 	for _, spans := range s.pendingClients {
 		count += len(spans)
 	}
@@ -586,6 +775,22 @@ func (s *Stitcher) pendingCount() int {
 		count += len(spans)
 	}
 	return count
+}
+
+// removeFromPortQueue removes a pendingSpan from a port-indexed FIFO queue
+// by pointer identity. Must be called under s.mu.
+func (s *Stitcher) removeFromPortQueue(portMap *map[uint16][]*pendingSpan, target *pendingSpan) {
+	for port, queue := range *portMap {
+		for i, ps := range queue {
+			if ps == target {
+				(*portMap)[port] = append(queue[:i], queue[i+1:]...)
+				if len((*portMap)[port]) == 0 {
+					delete(*portMap, port)
+				}
+				return
+			}
+		}
+	}
 }
 
 // Cleanup removes stale pending spans older than the window.
@@ -634,6 +839,36 @@ func (s *Stitcher) Cleanup() int {
 		}
 	}
 
+	// Clean expired port-indexed entries. These share pointers with the
+	// heuristic index entries above, so don't add to expiredSpans (already
+	// handled). Just remove from the port index to prevent stale matches.
+	for port, queue := range s.pendingClientsByPort {
+		kept := queue[:0]
+		for _, ps := range queue {
+			if ps.createdAt.After(cutoff) {
+				kept = append(kept, ps)
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.pendingClientsByPort, port)
+		} else {
+			s.pendingClientsByPort[port] = kept
+		}
+	}
+	for port, queue := range s.pendingServersByPort {
+		kept := queue[:0]
+		for _, ps := range queue {
+			if ps.createdAt.After(cutoff) {
+				kept = append(kept, ps)
+			}
+		}
+		if len(kept) == 0 {
+			delete(s.pendingServersByPort, port)
+		} else {
+			s.pendingServersByPort[port] = kept
+		}
+	}
+
 	// Must release lock before calling callbacks (they may call ExportSpan
 	// which eventually calls back into this stitcher on another goroutine).
 	cbs := s.callbacks
@@ -653,13 +888,5 @@ func (s *Stitcher) Cleanup() int {
 func (s *Stitcher) PendingCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	count := 0
-	for _, spans := range s.pendingClients {
-		count += len(spans)
-	}
-	for _, spans := range s.pendingServers {
-		count += len(spans)
-	}
-	return count
+	return s.pendingCount()
 }

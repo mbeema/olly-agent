@@ -199,6 +199,40 @@ struct {
     __type(value, __u32);
 } sock_ops_map SEC(".maps");
 
+// Ephemeral port map: populated by sockops ACTIVE_ESTABLISHED.
+// Key: {pid, remote_addr, remote_port} → Value: {local_port, cookie}
+// Go agent reads this to enrich outbound ConnInfo with the local ephemeral port
+// for deterministic same-host CLIENT↔SERVER trace linking.
+struct eph_port_key {
+    __u32 pid;
+    __u32 remote_addr;
+    __u16 remote_port;
+    __u16 _pad;
+};
+
+struct eph_port_val {
+    __u16 local_port;
+    __u16 _pad;
+    __u64 cookie;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, struct eph_port_key);
+    __type(value, struct eph_port_val);
+} eph_port_map SEC(".maps");
+
+// Temporary map: sock pointer → PID, populated at TCP_SYN_SENT (where PID
+// is available but sport is not yet assigned), consumed at TCP_ESTABLISHED
+// (where sport is available but PID may be in softirq context).
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u64);    // ctx->skaddr (struct sock *)
+    __type(value, __u32);  // PID
+} sk_pid_map SEC(".maps");
+
 // ──────────────────────────────────────────────────────────────────────
 // Temporary storage for kprobe → kretprobe data passing
 // ──────────────────────────────────────────────────────────────────────
@@ -1351,7 +1385,73 @@ int olly_sockops(struct bpf_sock_ops *skops) {
     }
 
     bpf_sock_hash_update(skops, &sock_ops_map, &key, BPF_NOEXIST);
+
     return 1;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Ephemeral port capture via inet_sock_set_state tracepoint
+// ──────────────────────────────────────────────────────────────────────
+
+// Two-phase ephemeral port capture via inet_sock_set_state tracepoint.
+//
+// Phase 1 (TCP_SYN_SENT): PID is available (connect syscall context) but
+// sport is NOT yet assigned (kernel assigns it in inet_hash_connect AFTER
+// tcp_set_state(SYN_SENT)). Store sock_ptr → PID in sk_pid_map.
+//
+// Phase 2 (TCP_ESTABLISHED): sport IS assigned. Look up PID from sk_pid_map
+// (handles both blocking connects in process context and non-blocking in softirq).
+//
+// sport/dport are host byte order; saddr/daddr are network byte order.
+#ifndef TCP_SYN_SENT
+#define TCP_SYN_SENT 2
+#endif
+#ifndef TCP_ESTABLISHED
+#define TCP_ESTABLISHED 1
+#endif
+
+SEC("tracepoint/sock/inet_sock_set_state")
+int tracepoint_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx) {
+    __u64 sk = (__u64)(unsigned long)ctx->skaddr;
+
+    if (ctx->newstate == TCP_SYN_SENT) {
+        // Phase 1: Capture PID → sock mapping. Sport not yet assigned.
+        __u64 pid_tgid = bpf_get_current_pid_tgid();
+        __u32 pid = pid_tgid >> 32;
+        if (!pid_allowed(pid))
+            return 0;
+        bpf_map_update_elem(&sk_pid_map, &sk, &pid, BPF_ANY);
+        return 0;
+    }
+
+    if (ctx->newstate == TCP_ESTABLISHED) {
+        // Phase 2: Sport is now assigned. Look up PID from phase 1.
+        __u32 *pid_ptr = bpf_map_lookup_elem(&sk_pid_map, &sk);
+        if (!pid_ptr)
+            return 0; // not a tracked connection
+        __u32 pid = *pid_ptr;
+        bpf_map_delete_elem(&sk_pid_map, &sk);
+
+        struct eph_port_key ekey = {};
+        ekey.pid = pid;
+        // Use bpf_probe_read_kernel for array fields — direct access to ctx
+        // arrays causes "dereference of modified ctx ptr" verifier error.
+        if (ctx->family == AF_INET) {
+            bpf_probe_read_kernel(&ekey.remote_addr, 4, &ctx->daddr);
+        } else if (ctx->family == AF_INET6) {
+            bpf_probe_read_kernel(&ekey.remote_addr, 4, &ctx->daddr_v6[12]);
+        }
+        ekey.remote_port = ctx->dport; // already host byte order
+
+        struct eph_port_val eval = {};
+        eval.local_port = ctx->sport;  // already host byte order (now assigned)
+        eval.cookie = sk;
+
+        bpf_map_update_elem(&eph_port_map, &ekey, &eval, BPF_ANY);
+        return 0;
+    }
+
+    return 0;
 }
 
 // ──────────────────────────────────────────────────────────────────────

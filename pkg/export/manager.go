@@ -113,6 +113,13 @@ type Manager struct {
 	pyroscope      *PyroscopeExporter
 	circuitBreaker *CircuitBreaker
 
+	// TraceMergeResolver applies late trace ID merges at batch flush time.
+	// Stitcher TraceMerge entries are created asynchronously when CLIENT↔SERVER
+	// spans are matched. Internal spans (e.g., pricing's CLIENT to stock) may
+	// be queued for export BEFORE the TraceMerge entry exists. By resolving
+	// at flush time (typically 500ms-1s later), most merges are available.
+	TraceMergeResolver func(traceID string) (string, bool)
+
 	wg     sync.WaitGroup
 	stopCh chan struct{}
 }
@@ -500,6 +507,17 @@ func (m *Manager) flushProfiles(ctx context.Context, profiles []*profiling.Profi
 // H1 fix: flushSpans with exponential backoff retry.
 // B1 fix: only count items on successful export (not on failure/circuit-breaker drop).
 func (m *Manager) flushSpans(ctx context.Context, spans []*traces.Span) {
+	// Late TraceMerge resolution: stitcher creates TraceMerge entries when
+	// CLIENT↔SERVER spans are matched. Internal spans may reach the export
+	// batch before the merge exists. Resolving now catches most merges.
+	if resolver := m.TraceMergeResolver; resolver != nil {
+		for _, span := range spans {
+			if newTraceID, ok := resolver(span.TraceID); ok {
+				span.TraceID = newTraceID
+			}
+		}
+	}
+
 	for _, exp := range m.exporters {
 		if m.retryExport(ctx, "spans", func(expCtx context.Context) error {
 			return exp.ExportSpans(expCtx, spans)

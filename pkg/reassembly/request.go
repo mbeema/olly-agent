@@ -50,6 +50,11 @@ type RequestPair struct {
 	// as the highest-priority lookup for parent linking.
 	// 0 means not set (inbound or no causal mapping available).
 	CausalInboundFD int32
+
+	// LocalPort is the ephemeral port for outbound connections (from BPF sockops).
+	// Used for deterministic same-host CLIENT↔SERVER trace linking:
+	// CLIENT.LocalPort == SERVER.RemotePort is unique per TCP connection.
+	LocalPort uint16
 }
 
 // streamKey uniquely identifies a stream.
@@ -117,6 +122,15 @@ func (r *Reassembler) getOrCreate(pid uint32, fd int32, remoteAddr string, remot
 	r.mu.RUnlock()
 
 	if ok {
+		// Backfill remote info if the stream was created by PushCausalFD
+		// (which passes remoteAddr="" and remotePort=0). Without the port,
+		// detectProtocol's port-based fallback fails → "unknown" spans.
+		if remotePort != 0 && ss.stream.RemotePort == 0 {
+			ss.stream.RemotePort = remotePort
+		}
+		if remoteAddr != "" && ss.stream.RemoteAddr == "" {
+			ss.stream.RemoteAddr = remoteAddr
+		}
 		return ss
 	}
 

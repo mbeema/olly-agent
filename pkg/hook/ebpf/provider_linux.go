@@ -39,6 +39,7 @@ type Provider struct {
 var _ hook.HookProvider = (*Provider)(nil)
 var _ hook.TraceInjector = (*Provider)(nil)
 var _ hook.EventTraceProvider = (*Provider)(nil)
+var _ hook.EphemeralPortProvider = (*Provider)(nil)
 
 // NewProvider creates a new eBPF hook provider. It does not load or attach
 // BPF programs until Start() is called.
@@ -272,4 +273,17 @@ func (p *Provider) GetEventTraceContext(pid, tid uint32) (traceID, spanID string
 		return "", "", false
 	}
 	return p.eventReader.getEventTraceContext(pid, tid)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// EphemeralPortProvider interface implementation
+// ──────────────────────────────────────────────────────────────────────
+
+// GetEphemeralPort returns the local ephemeral port and socket cookie for an
+// outbound connection. Used for deterministic same-host CLIENT↔SERVER matching.
+func (p *Provider) GetEphemeralPort(pid uint32, remoteAddr uint32, remotePort uint16) (uint16, uint64, bool) {
+	if p.loader == nil {
+		return 0, 0, false
+	}
+	return p.loader.lookupEphPort(pid, remoteAddr, remotePort)
 }

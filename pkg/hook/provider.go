@@ -68,6 +68,22 @@ type TraceInjector interface {
 	SupportsInjection() bool
 }
 
+// EphemeralPortProvider is implemented by providers that can look up the
+// local ephemeral port of outbound connections from BPF sockops data.
+// This enables deterministic same-host CLIENT↔SERVER trace linking by
+// matching CLIENT.LocalPort == SERVER.RemotePort.
+//
+// Use type assertion to check if a HookProvider supports this:
+//
+//	if epp, ok := provider.(EphemeralPortProvider); ok {
+//	    localPort, cookie, ok := epp.GetEphemeralPort(pid, remoteAddr, remotePort)
+//	}
+type EphemeralPortProvider interface {
+	// GetEphemeralPort returns the local port and socket cookie for an
+	// outbound connection identified by (pid, remoteAddr, remotePort).
+	GetEphemeralPort(pid uint32, remoteAddr uint32, remotePort uint16) (localPort uint16, cookie uint64, ok bool)
+}
+
 // EventTraceProvider is implemented by providers that embed BPF-generated
 // trace context directly in ring buffer events, eliminating the race condition
 // between BPF map writes and Go's asynchronous ring buffer processing.
