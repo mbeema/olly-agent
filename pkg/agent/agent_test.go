@@ -10,6 +10,7 @@ import (
 
 	"github.com/mbeema/olly/pkg/config"
 	"github.com/mbeema/olly/pkg/conntrack"
+	"github.com/mbeema/olly/pkg/health"
 	hookebpf "github.com/mbeema/olly/pkg/hook/ebpf"
 	"github.com/mbeema/olly/pkg/logs"
 	"github.com/mbeema/olly/pkg/reassembly"
@@ -19,9 +20,10 @@ import (
 // newTestAgent creates a minimal agent for testing processHookLog.
 func newTestAgent() *Agent {
 	a := &Agent{
-		logParser: logs.NewParser(),
-		logCh:     make(chan *logs.LogRecord, 100),
-		logger:    zap.NewNop(),
+		logParser:   logs.NewParser(),
+		logCh:       make(chan *logs.LogRecord, 100),
+		logger:      zap.NewNop(),
+		healthStats: health.NewStats(),
 	}
 	cfg := config.DefaultConfig()
 	a.cfg.Store(cfg)
@@ -183,9 +185,10 @@ func TestProcessHookLogPIDOverridesParser(t *testing.T) {
 func TestProcessHookLogChannelFull(t *testing.T) {
 	// Create agent with tiny channel
 	a := &Agent{
-		logParser: logs.NewParser(),
-		logCh:     make(chan *logs.LogRecord, 1),
-		logger:    zap.NewNop(),
+		logParser:   logs.NewParser(),
+		logCh:       make(chan *logs.LogRecord, 1),
+		logger:      zap.NewNop(),
+		healthStats: health.NewStats(),
 	}
 	cfg := config.DefaultConfig()
 	a.cfg.Store(cfg)

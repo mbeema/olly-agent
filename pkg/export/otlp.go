@@ -15,6 +15,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/mbeema/olly/pkg/config"
+	"github.com/mbeema/olly/pkg/discovery"
 	"github.com/mbeema/olly/pkg/traces"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -175,6 +176,12 @@ func (e *OTLPExporter) resourceForService(serviceName string, pid uint32) *resou
 	}
 	if e.deploymentEnv != "" {
 		attrs = append(attrs, strAttr("deployment.environment", e.deploymentEnv))
+	}
+
+	// Cloud and Kubernetes resource attributes (detected once, cached)
+	meta := discovery.DetectResourceMetadata()
+	for k, v := range meta.ResourceAttributes() {
+		attrs = append(attrs, strAttr(k, v))
 	}
 
 	return &resourcepb.Resource{Attributes: attrs}

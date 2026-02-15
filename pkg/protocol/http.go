@@ -183,6 +183,62 @@ func ExtractTraceContext(request []byte) TraceContext {
 	return ctx
 }
 
+// NormalizeRoute collapses dynamic path segments to produce an http.route.
+// Numeric IDs, UUIDs, and hex strings are replaced with {id}.
+// Example: /api/users/42/orders/abc123 → /api/users/{id}/orders/{id}
+func NormalizeRoute(path string) string {
+	if path == "" || path == "/" {
+		return path
+	}
+	segments := strings.Split(path, "/")
+	for i, seg := range segments {
+		if seg == "" {
+			continue
+		}
+		if isDynamicSegment(seg) {
+			segments[i] = "{id}"
+		}
+	}
+	return strings.Join(segments, "/")
+}
+
+// isDynamicSegment returns true if a path segment looks like a dynamic value
+// (numeric ID, UUID, or long hex string) rather than a fixed route component.
+func isDynamicSegment(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	// Pure numeric
+	allDigits := true
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			allDigits = false
+			break
+		}
+	}
+	if allDigits {
+		return true
+	}
+	// UUID: 8-4-4-4-12 hex with dashes (36 chars)
+	if len(s) == 36 && s[8] == '-' && s[13] == '-' && s[18] == '-' && s[23] == '-' {
+		return true
+	}
+	// Long hex strings (>8 chars, all hex)
+	if len(s) > 8 {
+		allHex := true
+		for _, c := range s {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				allHex = false
+				break
+			}
+		}
+		if allHex {
+			return true
+		}
+	}
+	return false
+}
+
 // indexBytesCI performs a case-insensitive search for needle in haystack.
 // The needle must be lowercase. Returns the index of the first match or -1.
 func indexBytesCI(haystack, needle []byte) int {

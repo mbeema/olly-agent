@@ -120,6 +120,10 @@ type Manager struct {
 	// at flush time (typically 500ms-1s later), most merges are available.
 	TraceMergeResolver func(traceID string) (string, bool)
 
+	// OnExportStats is called after each successful flush with signal and count.
+	// Used by the agent to propagate export/drop counts to health stats.
+	OnExportStats func(signal string, exported int64, dropped int64)
+
 	wg     sync.WaitGroup
 	stopCh chan struct{}
 }
@@ -267,8 +271,14 @@ func (m *Manager) ExportLog(log *LogRecord) {
 func (m *Manager) ExportMetric(metric *Metric) {
 	select {
 	case m.metricCh <- metric:
+		if m.OnExportStats != nil {
+			m.OnExportStats("metrics", 1, 0)
+		}
 	default:
 		m.dropCount.Add(1)
+		if m.OnExportStats != nil {
+			m.OnExportStats("metrics", 0, 1)
+		}
 		m.logger.Warn("metric channel full, dropping metric")
 	}
 }
@@ -277,8 +287,14 @@ func (m *Manager) ExportMetric(metric *Metric) {
 func (m *Manager) ExportProfile(p *profiling.Profile) {
 	select {
 	case m.profileCh <- p:
+		if m.OnExportStats != nil {
+			m.OnExportStats("profiles", 1, 0)
+		}
 	default:
 		m.dropCount.Add(1)
+		if m.OnExportStats != nil {
+			m.OnExportStats("profiles", 0, 1)
+		}
 		m.logger.Warn("profile channel full, dropping profile")
 	}
 }

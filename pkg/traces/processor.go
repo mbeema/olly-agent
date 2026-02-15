@@ -141,13 +141,13 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 			}
 			span.ParentSpanID = pair.ParentSpanID
 		} else {
-			// SERVER span: use thread context for SpanID (so child CLIENT
-			// spans can reference it as parent). Only overwrite TraceID if
-			// traceparent wasn't extracted — when extraction succeeds, the
-			// extracted traceID is authoritative (from the upstream service).
-			// Thread context traceID may differ (BPF-generated) if the
-			// traceparent was split across reads or reassembled in the pair.
-			if span.Attributes["olly.trace_source"] != "traceparent" {
+			// SERVER span: use extracted traceparent traceID when available
+			// (per-request, from HTTP headers) as it survives keep-alive
+			// connCtx overwrites. TraceMerge at processSpan time resolves
+			// it to the canonical traceID. Fall back to pair.ParentTraceID
+			// when traceparent wasn't extracted.
+			traceSource, _ := span.Attributes["olly.trace_source"]
+			if traceSource != "traceparent" {
 				span.TraceID = pair.ParentTraceID
 			}
 			span.SpanID = pair.ParentSpanID
@@ -167,8 +167,9 @@ func (p *Processor) ProcessPair(pair *reassembly.RequestPair, connInfo *conntrac
 		if span.Kind == SpanKindServer && attrs.HTTPStatusCode >= 400 && attrs.HTTPStatusCode < 500 {
 			span.Status = StatusUnset
 		} else {
-			span.Status = StatusError
-			span.StatusMsg = attrs.ErrorMsg
+			// SetError sets StatusError + creates an "exception" span event
+			// for visibility in Grafana/Jaeger trace detail views.
+			span.SetError(attrs.ErrorMsg)
 		}
 	} else {
 		span.Status = StatusUnset
@@ -252,6 +253,15 @@ func (p *Processor) setProtocolAttributes(span *Span, attrs *protocol.SpanAttrib
 		}
 		if attrs.HTTPUserAgent != "" {
 			span.SetAttribute("user_agent.original", attrs.HTTPUserAgent)
+		}
+		// http.route: normalized path with dynamic segments collapsed.
+		// Per OTEL, http.route is preferred for span naming on SERVER spans
+		// and for low-cardinality grouping in dashboards.
+		if attrs.HTTPPath != "" {
+			route := protocol.NormalizeRoute(attrs.HTTPPath)
+			if route != attrs.HTTPPath {
+				span.SetAttribute("http.route", route)
+			}
 		}
 		// CLIENT span: server.port is the remote port we connected to.
 		if span.Kind == SpanKindClient && connInfo != nil {

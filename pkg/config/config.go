@@ -126,15 +126,29 @@ type CorrelationConfig struct {
 }
 
 type MetricsConfig struct {
-	Enabled   bool                  `yaml:"enabled"`
-	Host      MetricsToggle         `yaml:"host"`
-	Process   MetricsToggle         `yaml:"process"`
-	Request   RequestMetricsCfg     `yaml:"request"`
-	GenAI     GenAIMetricsCfg       `yaml:"genai"`
-	MCP       MCPMetricsCfg         `yaml:"mcp"`
-	Interval  time.Duration         `yaml:"interval"`
-	PerProcess PerProcessMetricsCfg `yaml:"per_process"`
-	Container MetricsToggle         `yaml:"container"`
+	Enabled    bool                  `yaml:"enabled"`
+	Host       MetricsToggle         `yaml:"host"`
+	Process    MetricsToggle         `yaml:"process"`
+	Request    RequestMetricsCfg     `yaml:"request"`
+	GenAI      GenAIMetricsCfg       `yaml:"genai"`
+	MCP        MCPMetricsCfg         `yaml:"mcp"`
+	Interval   time.Duration         `yaml:"interval"`
+	PerProcess PerProcessMetricsCfg  `yaml:"per_process"`
+	Container  MetricsToggle         `yaml:"container"`
+	StatsD     StatsDConfig          `yaml:"statsd"`
+	Filter     MetricsFilterConfig   `yaml:"filter"`
+}
+
+// StatsDConfig configures the StatsD/DogStatsD UDP receiver.
+type StatsDConfig struct {
+	Enabled    bool   `yaml:"enabled"`
+	ListenAddr string `yaml:"listen_addr"` // e.g., ":8125"
+}
+
+// MetricsFilterConfig configures metric name filtering.
+type MetricsFilterConfig struct {
+	IncludePatterns []string `yaml:"include_patterns"` // Glob: only export matching metric names (empty = all)
+	ExcludePatterns []string `yaml:"exclude_patterns"` // Glob: drop matching metric names
 }
 
 // GenAIMetricsCfg configures GenAI token and duration metrics.
@@ -312,6 +326,7 @@ func DefaultConfig() *Config {
 			Interval:   15 * time.Second,
 			PerProcess: PerProcessMetricsCfg{Enabled: false},
 			Container:  MetricsToggle{Enabled: true},
+			StatsD:     StatsDConfig{Enabled: false, ListenAddr: ":8125"},
 		},
 		Exporters: ExportersConfig{
 			OTLP: OTLPConfig{

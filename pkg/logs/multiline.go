@@ -160,5 +160,43 @@ func isContinuation(line string) bool {
 		return true
 	}
 
+	// .NET stack trace patterns
+	if strings.HasPrefix(line, "   at ") {
+		return true
+	}
+	if strings.HasPrefix(line, "--->") {
+		return true
+	}
+	if strings.HasPrefix(line, "Unhandled exception.") {
+		return true
+	}
+
+	// Ruby stack trace patterns
+	if strings.HasPrefix(line, "from ") {
+		return true
+	}
+
+	// Rust panic/backtrace patterns
+	if strings.HasPrefix(line, "thread '") {
+		return true
+	}
+	if strings.HasPrefix(line, "stack backtrace:") {
+		return true
+	}
+	if strings.HasPrefix(line, "note: ") {
+		return true
+	}
+
+	// Elixir/Erlang stack trace patterns
+	if strings.HasPrefix(line, "** (") {
+		return true
+	}
+	if strings.HasPrefix(line, "    (") {
+		return true
+	}
+	if strings.HasPrefix(line, "    lib/") {
+		return true
+	}
+
 	return false
 }

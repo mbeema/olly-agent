@@ -42,28 +42,29 @@ type Agent struct {
 	cfg    atomic.Pointer[config.Config]
 	logger *zap.Logger
 
-	hookProvider    hook.HookProvider
-	healthServer    *health.Server
-	healthStats     *health.Stats
-	redactor        *redact.Redactor
-	sampler         *traces.Sampler
-	logParser       *logs.Parser
-	connTracker     *conntrack.Tracker
-	reassembler     *reassembly.Reassembler
-	traceProc       *traces.Processor
-	traceStitcher   *traces.Stitcher
-	correlation     *correlation.Engine
-	logCollector    *logs.Collector
-	metricsColl     *metrics.Collector
-	requestMetrics  *rmetrics.RequestMetrics
-	genaiMetrics    atomic.Pointer[rmetrics.GenAIMetrics]
-	mcpMetrics      atomic.Pointer[rmetrics.MCPMetrics]
-	processColl     *metrics.ProcessCollector
-	containerColl   *metrics.ContainerCollector
-	exporter        *export.Manager
-	discoverer      *discovery.Discoverer
-	serviceMap      *servicemap.Generator
-	profiler        profiling.Profiler
+	hookProvider   hook.HookProvider
+	healthServer   *health.Server
+	healthStats    *health.Stats
+	redactor       *redact.Redactor
+	sampler        *traces.Sampler
+	logParser      *logs.Parser
+	connTracker    *conntrack.Tracker
+	reassembler    *reassembly.Reassembler
+	traceProc      *traces.Processor
+	traceStitcher  *traces.Stitcher
+	correlation    *correlation.Engine
+	logCollector   *logs.Collector
+	metricsColl    *metrics.Collector
+	requestMetrics *rmetrics.RequestMetrics
+	genaiMetrics   atomic.Pointer[rmetrics.GenAIMetrics]
+	mcpMetrics     atomic.Pointer[rmetrics.MCPMetrics]
+	processColl    *metrics.ProcessCollector
+	containerColl  *metrics.ContainerCollector
+	exporter       *export.Manager
+	discoverer     *discovery.Discoverer
+	serviceMap     *servicemap.Generator
+	profiler       profiling.Profiler
+	statsdReceiver *metrics.StatsDReceiver
 
 	// Configurable trace context lifetime (replaces hardcoded 30s)
 	maxRequestDuration time.Duration
@@ -86,6 +87,8 @@ type Agent struct {
 	fdCausal        sync.Map // key: uint64(PID)<<32|uint64(uint32(FD)) -> *causalEntry
 	pidActiveCtx    sync.Map // key: uint32(PID)                        -> *pidInboundSet (active inbound FDs)
 	causalCtxSnap   sync.Map // key: uint64(PID)<<32|uint64(uint32(outbound FD)) -> *causalCtxQueue
+	outboundEvtCtx  sync.Map // key: uint64(PID)<<32|uint64(uint32(outbound FD)) -> *outboundTraceCtx
+	bpfSpanToConn   sync.Map // key: string (BPF spanID) -> uint64 (connKey) for reverse FD lookup
 
 	mu            sync.Mutex
 	ctx           context.Context
@@ -98,12 +101,14 @@ type Agent struct {
 // Keyed by PID+FD (connection-scoped) instead of PID+TID (thread-scoped) to
 // survive Go goroutine migration and handle concurrent requests correctly.
 type connTraceCtx struct {
-	TraceID      string
-	SpanID       string // injected via sk_msg → becomes CLIENT span's own spanID
-	ServerSpanID string // SERVER span's own spanID (CLIENT spans reference this as parent)
-	ParentSpanID string // from incoming traceparent header (cross-service linking)
-	ReadTID      uint32 // TID that read the inbound request (for sk_msg injection validation)
-	Created      time.Time
+	TraceID        string
+	SpanID         string // injected via sk_msg → becomes CLIENT span's own spanID
+	BPFSpanID      string // original BPF spanID from kretprobe_read, never regenerated (for reverse lookup)
+	ServerSpanID   string // SERVER span's own spanID (CLIENT spans reference this as parent)
+	ParentSpanID   string // from incoming traceparent header (cross-service linking)
+	ReadTID        uint32 // TID that read the inbound request (for sk_msg injection validation)
+	Created        time.Time
+	SpanIDConsumed bool // true after first CLIENT pair consumed the InjectedSpanID
 }
 
 // causalEntry records which inbound FD caused an outbound write.
@@ -114,12 +119,15 @@ type causalEntry struct {
 }
 
 // causalCtxSnapshot is a minimal snapshot of trace context captured at
-// PushCausalFD time (OnDataOut). Used by enrichPairContext Layer 0 to avoid
+// PushCausalFD time (OnDataOut). Used by enrichPairContext to avoid
 // stale connCtx lookups when CLIENT pair creation is delayed (response >256
-// bytes causes framing failure → pair created later after connCtx overwrite).
+// bytes causes framing failure → pair created later after connCtx overwrite)
+// or when multiple requests share the same traceID (fullchain propagation).
 type causalCtxSnapshot struct {
 	TraceID      string
 	ServerSpanID string
+	SpanID       string // BPF-injected spanID for CLIENT span matching
+	ReadTID      uint32 // TID that read the inbound request
 }
 
 // causalCtxQueue is a FIFO queue of context snapshots for an outbound FD.
@@ -145,6 +153,14 @@ func (q *causalCtxQueue) pop() (causalCtxSnapshot, bool) {
 	snap := q.entries[0]
 	q.entries = q.entries[1:]
 	return snap, true
+}
+
+// outboundTraceCtx holds BPF event trace context for outbound connections.
+// Used for root CLIENT spans (no inbound request, e.g. curl) to match the
+// spanID that BPF sk_msg injects into the traceparent header.
+type outboundTraceCtx struct {
+	TraceID string
+	SpanID  string
 }
 
 // pidInboundEntry tracks a single active inbound FD with its creation timestamp.
@@ -347,6 +363,27 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 	// batch before the stitcher creates the TraceMerge entry for their trace.
 	a.exporter.TraceMergeResolver = a.traceStitcher.TraceMerge
 
+	// Wire self-monitoring: propagate export/drop counts for metrics and profiles
+	// to health stats. Spans and logs are tracked directly in processSpan/processLog.
+	a.exporter.OnExportStats = func(signal string, exported int64, dropped int64) {
+		switch signal {
+		case "metrics":
+			if exported > 0 {
+				a.healthStats.MetricsExported.Add(exported)
+			}
+			if dropped > 0 {
+				a.healthStats.MetricsDropped.Add(dropped)
+			}
+		case "profiles":
+			if exported > 0 {
+				a.healthStats.ProfilesExported.Add(exported)
+			}
+			if dropped > 0 {
+				a.healthStats.ProfilesDropped.Add(dropped)
+			}
+		}
+	}
+
 	// Initialize log collector
 	if cfg.Logs.Enabled {
 		logsCfg := cfg.Logs
@@ -391,6 +428,15 @@ func New(cfg *config.Config, logger *zap.Logger) (*Agent, error) {
 		if cfg.Metrics.Container.Enabled {
 			a.containerColl = metrics.NewContainerCollector(logger)
 		}
+	}
+
+	// Initialize StatsD/DogStatsD receiver
+	if cfg.Metrics.Enabled && cfg.Metrics.StatsD.Enabled {
+		listenAddr := cfg.Metrics.StatsD.ListenAddr
+		if listenAddr == "" {
+			listenAddr = ":8125"
+		}
+		a.statsdReceiver = metrics.NewStatsDReceiver(listenAddr, logger)
 	}
 
 	// Initialize discovery
@@ -516,18 +562,36 @@ func (a *Agent) Start(ctx context.Context) error {
 				// (Redis, HTTP keep-alive) get per-request causal tracking
 				// instead of last-writer-wins on the fdCausal map.
 				tidKey := uint64(pid)<<32 | uint64(tid)
+				var iFD int32
+				var foundInbound, fromThreadMap bool
+
 				if inboundFD, ok := a.threadInboundFD.Load(tidKey); ok {
-					iFD := inboundFD.(int32)
+					iFD = inboundFD.(int32)
+					foundInbound = true
+					fromThreadMap = true
+				} else if val, ok := a.pidActiveCtx.Load(pid); ok {
+					// PID-level fallback: Go goroutine TID mismatch.
+					// threadInboundFD has no entry for this TID, but
+					// pidActiveCtx tracks active inbound FDs.
+					if bestFD, matched := val.(*pidInboundSet).BestMatch(time.Now()); matched {
+						iFD = bestFD
+						foundInbound = true
+					}
+				}
+
+				if foundInbound {
 					a.reassembler.PushCausalFD(pid, fd, iFD)
-					causalKey := uint64(pid)<<32 | uint64(uint32(fd))
-					a.fdCausal.Store(causalKey, &causalEntry{
-						InboundFD: iFD,
-						Timestamp: time.Now(),
-					})
+					if fromThreadMap {
+						causalKey := uint64(pid)<<32 | uint64(uint32(fd))
+						a.fdCausal.Store(causalKey, &causalEntry{
+							InboundFD: iFD,
+							Timestamp: time.Now(),
+						})
+					}
 					// Snapshot the inbound FD's trace context now. If the
 					// CLIENT pair is created late (response >256 bytes),
 					// connCtx may be overwritten by the next inbound request.
-					// The snapshot preserves the correct TraceID/ServerSpanID.
+					// The snapshot preserves the correct TraceID/ServerSpanID/SpanID.
 					inboundKey := uint64(pid)<<32 | uint64(uint32(iFD))
 					if ctxVal, ctxOK := a.connCtx.Load(inboundKey); ctxOK {
 						tctx := ctxVal.(*connTraceCtx)
@@ -536,14 +600,21 @@ func (a *Agent) Start(ctx context.Context) error {
 						qVal.(*causalCtxQueue).push(causalCtxSnapshot{
 							TraceID:      tctx.TraceID,
 							ServerSpanID: tctx.ServerSpanID,
+							SpanID:       tctx.SpanID,
+							ReadTID:      tctx.ReadTID,
 						})
 					}
-				} else if val, ok := a.pidActiveCtx.Load(pid); ok {
-					// PID-level fallback: Go goroutine TID mismatch.
-					// threadInboundFD has no entry for this TID, but
-					// pidActiveCtx tracks active inbound FDs.
-					if bestFD, found := val.(*pidInboundSet).BestMatch(time.Now()); found {
-						a.reassembler.PushCausalFD(pid, fd, bestFD)
+				}
+				// Capture BPF event trace context for outbound connections.
+				// Root CLIENT spans (no inbound request, e.g. curl, load generators)
+				// need this to match the spanID that BPF sk_msg injects.
+				if etp, ok := a.hookProvider.(hook.EventTraceProvider); ok {
+					if evtTraceID, evtSpanID, evtOK := etp.GetEventTraceContext(pid, tid); evtOK {
+						outKey := uint64(pid)<<32 | uint64(uint32(fd))
+						a.outboundEvtCtx.Store(outKey, &outboundTraceCtx{
+							TraceID: evtTraceID,
+							SpanID:  evtSpanID,
+						})
 					}
 				}
 				a.reassembler.AppendSend(pid, tid, fd, data, remoteAddr, remotePort, conn.IsSSL)
@@ -587,13 +658,39 @@ func (a *Agent) Start(ctx context.Context) error {
 					val.(*pidInboundSet).Add(fd, time.Now())
 				}
 
-				{
+				// --- New request detection ---
+				// Extract trace context indicators BEFORE deciding whether to
+				// create connCtx. This avoids overwriting connCtx on continuation
+				// reads (large HTTP request bodies split across multiple eBPF
+				// events) which would corrupt trace context for SERVER pairs that
+				// haven't been emitted yet due to response framing delays.
+				traceCtx := protocol.ExtractTraceContext(data)
+
+				var bpfEventTraceID, bpfEventSpanID string
+				var hasBpfEventCtx bool
+				if etp, ok := a.hookProvider.(hook.EventTraceProvider); ok {
+					// GetEventTraceContext is destructive (deletes entry after read).
+					// Must call exactly once and reuse the result.
+					if evtTraceID, evtSpanID, evtOK := etp.GetEventTraceContext(pid, tid); evtOK {
+						bpfEventTraceID = evtTraceID
+						bpfEventSpanID = evtSpanID
+						hasBpfEventCtx = true
+					}
+				}
+
+				// Only create new connCtx when this is a NEW request, not a
+				// continuation read of a large request body. Detection:
+				//   - traceparent header found → start of HTTP request with injection
+				//   - BPF event trace context → BPF only generates for HTTP method starts
+				//   - HTTP method prefix → start of HTTP request (stub provider fallback)
+				// For the very first read on a connection, always create connCtx.
+				_, existingCtx := a.connCtx.Load(connKey)
+				isNewRequest := traceCtx.TraceID != "" || hasBpfEventCtx || isHTTPRequestStart(data)
+
+				if isNewRequest || !existingCtx {
 					tctx := &connTraceCtx{Created: time.Now()}
 
-					// Priority 1: Extract traceparent from HTTP headers in the data.
-					// This captures injected headers from upstream sk_msg and gives
-					// us both traceID (for trace continuity) and parentSpanID.
-					traceCtx := protocol.ExtractTraceContext(data)
+					// Priority 1: Use pre-extracted traceparent.
 					if traceCtx.TraceID != "" {
 						tctx.TraceID = traceCtx.TraceID
 						tctx.ParentSpanID = traceCtx.SpanID
@@ -604,30 +701,20 @@ func (a *Agent) Start(ctx context.Context) error {
 							zap.Uint16("port", remotePort))
 					}
 
-					// Priority 2: Check event-embedded BPF trace context (race-free).
-					// BPF embeds trace context directly in the ring buffer event,
-					// eliminating the map read race where BPF overwrites before Go reads.
-					// Always read BPF SpanID: sk_msg uses BPF's thread_trace_ctx to
-					// inject traceparent into outbound HTTP. The CLIENT span's SpanID
-					// must match what BPF injects, so downstream SERVERs reference
-					// the correct parent. TraceID only used if Priority 1 didn't set it.
-					var bpfEventTraceID string
-					if etp, ok := a.hookProvider.(hook.EventTraceProvider); ok {
-						if evtTraceID, evtSpanID, evtOK := etp.GetEventTraceContext(pid, tid); evtOK {
-							bpfEventTraceID = evtTraceID
-							if tctx.TraceID == "" {
-								tctx.TraceID = evtTraceID
-							}
-							tctx.SpanID = evtSpanID
-							a.logger.Debug("using event-embedded BPF trace context",
-								zap.Uint32("pid", pid), zap.Uint32("tid", tid),
-								zap.String("traceID", tctx.TraceID),
-								zap.String("bpfSpanID", evtSpanID))
+					// Priority 2: Use pre-extracted BPF event trace context.
+					if hasBpfEventCtx {
+						if tctx.TraceID == "" {
+							tctx.TraceID = bpfEventTraceID
 						}
+						tctx.SpanID = bpfEventSpanID
+						tctx.BPFSpanID = bpfEventSpanID // original, never regenerated
+						a.logger.Debug("using event-embedded BPF trace context",
+							zap.Uint32("pid", pid), zap.Uint32("tid", tid),
+							zap.String("traceID", tctx.TraceID),
+							zap.String("bpfSpanID", bpfEventSpanID))
 					}
 
 					// Priority 3: Fall back to BPF map read (backward compat).
-					// Only used if event-embedded context is not available.
 					if tctx.TraceID == "" || tctx.SpanID == "" {
 						if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
 							if bpfTraceID, bpfSpanID, bpfOK := injector.GetTraceContext(pid, tid); bpfOK {
@@ -652,12 +739,6 @@ func (a *Agent) Start(ctx context.Context) error {
 						tctx.SpanID = traces.GenerateSpanID()
 					}
 					// BPF traceID → canonical traceID merge.
-					// BPF kretprobe_read generates a fresh traceID at each service hop.
-					// sk_msg injects this BPF traceID into outbound HTTP connections.
-					// But the Go agent knows the correct traceID from the extracted
-					// upstream traceparent (Priority 1). When these differ, register a
-					// merge so downstream spans (arriving with the BPF traceID via
-					// sk_msg injection) get redirected to the canonical trace.
 					if traceCtx.TraceID != "" && bpfEventTraceID != "" && traceCtx.TraceID != bpfEventTraceID {
 						canonical := tctx.TraceID
 						if a.traceStitcher != nil {
@@ -674,12 +755,26 @@ func (a *Agent) Start(ctx context.Context) error {
 
 					tctx.ServerSpanID = traces.GenerateSpanID()
 					tctx.ReadTID = tid
+
+					// Clean up old bpfSpanToConn entry before overwriting connCtx
+					if existingCtx {
+						if old, ok := a.connCtx.Load(connKey); ok {
+							if oldCtx, ok := old.(*connTraceCtx); ok && oldCtx.BPFSpanID != "" {
+								a.bpfSpanToConn.Delete(oldCtx.BPFSpanID)
+							}
+						}
+					}
 					a.connCtx.Store(connKey, tctx)
+					// Store reverse lookup: BPF spanID → connKey.
+					// Used by OnDataOut to verify threadInboundFD results
+					// when goroutine/thread-pool migration causes stale mappings.
+					if tctx.BPFSpanID != "" {
+						a.bpfSpanToConn.Store(tctx.BPFSpanID, connKey)
+					}
 
 					// Early registration: make trace context available for log
 					// correlation BEFORE the app writes any logs during request
-					// processing. Without this, logs are exported without trace
-					// context because spans complete after log writes.
+					// processing.
 					if a.correlation != nil {
 						svcName := ""
 						if a.discoverer != nil {
@@ -706,6 +801,7 @@ func (a *Agent) Start(ctx context.Context) error {
 			connKey := uint64(pid)<<32 | uint64(uint32(fd))
 			a.fdCausal.Delete(connKey)
 			a.causalCtxSnap.Delete(connKey)
+			a.outboundEvtCtx.Delete(connKey)
 			// Do NOT remove from pidActiveCtx here — connCtx must survive
 			// briefly after close so that outbound CLIENT pairs still in
 			// flight can look up the inbound trace context via Layer 3.
@@ -777,6 +873,7 @@ func (a *Agent) Start(ctx context.Context) error {
 			select {
 			case a.logCh <- record:
 			default:
+				a.healthStats.LogsDropped.Add(1)
 				a.logger.Warn("log channel full, dropping log")
 			}
 		})
@@ -924,6 +1021,39 @@ func (a *Agent) Start(ctx context.Context) error {
 		}
 	}
 
+	// Start StatsD receiver
+	if a.statsdReceiver != nil {
+		a.statsdReceiver.OnMetric(func(m *metrics.Metric) {
+			em := &export.Metric{
+				Name:        m.Name,
+				Description: m.Description,
+				Unit:        m.Unit,
+				Type:        export.MetricType(m.Type),
+				Value:       m.Value,
+				Timestamp:   m.Timestamp,
+				Labels:      m.Labels,
+			}
+			if m.Histogram != nil {
+				buckets := make([]export.HistogramBucket, len(m.Histogram.Buckets))
+				for i, b := range m.Histogram.Buckets {
+					buckets[i] = export.HistogramBucket{
+						UpperBound: b.UpperBound,
+						Count:      b.Count,
+					}
+				}
+				em.Histogram = &export.HistogramValue{
+					Count:   m.Histogram.Count,
+					Sum:     m.Histogram.Sum,
+					Buckets: buckets,
+				}
+			}
+			a.exporter.ExportMetric(em)
+		})
+		if err := a.statsdReceiver.Start(ctx); err != nil {
+			a.logger.Warn("statsd receiver start error", zap.Error(err))
+		}
+	}
+
 	if a.correlation != nil {
 		if err := a.correlation.Start(ctx); err != nil {
 			a.logger.Warn("correlation engine start error", zap.Error(err))
@@ -1041,7 +1171,10 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 	connInfo := a.connTracker.Lookup(pair.PID, pair.FD)
 
 	// SERVER pairs: direct lookup by the pair's own FD (which IS the inbound FD).
-	if connInfo != nil && connInfo.Direction == conntrack.ConnInbound {
+	// Also check pair.Direction as fallback when connInfo is nil (connection
+	// already closed via OnClose before pair was processed). connCtx survives
+	// close by design, so we can still look up the trace context.
+	if (connInfo != nil && connInfo.Direction == conntrack.ConnInbound) || pair.Direction == 1 {
 		connKey := uint64(pair.PID)<<32 | uint64(uint32(pair.FD))
 		val, ok := a.connCtx.Load(connKey)
 		if !ok {
@@ -1135,6 +1268,19 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 	}
 
 	if !found {
+		// Fallback for root CLIENT spans (no inbound request, e.g. curl,
+		// load generators): use BPF event trace context so the CLIENT span's
+		// traceID and spanID match what BPF sk_msg injects into the outbound
+		// traceparent header. Without this, downstream SERVERs have a
+		// parentSpanId that references a non-existent span.
+		outKey := uint64(pair.PID)<<32 | uint64(uint32(pair.FD))
+		if val, ok := a.outboundEvtCtx.Load(outKey); ok {
+			octx := val.(*outboundTraceCtx)
+			pair.ParentTraceID = octx.TraceID
+			if pair.Protocol == "http" || pair.Protocol == "grpc" || pair.Protocol == "genai" || pair.Protocol == "mcp" {
+				pair.InjectedSpanID = octx.SpanID
+			}
+		}
 		return
 	}
 
@@ -1146,6 +1292,9 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 		if causalSnap != nil && causalSnap.TraceID != "" {
 			pair.ParentTraceID = causalSnap.TraceID
 			pair.ParentSpanID = causalSnap.ServerSpanID
+			if causalSnap.SpanID != "" && (pair.Protocol == "http" || pair.Protocol == "grpc" || pair.Protocol == "genai" || pair.Protocol == "mcp") {
+				pair.InjectedSpanID = causalSnap.SpanID
+			}
 		}
 		return
 	}
@@ -1154,17 +1303,18 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 		return
 	}
 
-	// Check if connCtx was overwritten by a newer request (delayed pair
-	// creation: response >256 bytes caused framing failure, pair created
-	// after next inbound request overwrote connCtx). Use snapshot to
-	// preserve the correct TraceID/ServerSpanID from the original request.
-	if causalSnap != nil && causalSnap.TraceID != "" && causalSnap.TraceID != tctx.TraceID {
-		// connCtx was overwritten — use snapshot for TraceID/ServerSpanID.
-		// Don't set InjectedSpanID since we can't reliably consume from
-		// the wrong connCtx. The CLIENT span gets a generated SpanID and
-		// falls back to stitcher for CLIENT↔SERVER linking.
+	// Check if connCtx was overwritten by a newer request. Compare
+	// ServerSpanID (not TraceID) to detect overwrites even when multiple
+	// requests share the same traceID (common in fullchain propagation).
+	if causalSnap != nil && causalSnap.ServerSpanID != "" && causalSnap.ServerSpanID != tctx.ServerSpanID {
+		// connCtx was overwritten — use snapshot for correct context.
 		pair.ParentTraceID = causalSnap.TraceID
 		pair.ParentSpanID = causalSnap.ServerSpanID
+		// Use snapshot SpanID for InjectedSpanID so the CLIENT span's
+		// SpanID matches what sk_msg injected into the downstream traceparent.
+		if causalSnap.SpanID != "" && (pair.Protocol == "http" || pair.Protocol == "grpc" || pair.Protocol == "genai" || pair.Protocol == "mcp") {
+			pair.InjectedSpanID = causalSnap.SpanID
+		}
 		return
 	}
 
@@ -1185,13 +1335,22 @@ func (a *Agent) enrichPairContext(pair *reassembly.RequestPair) {
 	//    inbound requests are active. Under concurrency, sk_msg won't inject
 	//    and these spans fall back to the stitcher.
 	if pair.Protocol == "http" || pair.Protocol == "grpc" || pair.Protocol == "genai" || pair.Protocol == "mcp" {
-		if tctx.ReadTID != 0 {
+		// Only the first CLIENT pair from this inbound request gets the
+		// BPF-injected SpanID. sk_msg injects the SAME SpanID for ALL
+		// outbound writes from the same thread (BPF map update is async,
+		// not applied between writes). Subsequent CLIENT pairs get random
+		// SpanIDs and rely on the stitcher for cross-service matching.
+		if tctx.ReadTID != 0 && !tctx.SpanIDConsumed {
 			pair.InjectedSpanID = tctx.SpanID
+			tctx.SpanIDConsumed = true
 		}
-		// Consume: generate a new SpanID for subsequent CLIENT spans on
-		// this connection. Without this, multiple outbound calls reusing
-		// the same FD would all get the same SpanID.
-		tctx.SpanID = traces.GenerateSpanID()
+		// Regenerate SpanID for subsequent CLIENT spans on this connection.
+		newSpanID := traces.GenerateSpanID()
+		tctx.SpanID = newSpanID
+		// Update BPF thread_trace_ctx for future outbound requests.
+		if injector, ok := a.hookProvider.(hook.TraceInjector); ok {
+			injector.SetTraceContext(pair.PID, tctx.ReadTID, tctx.TraceID, newSpanID)
+		}
 	}
 }
 
@@ -1409,7 +1568,7 @@ func (a *Agent) processHookLog(pid, tid uint32, fd int32, data []byte, ts uint64
 		select {
 		case a.logCh <- record:
 		default:
-			// Channel full, drop
+			a.healthStats.LogsDropped.Add(1)
 		}
 	}
 }
@@ -1446,6 +1605,10 @@ func (a *Agent) Stop() error {
 
 	if a.containerColl != nil {
 		a.containerColl.Stop()
+	}
+
+	if a.statsdReceiver != nil {
+		a.statsdReceiver.Stop()
 	}
 
 	if a.profiler != nil {
@@ -1535,6 +1698,7 @@ func (a *Agent) startLogs() {
 		select {
 		case a.logCh <- record:
 		default:
+			a.healthStats.LogsDropped.Add(1)
 			a.logger.Warn("log channel full, dropping log")
 		}
 	})
@@ -1700,6 +1864,10 @@ func (a *Agent) cleanupLoop(ctx context.Context) {
 					return true
 				}
 				if time.Since(tctx.Created) > a.maxRequestDuration {
+					// Also remove reverse lookup entry
+					if tctx.BPFSpanID != "" {
+						a.bpfSpanToConn.Delete(tctx.BPFSpanID)
+					}
 					a.connCtx.Delete(key)
 					staleConnCtx++
 				}
@@ -1780,9 +1948,32 @@ func (a *Agent) cleanupLoop(ctx context.Context) {
 			}
 
 		case <-ctx.Done():
+			// Flush deferred stitcher spans before shutdown so pending
+			// SERVER/CLIENT spans aren't lost.
+			if a.traceStitcher != nil {
+				a.traceStitcher.Cleanup()
+			}
 			return
 		}
 	}
+}
+
+// isHTTPRequestStart checks if data begins with an HTTP method, indicating
+// the start of a new HTTP request (not a continuation read of a large body).
+func isHTTPRequestStart(data []byte) bool {
+	if len(data) < 4 {
+		return false
+	}
+	// Check common HTTP method prefixes (matches BPF maybe_generate_trace_ctx).
+	return bytes.HasPrefix(data, []byte("GET ")) ||
+		bytes.HasPrefix(data, []byte("POST")) ||
+		bytes.HasPrefix(data, []byte("PUT ")) ||
+		bytes.HasPrefix(data, []byte("DELE")) ||
+		bytes.HasPrefix(data, []byte("PATC")) ||
+		bytes.HasPrefix(data, []byte("HEAD")) ||
+		bytes.HasPrefix(data, []byte("OPTI")) ||
+		bytes.HasPrefix(data, []byte("CONN")) ||
+		bytes.HasPrefix(data, []byte("TRAC"))
 }
 
 // logLevelToSeverityNumber maps logs.LogLevel to OTEL SeverityNumber.

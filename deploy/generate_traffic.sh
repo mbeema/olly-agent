@@ -15,7 +15,7 @@ if [ -z "$EC2_IP" ]; then
 fi
 
 BASE_URL="http://$EC2_IP:5000"
-ITERATIONS="${1:-30}"
+ITERATIONS="${1:-10}"
 
 echo "=== Generating traffic against $BASE_URL ($ITERATIONS iterations) ==="
 
